@@ -70,7 +70,7 @@ describe('devalue', () => {
 		test(
 			'Dangerous string',
 			`</script><script src='https://evil.com/script.js'>alert('pwned')</script><script>`,
-			`"<\\u002fscript><script src='https://evil.com/script.js'>alert('pwned')<\\u002fscript><script>"`
+			`"\\u003C\\u002Fscript\\u003E\\u003Cscript src='https:\\u002F\\u002Fevil.com\\u002Fscript.js'\\u003Ealert('pwned')\\u003C\\u002Fscript\\u003E\\u003Cscript\\u003E"`
 		);
 	});
 
