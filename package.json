@@ -1,0 +1,32 @@
+{
+  "name": "devalue",
+  "description": "devalue",
+  "version": "1.0.0",
+  "repository": "Rich-Harris/devalue",
+  "main": "dist/devalue.umd.js",
+  "module": "dist/devalue.esm.js",
+  "types": "types/index.d.ts",
+  "files": [
+    "dist",
+	  "types"
+  ],
+  "devDependencies": {
+    "@types/mocha": "^2.2.44",
+    "@types/node": "^8.0.53",
+    "glob": "^7.1.2",
+    "mocha": "^4.0.1",
+    "rollup": "^0.52.0",
+    "rollup-plugin-typescript": "^0.8.1",
+    "rollup-plugin-virtual": "^1.0.1",
+    "sander": "^0.6.0",
+    "ts-node": "^3.3.0",
+    "typescript": "^2.6.2"
+  },
+  "scripts": {
+    "build-declarations": "tsc -d && node scripts/move-type-declarations.js",
+    "build": "npm run build-declarations && rollup -c",
+    "test": "mocha --opts mocha.opts",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "license": "LIL"
+}
