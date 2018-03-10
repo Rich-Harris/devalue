@@ -178,7 +178,7 @@ function isPrimitive(thing: any) {
 }
 
 function stringifyPrimitive(thing: any) {
-	if (typeof thing === 'string') return JSON.stringify(thing);
+	if (typeof thing === 'string') return JSON.stringify(thing).replace(/<\/script/g, '<\\u002fscript');
 	if (thing === void 0) return 'void 0';
 	if (thing === 0 && 1 / thing < 0) return '-0';
 	return String(thing);
