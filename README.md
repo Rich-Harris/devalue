@@ -9,6 +9,7 @@ Like `JSON.stringify`, but handles
 * dates
 * `Map` and `Set`
 
+Try it out on [runkit.com](https://npm.runkit.com/devalue).
 
 ## Goals:
 
