@@ -66,6 +66,14 @@ describe('devalue', () => {
 		test('String (repetition)', [str, str], `(function(a){return [a,a]}("a string"))`);
 	});
 
+	describe('XSS', () => {
+		test(
+			'Dangerous string',
+			`</script><script src='https://evil.com/script.js'>alert('pwned')</script><script>`,
+			`"\\u003C\\u002Fscript\\u003E\\u003Cscript src='https:\\u002F\\u002Fevil.com\\u002Fscript.js'\\u003Ealert('pwned')\\u003C\\u002Fscript\\u003E\\u003Cscript\\u003E"`
+		);
+	});
+
 	describe('misc', () => {
 		test('Object without prototype', Object.create(null), 'Object.create(null)');
 
