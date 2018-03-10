@@ -2,36 +2,6 @@ import * as assert from 'assert';
 import devalue from '../src/index';
 
 describe('devalue', () => {
-	// borrowed from https://github.com/jed/lave
-	const tests: Record<string, [any, string]> = {
-		number:    [ 123                           , `123`                                 ],
-		negative:  [ -123                          , `-123`                                ],
-		string:    [ 'abc'                         , `"abc"`                               ],
-		boolean:   [ true                          , `true`                                ],
-		Number:    [ new Number(123)               , `Object(123)`                         ],
-		String:    [ new String('abc')             , `Object("abc")`                       ],
-		Boolean:   [ new Boolean(true)             , `Object(true)`                        ],
-		undefined: [ void 0                        , `undefined`                           ],
-		null:      [ null                          , `null`                                ],
-		NaN:       [ NaN                           , `NaN`                                 ],
-		Infinity:  [ Infinity                      , `Infinity`                            ],
-		RegExp:    [ /regexp/img                   , `/regexp/gim`                         ],
-		//Buffer:    [ new Buffer('A')               , `Buffer('QQ==','base64')`             ],
-		Date:      [ new Date(1e12)                , `new Date(1000000000000)`             ],
-		Array:     [ [1,2,3]                       , `[1,2,3]`                             ],
-		Object:    [ {foo: 'bar', 'x-y': 'z'}      , `{foo:"bar","x-y":"z"}`               ],
-		sparse:    [ Array(10)                     , `[,,,,,,,,,,]`                        ],
-		Set:       [ new Set([1,2,3])              , `new Set([1,2,3])`                    ],
-		Map:       [ new Map([[1,2]])              , `new Map([[1,2]])`                    ],
-		cycleMap:  [ (a=>a.set(0,a))(new Map)      , `(function(a){a.set(0, a);return a}(new Map))`   ],
-		cycleSet:  [ (a=>a.add(a).add(0))(new Set) , `(function(a){a.add(a).add(0);return a}(new Set))` ],
-		arrcycle:  [ ((a:any)=>a[0]=a)([])         , `var a=[,];a[0]=a;a`                  ],
-		objcycle:  [ ((a:any)=>a.a=a)({})          , `var a={'a':null};a.a=a;a`            ],
-		dipole:    [ (a=>[a,a])({})                , `var a={};[a,a]`                      ],
-		property:  [ Object.assign([], {a:0})      , `var a=[];a.a=0;a`                    ],
-		prototype: [ Object.create(null)           , `Object.create(null)`                 ]
-	};
-
 	function test(name: string, input: any, expected: string) {
 		it(name, () => {
 			const actual = devalue(input);
@@ -83,6 +53,12 @@ describe('devalue', () => {
 		let objFromNull: any = Object.create(null);
 		objFromNull.self = objFromNull;
 		test('Object (cyclical)', objFromNull, `(function(a){a.self=a;return a}(Object.create(null)))`);
+
+		let first: any = {};
+		let second: any = {};
+		first.second = second;
+		second.first = first;
+		test('Object (cyclical)', [first, second], `(function(a,b){a.second=b;b.first=a;return [a,b]}({},{}))`);
 	});
 
 	describe('repetition', () => {

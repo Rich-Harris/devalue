@@ -16,10 +16,6 @@ export default function devalue(value: any) {
 	const repeated = new Map();
 	const seen = new Set();
 
-	const refs = new Map();
-	const values: Record<string, string> = {};
-
-	let uid = 1;
 	let n = 0;
 
 	function walk(thing: any) {
@@ -33,9 +29,6 @@ export default function devalue(value: any) {
 		}
 
 		seen.add(thing);
-
-		const id = uid++;
-		refs.set(thing, id);
 
 		if (!isPrimitive(thing)) {
 			const type = getType(thing);
@@ -114,12 +107,8 @@ export default function devalue(value: any) {
 		}
 	}
 
-	function deference(str: string): string {
-		return str.replace(/%(\d+)/g, (m, id) => deference(values[id]));
-	}
-
 	walk(value);
-	const str = deference(stringify(value));
+	const str = stringify(value);
 
 	if (repeated.size) {
 		const params: string[] = [];
