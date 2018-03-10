@@ -59,11 +59,8 @@ export default function devalue(value: any) {
 
 				default:
 					const proto = Object.getPrototypeOf(thing);
-					if (proto === null) {
-						throw new Error(`TODO objects with null prototype`);
-					}
 
-					if (proto !== Object.prototype) {
+					if (proto !== Object.prototype && proto !== null) {
 						throw new Error(`Cannot stringify arbitrary non-POJOs`);
 					}
 
@@ -105,16 +102,15 @@ export default function devalue(value: any) {
 				return `new ${type}([${Array.from(thing).map(stringify).join(',')}])`;
 
 			default:
+				const obj = `{${Object.keys(thing).map(key => `${safeKey(key)}:${stringify(thing[key])}`).join(',')}}`;
 				const proto = Object.getPrototypeOf(thing);
 				if (proto === null) {
-					throw new Error(`TODO objects with null prototype`);
+					return Object.keys(thing).length > 0
+						? `Object.assign(Object.create(null),${obj})`
+						: `Object.create(null)`;
 				}
 
-				if (proto !== Object.prototype) {
-					throw new Error(`Cannot stringify arbitrary non-POJOs`);
-				}
-
-				return `{${Object.keys(thing).map(key => `${safeKey(key)}:${stringify(thing[key])}`).join(',')}}`;
+				return obj;
 		}
 	}
 
@@ -135,6 +131,7 @@ export default function devalue(value: any) {
 
 			if (isPrimitive(thing)) {
 				values.push(stringifyPrimitive(thing));
+				return;
 			}
 
 			const type = getType(thing);
@@ -172,7 +169,7 @@ export default function devalue(value: any) {
 					break;
 
 				default:
-					values.push('{}');
+					values.push(Object.getPrototypeOf(thing) === null ? 'Object.create(null)' : '{}');
 					Object.keys(thing).forEach(key => {
 						statements.push(`${name}${safeProp(key)}=${stringify(thing[key])}`);
 					});

@@ -79,6 +79,10 @@ describe('devalue', () => {
 		let obj: any = {};
 		obj.self = obj;
 		test('Object (cyclical)', obj, `(function(a){a.self=a;return a}({}))`);
+
+		let objFromNull: any = Object.create(null);
+		objFromNull.self = objFromNull;
+		test('Object (cyclical)', objFromNull, `(function(a){a.self=a;return a}(Object.create(null)))`);
 	});
 
 	describe('repetition', () => {
