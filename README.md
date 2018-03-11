@@ -93,6 +93,7 @@ const value = eval('(' + str + ')');
 * [lave](https://github.com/jed/lave) by Jed Schmidt
 * [arson](https://github.com/benjamn/arson) by Ben Newman
 * [tosource](https://github.com/marcello3d/node-tosource) by Marcello Bastéa-Forte
+* [serialize-javascript](https://github.com/yahoo/serialize-javascript) by Eric Ferraiuolo
 
 
 ## License
