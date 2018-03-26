@@ -7,7 +7,7 @@ export default {
 		{ file: pkg.main, format: 'umd' },
 		{ file: pkg.module, format: 'es' }
 	],
-	name: 'TODO',
+	name: 'devalue',
 	plugins: [
 		typescript({
 			typescript: require('typescript')
