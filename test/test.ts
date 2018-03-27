@@ -1,4 +1,5 @@
 import * as assert from 'assert';
+import * as vm from 'vm';
 import devalue from '../src/index';
 
 describe('devalue', () => {
@@ -80,5 +81,17 @@ describe('devalue', () => {
 		// let arr = [];
 		// arr.x = 42;
 		// test('Array with named properties', arr, `TODO`);
+
+		test('cross-realm POJO', vm.runInNewContext('({})'), '{}');
+
+		it('throws for non-POJOs', () => {
+			class Foo {}
+			const foo = new Foo();
+			assert.throws(() => devalue(foo));
+		});
+
+		it('throws for symbolic keys', () => {
+			assert.throws(() => devalue({ [Symbol()]: null }));
+		});
 	});
 });

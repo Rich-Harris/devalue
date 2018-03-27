@@ -2,6 +2,7 @@ const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$';
 const reserved = /^(?:do|if|in|for|int|let|new|try|var|byte|case|char|else|enum|goto|long|this|void|with|await|break|catch|class|const|final|float|short|super|throw|while|yield|delete|double|export|import|native|return|switch|throws|typeof|boolean|default|extends|finally|package|private|abstract|continue|debugger|function|volatile|interface|protected|transient|implements|instanceof|synchronized)$/;
 const unsafe = /[<>\/\u2028\u2029]/g;
 const escaped: Record<string, string> = { '<': '\\u003C', '>' : '\\u003E', '/': '\\u002F', '\u2028': '\\u2028', '\u2029': '\\u2029' };
+const objectProtoOwnPropertyNames = Object.getOwnPropertyNames(Object.prototype).sort().join('\0');
 
 export default function devalue(value: any) {
 	const repeated = new Map();
@@ -44,8 +45,16 @@ export default function devalue(value: any) {
 				default:
 					const proto = Object.getPrototypeOf(thing);
 
-					if (proto !== Object.prototype && proto !== null) {
-						throw new Error(`Cannot stringify arbitrary non-POJOs`);
+					if (
+					  proto !== Object.prototype &&
+					  proto !== null &&
+					  Object.getOwnPropertyNames(proto).sort().join('\0') !== objectProtoOwnPropertyNames
+					) {
+					  throw new Error(`Cannot stringify arbitrary non-POJOs`);
+					}
+
+					if (Object.getOwnPropertySymbols(thing).length > 0) {
+						throw new Error(`Cannot stringify POJOs with symbolic keys`);
 					}
 
 					Object.keys(thing).forEach(key => walk(thing[key]));
