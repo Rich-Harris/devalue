@@ -1,5 +1,10 @@
 # devalue changelog
 
+## 1.0.3
+
+* Detect POJOs cross-realm ([#7](https://github.com/Rich-Harris/devalue/pull/7))
+* Error on symbolic keys ([#7](https://github.com/Rich-Harris/devalue/pull/7))
+
 ## 1.0.2
 
 * Fix global name for UMD build

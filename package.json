@@ -1,7 +1,7 @@
 {
   "name": "devalue",
   "description": "Gets the job done when JSON.stringify can't",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "repository": "Rich-Harris/devalue",
   "main": "dist/devalue.umd.js",
   "module": "dist/devalue.esm.js",
