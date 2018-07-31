@@ -14,6 +14,8 @@ describe('devalue', () => {
 		test('number', 42, '42');
 		test('negative number', -42, '-42');
 		test('negative zero', -0, '-0');
+		test('positive decimal', 0.1, '.1');
+		test('negative decimal', -0.1, '-.1');
 		test('string', 'woo!!!', '"woo!!!"');
 		test('boolean', true, 'true');
 		test('Number', new Number(42), 'Object(42)');
