@@ -1,5 +1,9 @@
 # devalue changelog
 
+## 1.0.4
+
+* Smaller output ([#10](https://github.com/Rich-Harris/devalue/pull/10))
+
 ## 1.0.3
 
 * Detect POJOs cross-realm ([#7](https://github.com/Rich-Harris/devalue/pull/7))
