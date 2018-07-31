@@ -5,8 +5,7 @@ const escaped: Record<string, string> = { '<': '\\u003C', '>' : '\\u003E', '/': 
 const objectProtoOwnPropertyNames = Object.getOwnPropertyNames(Object.prototype).sort().join('\0');
 
 export default function devalue(value: any) {
-	const repeated = new Map();
-	const seen = new Set();
+	const counts = new Map();
 
 	let n = 0;
 
@@ -15,12 +14,12 @@ export default function devalue(value: any) {
 			throw new Error(`Cannot stringify a function`);
 		}
 
-		if (seen.has(thing)) {
-			repeated.set(thing, getName(n++));
+		if (counts.has(thing)) {
+			counts.set(thing, counts.get(thing) + 1);
 			return;
 		}
 
-		seen.add(thing);
+		counts.set(thing, 1);
 
 		if (!isPrimitive(thing)) {
 			const type = getType(thing);
@@ -46,11 +45,11 @@ export default function devalue(value: any) {
 					const proto = Object.getPrototypeOf(thing);
 
 					if (
-					  proto !== Object.prototype &&
-					  proto !== null &&
-					  Object.getOwnPropertyNames(proto).sort().join('\0') !== objectProtoOwnPropertyNames
+						proto !== Object.prototype &&
+						proto !== null &&
+						Object.getOwnPropertyNames(proto).sort().join('\0') !== objectProtoOwnPropertyNames
 					) {
-					  throw new Error(`Cannot stringify arbitrary non-POJOs`);
+						throw new Error(`Cannot stringify arbitrary non-POJOs`);
 					}
 
 					if (Object.getOwnPropertySymbols(thing).length > 0) {
@@ -62,9 +61,20 @@ export default function devalue(value: any) {
 		}
 	}
 
+	walk(value);
+
+	const names = new Map();
+
+	Array.from(counts)
+		.filter(entry => entry[1] > 1)
+		.sort((a, b) => b[1] - a[1])
+		.forEach((entry, i) => {
+			names.set(entry[0], getName(i));
+		});
+
 	function stringify(thing: any): string {
-		if (repeated.has(thing)) {
-			return repeated.get(thing);
+		if (names.has(thing)) {
+			return names.get(thing);
 		}
 
 		if (isPrimitive(thing)) {
@@ -107,15 +117,14 @@ export default function devalue(value: any) {
 		}
 	}
 
-	walk(value);
 	const str = stringify(value);
 
-	if (repeated.size) {
+	if (names.size) {
 		const params: string[] = [];
 		const statements: string[] = [];
 		const values: string[] = [];
 
-		repeated.forEach((name, thing) => {
+		names.forEach((name, thing) => {
 			params.push(name);
 
 			if (isPrimitive(thing)) {
