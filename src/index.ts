@@ -205,7 +205,9 @@ function stringifyPrimitive(thing: any) {
 	if (typeof thing === 'string') return JSON.stringify(thing).replace(unsafe, escape);
 	if (thing === void 0) return 'void 0';
 	if (thing === 0 && 1 / thing < 0) return '-0';
-	return String(thing);
+	const str = String(thing);
+	if (typeof thing === 'number') return str.replace(/^(-)?0\./, '$1.');
+	return str;
 }
 
 function getType(thing: any) {
