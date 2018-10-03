@@ -1,8 +1,8 @@
 {
-  "name": "devalue",
+  "name": "@nuxtjs/devalue",
   "description": "Gets the job done when JSON.stringify can't",
   "version": "1.0.4",
-  "repository": "Rich-Harris/devalue",
+  "repository": "nuxt-community/devalue",
   "main": "dist/devalue.umd.js",
   "module": "dist/devalue.esm.js",
   "types": "types/index.d.ts",
@@ -10,6 +10,9 @@
     "dist",
 	  "types"
   ],
+  "dependencies": {
+    "consola": "^1.4.3"
+  },
   "devDependencies": {
     "@types/mocha": "^2.2.44",
     "@types/node": "^8.0.53",
