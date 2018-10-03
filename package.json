@@ -10,6 +10,9 @@
     "dist",
 	  "types"
   ],
+  "dependencies": {
+    "consola": "^1.4.3"
+  },
   "devDependencies": {
     "@types/mocha": "^2.2.44",
     "@types/node": "^8.0.53",

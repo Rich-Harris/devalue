@@ -3,15 +3,18 @@ const reserved = /^(?:do|if|in|for|int|let|new|try|var|byte|case|char|else|enum|
 const unsafe = /[<>\/\u2028\u2029]/g;
 const escaped: Record<string, string> = { '<': '\\u003C', '>' : '\\u003E', '/': '\\u002F', '\u2028': '\\u2028', '\u2029': '\\u2029' };
 const objectProtoOwnPropertyNames = Object.getOwnPropertyNames(Object.prototype).sort().join('\0');
+const consola = require('consola')
 
-export default function devalue(value: any) {
+
+export default function devalue(value: any, level = 'warn') {
 	const counts = new Map();
 
 	let n = 0;
 
 	function walk(thing: any) {
 		if (typeof thing === 'function') {
-			throw new Error(`Cannot stringify a function`);
+			consola[level](`Cannot stringify a function ${thing.name}`)
+			return
 		}
 
 		if (counts.has(thing)) {
@@ -49,14 +52,13 @@ export default function devalue(value: any) {
 						proto !== null &&
 						Object.getOwnPropertyNames(proto).sort().join('\0') !== objectProtoOwnPropertyNames
 					) {
-						throw new Error(`Cannot stringify arbitrary non-POJOs`);
+						consola[level](`Cannot stringify arbitrary non-POJOs ${thing.constructor.name}`);
+					} else if (Object.getOwnPropertySymbols(thing).length > 0) {
+						consola[level](`Cannot stringify POJOs with symbolic keys ${Object.getOwnPropertySymbols(thing)}`);
+					} else {
+						Object.keys(thing).forEach(key => walk(thing[key]));
 					}
 
-					if (Object.getOwnPropertySymbols(thing).length > 0) {
-						throw new Error(`Cannot stringify POJOs with symbolic keys`);
-					}
-
-					Object.keys(thing).forEach(key => walk(thing[key]));
 			}
 		}
 	}
