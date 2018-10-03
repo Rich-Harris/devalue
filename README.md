@@ -1,4 +1,8 @@
-# devalue
+# @nuxtjs/devalue
+
+Forked from  [devalue](https://github.com/Rich-Harris/devalue) to log errors on non serializable properties rather than Error.
+
+
 
 Like `JSON.stringify`, but handles
 
@@ -9,7 +13,7 @@ Like `JSON.stringify`, but handles
 * dates
 * `Map` and `Set`
 
-Try it out on [runkit.com](https://npm.runkit.com/devalue).
+Try it out on [runkit.com](https://npm.runkit.com/@nuxtjs/devalue).
 
 ## Goals:
 
@@ -27,7 +31,7 @@ Try it out on [runkit.com](https://npm.runkit.com/devalue).
 ## Usage
 
 ```js
-import devalue from 'devalue';
+import devalue from '@nuxtjs/devalue';
 
 let obj = { a: 1, b: 2 };
 obj.c = 3;
