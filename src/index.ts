@@ -202,7 +202,7 @@ function escape(char: string) {
 }
 
 function stringifyPrimitive(thing: any) {
-	if (typeof thing === 'string') return JSON.stringify(thing).replace(unsafe, escape);
+	if (typeof thing === 'string') return stringifyString(thing);
 	if (thing === void 0) return 'void 0';
 	if (thing === 0 && 1 / thing < 0) return '-0';
 	const str = String(thing);
@@ -220,4 +220,27 @@ function safeKey(key: string) {
 
 function safeProp(key: string) {
 	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key) ? `.${key}` : `[${JSON.stringify(key)}]`;
+}
+
+function stringifyString(str: string) {
+	let result = '"';
+
+	for (let i = 0; i < str.length; i += 1) {
+		const char = str[i];
+		const code = char.charCodeAt(0);
+
+		if (char === '"') {
+			result += '\\"';
+		} else if (char in escaped) {
+			result += escaped[char];
+		} else if ((code >= 0xD800 && code <= 0xDBFF) && i < str.length - 1) {
+			// escape lone surrogates
+			result += `\\\\u${code.toString(16).toUpperCase()}`;
+		} else {
+			result += char;
+		}
+	}
+
+	result += '"';
+	return result;
 }
