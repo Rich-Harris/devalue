@@ -1,5 +1,9 @@
 # devalue changelog
 
+## 1.1.0
+
+* Escape lone surrogates ([#13](https://github.com/Rich-Harris/devalue/issues/13))
+
 ## 1.0.4
 
 * Smaller output ([#10](https://github.com/Rich-Harris/devalue/pull/10))
