@@ -242,7 +242,7 @@ function stringifyString(str: string) {
 		} else if (code >= 0xd800 && code <= 0xdfff) {
 			const next = str.charCodeAt(i + 1);
 
-			// If this is the beginning of a [low, high] surrogate pair,
+			// If this is the beginning of a [high, low] surrogate pair,
 			// add the next two characters, otherwise escape
 			if (code <= 0xdbff && (next >= 0xdc00 && next <= 0xdfff)) {
 				result += char + str[++i];
