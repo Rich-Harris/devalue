@@ -35,6 +35,15 @@ describe('devalue', () => {
 		test('Map', new Map([['a', 'b']]), 'new Map([["a","b"]])');
 	});
 
+	describe('strings', () => {
+		test('newline', 'a\nb', JSON.stringify('a\nb'));
+		test('double quotes', '"yar"', JSON.stringify('"yar"'));
+		test('lone surrogate', "\uD800", '"\\uD800"');
+		test('surrogate pair', '𝌆', JSON.stringify('𝌆'));
+		test('nul', '\0', JSON.stringify('\0'));
+		test('backslash', '\\', JSON.stringify('\\'));
+	});
+
 	describe('cycles', () => {
 		let map = new Map();
 		map.set('self', map);
