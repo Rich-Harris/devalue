@@ -38,9 +38,13 @@ describe('devalue', () => {
 	describe('strings', () => {
 		test('newline', 'a\nb', JSON.stringify('a\nb'));
 		test('double quotes', '"yar"', JSON.stringify('"yar"'));
-		test('lone surrogate', "\uD800", '"\\uD800"');
+		test('lone low surrogate', "a\uDC00b", '"a\\uDC00b"');
+		test('lone high surrogate', "a\uD800b", '"a\\uD800b"');
+		test('two low surrogates', "a\uDC00\uDC00b", '"a\\uDC00\\uDC00b"');
+		test('two high surrogates', "a\uD800\uD800b", '"a\\uD800\\uD800b"');
 		test('surrogate pair', '𝌆', JSON.stringify('𝌆'));
-		test('nul', '\0', JSON.stringify('\0'));
+		test('surrogate pair in wrong order', 'a\uDC00\uD800b', '"a\uDC00\uD800b"');
+		test('nul', '\0', '"\0"');
 		test('backslash', '\\', JSON.stringify('\\'));
 	});
 

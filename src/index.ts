@@ -11,7 +11,6 @@ const escaped: Record<string, string> = {
 	'\n': '\\n',
 	'\r': '\\r',
 	'\t': '\\t',
-	'\0': '\\u0000',
 	'\u2028': '\\u2028',
 	'\u2029': '\\u2029'
 };
@@ -246,10 +245,10 @@ function stringifyString(str: string) {
 			result += '\\"';
 		} else if (char in escaped) {
 			result += escaped[char];
-		} else if ((code >= 0xD800 && code <= 0xDBFF)) {
+		} else if (code >= 0xD800 && code <= 0xDBFF) {
 			const next = str.charCodeAt(i + 1);
 			if (next >= 0xDC00 && next <= 0xDFFF) {
-				result += char;
+				result += char + str[++i];
 			} else {
 				// lone surrogates
 				result += `\\u${code.toString(16).toUpperCase()}`;
