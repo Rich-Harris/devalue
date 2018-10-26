@@ -43,7 +43,7 @@ describe('devalue', () => {
 		test('two low surrogates', "a\uDC00\uDC00b", '"a\\uDC00\\uDC00b"');
 		test('two high surrogates', "a\uD800\uD800b", '"a\\uD800\\uD800b"');
 		test('surrogate pair', '𝌆', JSON.stringify('𝌆'));
-		test('surrogate pair in wrong order', 'a\uDC00\uD800b', '"a\uDC00\uD800b"');
+		test('surrogate pair in wrong order', 'a\uDC00\uD800b', '"a\\uDC00\\uD800b"');
 		test('nul', '\0', '"\0"');
 		test('backslash', '\\', JSON.stringify('\\'));
 	});
