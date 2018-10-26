@@ -1,13 +1,23 @@
 const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$';
 const reserved = /^(?:do|if|in|for|int|let|new|try|var|byte|case|char|else|enum|goto|long|this|void|with|await|break|catch|class|const|final|float|short|super|throw|while|yield|delete|double|export|import|native|return|switch|throws|typeof|boolean|default|extends|finally|package|private|abstract|continue|debugger|function|volatile|interface|protected|transient|implements|instanceof|synchronized)$/;
-const unsafe = /[<>\/\u2028\u2029]/g;
-const escaped: Record<string, string> = { '<': '\\u003C', '>' : '\\u003E', '/': '\\u002F', '\u2028': '\\u2028', '\u2029': '\\u2029' };
+const escaped: Record<string, string> = {
+	'<': '\\u003C',
+	'>' : '\\u003E',
+	'/': '\\u002F',
+	'\\': '\\\\',
+	'\b': '\\b',
+	'\f': '\\f',
+	'\n': '\\n',
+	'\r': '\\r',
+	'\t': '\\t',
+	'\0': '\\0',
+	'\u2028': '\\u2028',
+	'\u2029': '\\u2029'
+};
 const objectProtoOwnPropertyNames = Object.getOwnPropertyNames(Object.prototype).sort().join('\0');
 
 export default function devalue(value: any) {
 	const counts = new Map();
-
-	let n = 0;
 
 	function walk(thing: any) {
 		if (typeof thing === 'function') {
@@ -197,12 +207,8 @@ function isPrimitive(thing: any) {
 	return Object(thing) !== thing;
 }
 
-function escape(char: string) {
-	return escaped[char];
-}
-
 function stringifyPrimitive(thing: any) {
-	if (typeof thing === 'string') return JSON.stringify(thing).replace(unsafe, escape);
+	if (typeof thing === 'string') return stringifyString(thing);
 	if (thing === void 0) return 'void 0';
 	if (thing === 0 && 1 / thing < 0) return '-0';
 	const str = String(thing);
@@ -220,4 +226,34 @@ function safeKey(key: string) {
 
 function safeProp(key: string) {
 	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key) ? `.${key}` : `[${JSON.stringify(key)}]`;
+}
+
+function stringifyString(str: string) {
+	let result = '"';
+
+	for (let i = 0; i < str.length; i += 1) {
+		const char = str.charAt(i);
+		const code = char.charCodeAt(0);
+
+		if (char === '"') {
+			result += '\\"';
+		} else if (char in escaped) {
+			result += escaped[char];
+		} else if (code >= 0xd800 && code <= 0xdfff) {
+			const next = str.charCodeAt(i + 1);
+
+			// If this is the beginning of a [high, low] surrogate pair,
+			// add the next two characters, otherwise escape
+			if (code <= 0xdbff && (next >= 0xdc00 && next <= 0xdfff)) {
+				result += char + str[++i];
+			} else {
+				result += `\\u${code.toString(16).toUpperCase()}`;
+			}
+		} else {
+			result += char;
+		}
+	}
+
+	result += '"';
+	return result;
 }
