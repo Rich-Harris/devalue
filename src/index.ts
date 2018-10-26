@@ -1,6 +1,5 @@
 const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$';
 const reserved = /^(?:do|if|in|for|int|let|new|try|var|byte|case|char|else|enum|goto|long|this|void|with|await|break|catch|class|const|final|float|short|super|throw|while|yield|delete|double|export|import|native|return|switch|throws|typeof|boolean|default|extends|finally|package|private|abstract|continue|debugger|function|volatile|interface|protected|transient|implements|instanceof|synchronized)$/;
-const unsafe = /[<>\/\u2028\u2029]/g;
 const escaped: Record<string, string> = {
 	'<': '\\u003C',
 	'>' : '\\u003E',
@@ -18,8 +17,6 @@ const objectProtoOwnPropertyNames = Object.getOwnPropertyNames(Object.prototype)
 
 export default function devalue(value: any) {
 	const counts = new Map();
-
-	let n = 0;
 
 	function walk(thing: any) {
 		if (typeof thing === 'function') {
@@ -207,10 +204,6 @@ function getName(num: number) {
 
 function isPrimitive(thing: any) {
 	return Object(thing) !== thing;
-}
-
-function escape(char: string) {
-	return escaped[char];
 }
 
 function stringifyPrimitive(thing: any) {
