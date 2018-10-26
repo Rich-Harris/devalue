@@ -245,12 +245,14 @@ function stringifyString(str: string) {
 			result += '\\"';
 		} else if (char in escaped) {
 			result += escaped[char];
-		} else if (code >= 0xD800 && code <= 0xDBFF) {
+		} else if (code >= 0xd800 && code <= 0xdfff) {
 			const next = str.charCodeAt(i + 1);
-			if (next >= 0xDC00 && next <= 0xDFFF) {
+
+			// If this is the beginning of a [low, high] surrogate pair,
+			// add the next two characters, otherwise escape
+			if (code <= 0xdbff && (next >= 0xdc00 && next <= 0xdfff)) {
 				result += char + str[++i];
 			} else {
-				// lone surrogates
 				result += `\\u${code.toString(16).toUpperCase()}`;
 			}
 		} else {
