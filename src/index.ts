@@ -1,4 +1,5 @@
 const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$';
+const unsafeChars = /[<>\b\f\n\r\t\0\u2028\u2029]/g;
 const reserved = /^(?:do|if|in|for|int|let|new|try|var|byte|case|char|else|enum|goto|long|this|void|with|await|break|catch|class|const|final|float|short|super|throw|while|yield|delete|double|export|import|native|return|switch|throws|typeof|boolean|default|extends|finally|package|private|abstract|continue|debugger|function|volatile|interface|protected|transient|implements|instanceof|synchronized)$/;
 const escaped: Record<string, string> = {
 	'<': '\\u003C',
@@ -220,12 +221,20 @@ function getType(thing: any) {
 	return Object.prototype.toString.call(thing).slice(8, -1);
 }
 
+function escapeUnsafeChar(c: string) {
+	return escaped[c] || c
+}
+
+function escapeUnsafeChars(str: string) {
+	return str.replace(unsafeChars, escapeUnsafeChar)
+}
+
 function safeKey(key: string) {
-	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key) ? key : JSON.stringify(key);
+	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key) ? key : JSON.stringify(escapeUnsafeChars(key));
 }
 
 function safeProp(key: string) {
-	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key) ? `.${key}` : `[${JSON.stringify(key)}]`;
+	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key) ? `.${key}` : `[${JSON.stringify(escapeUnsafeChars(key))}]`;
 }
 
 function stringifyString(str: string) {
