@@ -91,7 +91,7 @@ describe('devalue', () => {
 		test(
 			'Dangerous key',
 			{ '<svg onload=alert("xss_works")>': 'bar' },
-			'{"\\\\u003Csvg onload=alert(\\"xss_works\\")\\\\u003E":"bar"}'
+			'{"\\u003Csvg onload=alert(\\"xss_works\\")\\u003E":"bar"}'
 		)
 	});
 

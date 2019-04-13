@@ -230,11 +230,11 @@ function escapeUnsafeChars(str: string) {
 }
 
 function safeKey(key: string) {
-	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key) ? key : JSON.stringify(escapeUnsafeChars(key));
+	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key) ? key : escapeUnsafeChars(JSON.stringify(key));
 }
 
 function safeProp(key: string) {
-	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key) ? `.${key}` : `[${JSON.stringify(escapeUnsafeChars(key))}]`;
+	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key) ? `.${key}` : `[${escapeUnsafeChars(JSON.stringify(key))}]`;
 }
 
 function stringifyString(str: string) {
