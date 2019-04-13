@@ -88,6 +88,11 @@ describe('devalue', () => {
 			`</script><script src='https://evil.com/script.js'>alert('pwned')</script><script>`,
 			`"\\u003C\\u002Fscript\\u003E\\u003Cscript src='https:\\u002F\\u002Fevil.com\\u002Fscript.js'\\u003Ealert('pwned')\\u003C\\u002Fscript\\u003E\\u003Cscript\\u003E"`
 		);
+		test(
+			'Dangerous key',
+			{ '<svg onload=alert("xss_works")>': 'bar' },
+			'{"\\\\u003Csvg onload=alert(\\"xss_works\\")\\\\u003E":"bar"}'
+		)
 	});
 
 	describe('misc', () => {
