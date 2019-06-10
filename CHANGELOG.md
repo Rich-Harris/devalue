@@ -1,5 +1,9 @@
 # devalue changelog
 
+## 1.1.1
+
+* Prevent object key XSS vulnerability ([#19](https://github.com/Rich-Harris/devalue/issues/19))
+
 ## 1.1.0
 
 * Escape lone surrogates ([#13](https://github.com/Rich-Harris/devalue/issues/13))
