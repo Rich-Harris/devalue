@@ -1,5 +1,9 @@
 # devalue changelog
 
+## 2.0.0
+
+* Change license to MIT
+
 ## 1.1.1
 
 * Prevent object key XSS vulnerability ([#19](https://github.com/Rich-Harris/devalue/issues/19))
