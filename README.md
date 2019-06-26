@@ -111,6 +111,7 @@ Using `new Function(code)` is akin to using indirect eval.
 * [arson](https://github.com/benjamn/arson) by Ben Newman
 * [tosource](https://github.com/marcello3d/node-tosource) by Marcello Bastéa-Forte
 * [serialize-javascript](https://github.com/yahoo/serialize-javascript) by Eric Ferraiuolo
+* [jsesc](https://github.com/mathiasbynens/jsesc) by Mathias Bynens
 
 
 ## License
