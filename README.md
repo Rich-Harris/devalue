@@ -116,4 +116,4 @@ Using `new Function(code)` is akin to using indirect eval.
 
 ## License
 
-[LIL](LICENSE)
+[MIT](LICENSE)
