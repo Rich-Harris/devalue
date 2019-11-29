@@ -25,7 +25,7 @@ describe('devalue', () => {
 		test('null', null, 'null');
 		test('NaN', NaN, 'NaN');
 		test('Infinity', Infinity, 'Infinity');
-		test('RegExp', /regexp/img, '/regexp/gim');
+		test('RegExp', /regexp/img, 'new RegExp("regexp", "gim")');
 		test('Date', new Date(1e12), 'new Date(1000000000000)');
 		test('Array', ['a', 'b', 'c'], '["a","b","c"]');
 		test('Array (empty)', [], '[]');
@@ -92,7 +92,12 @@ describe('devalue', () => {
 			'Dangerous key',
 			{ '<svg onload=alert("xss_works")>': 'bar' },
 			'{"\\u003Csvg onload=alert(\\"xss_works\\")\\u003E":"bar"}'
-		)
+		);
+		test(
+			'Dangerous regex',
+			/[</script><script>alert('xss')//]/,
+			`new RegExp("[\\u003C\\\\\\u002Fscript\\u003E\\u003Cscript\\u003Ealert('xss')\\\\\\u002F\\\\\\u002F]", "")`
+		);
 	});
 
 	describe('misc', () => {

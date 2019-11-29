@@ -1,5 +1,9 @@
 # devalue changelog
 
+## 2.0.1
+
+* Prevent regex XSS vulnerability in non-Node environments
+
 ## 2.0.0
 
 * Change license to MIT

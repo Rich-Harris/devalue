@@ -101,7 +101,7 @@ export default function devalue(value: any) {
 				return `Object(${stringify(thing.valueOf())})`;
 
 			case 'RegExp':
-				return thing.toString();
+				return `new RegExp(${stringifyString(thing.source)}, "${thing.flags}")`;
 
 			case 'Date':
 				return `new Date(${thing.getTime()})`;
