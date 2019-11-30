@@ -103,6 +103,8 @@ describe('devalue', () => {
 	describe('misc', () => {
 		test('Object without prototype', Object.create(null), 'Object.create(null)');
 
+		test('Object without prototype with values', Object.assign(Object.create(null), { foo: 1 }), 'Object.create(null,{foo:{writable:true,value:1}})');
+
 		// let arr = [];
 		// arr.x = 42;
 		// test('Array with named properties', arr, `TODO`);

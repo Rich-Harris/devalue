@@ -116,15 +116,15 @@ export default function devalue(value: any) {
 				return `new ${type}([${Array.from(thing).map(stringify).join(',')}])`;
 
 			default:
-				const obj = `{${Object.keys(thing).map(key => `${safeKey(key)}:${stringify(thing[key])}`).join(',')}}`;
-				const proto = Object.getPrototypeOf(thing);
-				if (proto === null) {
-					return Object.keys(thing).length > 0
-						? `Object.assign(Object.create(null),${obj})`
-						: `Object.create(null)`;
+				if (Object.getPrototypeOf(thing) === null) {
+					if (Object.keys(thing).length === 0) {
+						return 'Object.create(null)';
+					}
+
+					return `Object.create(null,{${Object.keys(thing).map(key => `${safeKey(key)}:{writable:true,value:${stringify(thing[key])}}`).join(',')}})`;
 				}
 
-				return obj;
+				return `{${Object.keys(thing).map(key => `${safeKey(key)}:${stringify(thing[key])}`).join(',')}}`;
 		}
 	}
 
