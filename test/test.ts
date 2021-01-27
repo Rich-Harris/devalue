@@ -118,5 +118,13 @@ describe('devalue', () => {
 		it('throws for symbolic keys', () => {
 			assert.throws(() => devalue({ [Symbol()]: null }));
 		});
+
+		it('do not have duplicates in generated argument names', () => {
+			const foo = new Array(20000).fill(0).map((_, i) => i);
+			const bar = foo.map((_, i) => ({ [i]: foo[i] }));
+			const serialized = devalue([foo, ...bar]);
+
+			assert.doesNotThrow(() => eval(serialized), /Duplicate parameter name/);
+		});
 	});
 });
