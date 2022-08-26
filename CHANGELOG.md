@@ -1,5 +1,9 @@
 # devalue changelog
 
+## 3.0.1
+
+- Prevent duplicate parameter names ([#33](https://github.com/Rich-Harris/devalue/pull/33))
+
 ## 3.0.0
 
 - Convert to ESM
