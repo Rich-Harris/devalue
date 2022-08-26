@@ -1,5 +1,5 @@
 const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$';
-const unsafeChars = /[<>\b\f\n\r\t\0\u2028\u2029]/g;
+const unsafe_chars = /[<>\b\f\n\r\t\0\u2028\u2029]/g;
 const reserved =
 	/^(?:do|if|in|for|int|let|new|try|var|byte|case|char|else|enum|goto|long|this|void|with|await|break|catch|class|const|final|float|short|super|throw|while|yield|delete|double|export|import|native|return|switch|throws|typeof|boolean|default|extends|finally|package|private|abstract|continue|debugger|function|volatile|interface|protected|transient|implements|instanceof|synchronized)$/;
 
@@ -18,7 +18,7 @@ const escaped = {
 	'\u2028': '\\u2028',
 	'\u2029': '\\u2029'
 };
-const objectProtoOwnPropertyNames = Object.getOwnPropertyNames(Object.prototype)
+const object_proto_names = Object.getOwnPropertyNames(Object.prototype)
 	.sort()
 	.join('\0');
 
@@ -42,8 +42,8 @@ export function devalue(value) {
 
 		counts.set(thing, 1);
 
-		if (!isPrimitive(thing)) {
-			const type = getType(thing);
+		if (!is_primitive(thing)) {
+			const type = get_type(thing);
 
 			switch (type) {
 				case 'Number':
@@ -70,7 +70,7 @@ export function devalue(value) {
 						proto !== Object.prototype &&
 						proto !== null &&
 						Object.getOwnPropertyNames(proto).sort().join('\0') !==
-							objectProtoOwnPropertyNames
+							object_proto_names
 					) {
 						throw new Error(`Cannot stringify arbitrary non-POJOs`);
 					}
@@ -92,7 +92,7 @@ export function devalue(value) {
 		.filter((entry) => entry[1] > 1)
 		.sort((a, b) => b[1] - a[1])
 		.forEach((entry, i) => {
-			names.set(entry[0], getName(i));
+			names.set(entry[0], get_name(i));
 		});
 
 	/**
@@ -104,11 +104,11 @@ export function devalue(value) {
 			return names.get(thing);
 		}
 
-		if (isPrimitive(thing)) {
-			return stringifyPrimitive(thing);
+		if (is_primitive(thing)) {
+			return stringify_primitive(thing);
 		}
 
-		const type = getType(thing);
+		const type = get_type(thing);
 
 		switch (type) {
 			case 'Number':
@@ -117,7 +117,9 @@ export function devalue(value) {
 				return `Object(${stringify(thing.valueOf())})`;
 
 			case 'RegExp':
-				return `new RegExp(${stringifyString(thing.source)}, "${thing.flags}")`;
+				return `new RegExp(${stringify_string(thing.source)}, "${
+					thing.flags
+				}")`;
 
 			case 'Date':
 				return `new Date(${thing.getTime()})`;
@@ -135,7 +137,7 @@ export function devalue(value) {
 
 			default:
 				const obj = `{${Object.keys(thing)
-					.map((key) => `${safeKey(key)}:${stringify(thing[key])}`)
+					.map((key) => `${safe_key(key)}:${stringify(thing[key])}`)
 					.join(',')}}`;
 				const proto = Object.getPrototypeOf(thing);
 				if (proto === null) {
@@ -163,12 +165,12 @@ export function devalue(value) {
 		names.forEach((name, thing) => {
 			params.push(name);
 
-			if (isPrimitive(thing)) {
-				values.push(stringifyPrimitive(thing));
+			if (is_primitive(thing)) {
+				values.push(stringify_primitive(thing));
 				return;
 			}
 
-			const type = getType(thing);
+			const type = get_type(thing);
 
 			switch (type) {
 				case 'Number':
@@ -215,7 +217,9 @@ export function devalue(value) {
 						Object.getPrototypeOf(thing) === null ? 'Object.create(null)' : '{}'
 					);
 					Object.keys(thing).forEach((key) => {
-						statements.push(`${name}${safeProp(key)}=${stringify(thing[key])}`);
+						statements.push(
+							`${name}${safe_prop(key)}=${stringify(thing[key])}`
+						);
 					});
 			}
 		});
@@ -231,7 +235,7 @@ export function devalue(value) {
 }
 
 /** @param {number} num */
-function getName(num) {
+function get_name(num) {
 	let name = '';
 
 	do {
@@ -243,13 +247,13 @@ function getName(num) {
 }
 
 /** @param {any} thing */
-function isPrimitive(thing) {
+function is_primitive(thing) {
 	return Object(thing) !== thing;
 }
 
 /** @param {any} thing */
-function stringifyPrimitive(thing) {
-	if (typeof thing === 'string') return stringifyString(thing);
+function stringify_primitive(thing) {
+	if (typeof thing === 'string') return stringify_string(thing);
 	if (thing === void 0) return 'void 0';
 	if (thing === 0 && 1 / thing < 0) return '-0';
 	const str = String(thing);
@@ -259,36 +263,36 @@ function stringifyPrimitive(thing) {
 }
 
 /** @param {any} thing */
-function getType(thing) {
+function get_type(thing) {
 	return Object.prototype.toString.call(thing).slice(8, -1);
 }
 
 /** @param {string} c */
-function escapeUnsafeChar(c) {
+function escape_unsafe_char(c) {
 	return escaped[c] || c;
 }
 
 /** @param {string} str */
-function escapeUnsafeChars(str) {
-	return str.replace(unsafeChars, escapeUnsafeChar);
+function escape_unsafe_chars(str) {
+	return str.replace(unsafe_chars, escape_unsafe_char);
 }
 
 /** @param {string} key */
-function safeKey(key) {
+function safe_key(key) {
 	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key)
 		? key
-		: escapeUnsafeChars(JSON.stringify(key));
+		: escape_unsafe_chars(JSON.stringify(key));
 }
 
 /** @param {string} key */
-function safeProp(key) {
+function safe_prop(key) {
 	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key)
 		? `.${key}`
-		: `[${escapeUnsafeChars(JSON.stringify(key))}]`;
+		: `[${escape_unsafe_chars(JSON.stringify(key))}]`;
 }
 
 /** @param {string} str */
-function stringifyString(str) {
+function stringify_string(str) {
 	let result = '"';
 
 	for (let i = 0; i < str.length; i += 1) {
