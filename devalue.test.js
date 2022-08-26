@@ -1,5 +1,5 @@
 import * as vm from 'vm';
-import devalue from './devalue.js';
+import { devalue } from './devalue.js';
 
 let passed = 0;
 let failed = 0;
