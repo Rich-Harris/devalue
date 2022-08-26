@@ -22,6 +22,18 @@ const object_proto_names = Object.getOwnPropertyNames(Object.prototype)
 	.sort()
 	.join('\0');
 
+class DevalueError extends Error {
+	/**
+	 * @param {string} message
+	 * @param {string[]} keys
+	 */
+	constructor(message, keys) {
+		super(message);
+		this.name = 'DevalueError';
+		this.path = keys.join('');
+	}
+}
+
 /**
  * Turn a value into the JavaScript that creates an equivalent value
  * @param {any} value
@@ -29,10 +41,13 @@ const object_proto_names = Object.getOwnPropertyNames(Object.prototype)
 export function devalue(value) {
 	const counts = new Map();
 
+	/** @type {string[]} */
+	const keys = [];
+
 	/** @param {any} thing */
 	function walk(thing) {
 		if (typeof thing === 'function') {
-			throw new Error(`Cannot stringify a function`);
+			throw new DevalueError(`Cannot stringify a function`, keys);
 		}
 
 		if (counts.has(thing)) {
@@ -55,12 +70,25 @@ export function devalue(value) {
 					return;
 
 				case 'Array':
-					thing.forEach(walk);
+					/** @type {any[]} */ (thing).forEach((value, i) => {
+						keys.push(`[${i}]`);
+						walk(value);
+						keys.pop();
+					});
 					break;
 
 				case 'Set':
-				case 'Map':
 					Array.from(thing).forEach(walk);
+					break;
+
+				case 'Map':
+					for (const [key, value] of thing) {
+						keys.push(
+							`.get(${is_primitive(key) ? stringify_primitive(key) : '...'})`
+						);
+						walk(value);
+						keys.pop();
+					}
 					break;
 
 				default:
@@ -72,14 +100,24 @@ export function devalue(value) {
 						Object.getOwnPropertyNames(proto).sort().join('\0') !==
 							object_proto_names
 					) {
-						throw new Error(`Cannot stringify arbitrary non-POJOs`);
+						throw new DevalueError(
+							`Cannot stringify arbitrary non-POJOs`,
+							keys
+						);
 					}
 
 					if (Object.getOwnPropertySymbols(thing).length > 0) {
-						throw new Error(`Cannot stringify POJOs with symbolic keys`);
+						throw new DevalueError(
+							`Cannot stringify POJOs with symbolic keys`,
+							keys
+						);
 					}
 
-					Object.keys(thing).forEach((key) => walk(thing[key]));
+					for (const key in thing) {
+						keys.push(`.${key}`);
+						walk(thing[key]);
+						keys.pop();
+					}
 			}
 		}
 	}
