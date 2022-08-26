@@ -155,4 +155,31 @@ uvu.test('does not create duplicate parameter names', () => {
 	eval(serialized);
 });
 
+uvu.test('populates error.keys and error.path', () => {
+	try {
+		devalue({
+			foo: {
+				array: [function invalid() {}]
+			}
+		});
+	} catch (e) {
+		assert.equal(e.name, 'DevalueError');
+		assert.equal(e.message, 'Cannot stringify a function');
+		assert.equal(e.path, '.foo.array[0]');
+	}
+
+	try {
+		class Whatever {}
+		devalue({
+			foo: {
+				map: new Map([['key', new Whatever()]])
+			}
+		});
+	} catch (e) {
+		assert.equal(e.name, 'DevalueError');
+		assert.equal(e.message, 'Cannot stringify arbitrary non-POJOs');
+		assert.equal(e.path, '.foo.map.get("key")');
+	}
+});
+
 uvu.test.run();
