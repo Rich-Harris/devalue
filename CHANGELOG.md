@@ -1,5 +1,9 @@
 # devalue changelog
 
+## 3.1.1
+
+- Include `types` in package
+
 ## 3.1.0
 
 - Include `path` in error object if value is unserializable
