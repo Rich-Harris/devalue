@@ -243,7 +243,7 @@ function get_name(num) {
 		num = ~~(num / chars.length) - 1;
 	} while (num >= 0);
 
-	return reserved.test(name) ? `${name}_` : name;
+	return reserved.test(name) ? `${name}0` : name;
 }
 
 /** @param {any} thing */
