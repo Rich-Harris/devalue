@@ -8,6 +8,7 @@ Like `JSON.stringify`, but handles
 - regular expressions
 - dates
 - `Map` and `Set`
+- `BigInt`
 
 Try it out on [runkit.com](https://npm.runkit.com/devalue).
 
