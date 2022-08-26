@@ -26,7 +26,7 @@ const objectProtoOwnPropertyNames = Object.getOwnPropertyNames(Object.prototype)
  * Turn a value into the JavaScript that creates an equivalent value
  * @param {any} value
  */
-export default function devalue(value) {
+export function devalue(value) {
 	const counts = new Map();
 
 	/** @param {any} thing */
