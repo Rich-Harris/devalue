@@ -1,5 +1,9 @@
 # devalue changelog
 
+## 3.1.0
+
+- Include `path` in error object if value is unserializable
+
 ## 3.0.1
 
 - Prevent duplicate parameter names ([#33](https://github.com/Rich-Harris/devalue/pull/33))

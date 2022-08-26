@@ -37,7 +37,24 @@ obj.self = obj;
 devalue(obj); // '(function(a){a.a=1;a.b=2;a.c=3;a.self=a;return a}({}))'
 ```
 
-If `devalue` encounters a function or a non-POJO, it will throw an error.
+## Error handling
+
+If `devalue` encounters a function or a non-POJO, it will throw an error. You can find where in the input data the offending value lives by inspecting `error.path`:
+
+```js
+try {
+  const map = new Map();
+  map.set('key', function invalid() {});
+
+  devalue({
+    object: {
+      array: [map]
+    }
+  })
+} catch (e) {
+  console.log(e.path); // '.object.array[0].get("key")'
+}
+```
 
 ## XSS mitigation
 
