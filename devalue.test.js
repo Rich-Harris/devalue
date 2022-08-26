@@ -22,38 +22,6 @@ function compare(name, fn) {
 	test.run();
 }
 
-/**
- *
- * @param {string} name
- * @param {(...args: any[]) => void} fn
- */
-function throws(name, fn) {
-	try {
-		fn();
-		console.log(`❌ ${name}`);
-		failed += 1;
-	} catch (e) {
-		console.log(`✅ ${name}`);
-		passed += 1;
-	}
-}
-
-/**
- *
- * @param {string} name
- * @param {(...args: any[]) => void} fn
- */
-function allows(name, fn) {
-	try {
-		fn();
-		console.log(`✅ ${name}`);
-		passed += 1;
-	} catch (e) {
-		console.log(`❌ ${name} (${e.message})`);
-		failed += 1;
-	}
-}
-
 compare('basics', (t) => {
 	t('number', 42, '42');
 	t('negative number', -42, '-42');
