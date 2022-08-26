@@ -1,8 +1,12 @@
 # devalue changelog
 
+## 3.1.2
+
+- Include `pkg.types`
+
 ## 3.1.1
 
-- Include `types` in package
+- Include `types` in `pkg.files`
 
 ## 3.1.0
 
