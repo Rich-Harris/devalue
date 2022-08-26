@@ -45,6 +45,22 @@ function throws(name, fn) {
 	}
 }
 
+/**
+ *
+ * @param {string} name
+ * @param {(...args: any[]) => void} fn
+ */
+function allows(name, fn) {
+	try {
+		fn();
+		console.log(`✅ ${name}`);
+		passed += 1;
+	} catch (e) {
+		console.log(`❌ ${name} (${e.message})`);
+		failed += 1;
+	}
+}
+
 describe('basics', (t) => {
 	t('number', 42, '42');
 	t('negative number', -42, '-42');
@@ -172,6 +188,14 @@ describe('misc', (t) => {
 
 	throws('throws for symbolic keys', () => {
 		devalue({ [Symbol()]: null });
+	});
+
+	allows('does not create duplicate parameter names', () => {
+		const foo = new Array(20000).fill(0).map((_, i) => i);
+		const bar = foo.map((_, i) => ({ [i]: foo[i] }));
+		const serialized = devalue([foo, ...bar]);
+
+		eval(serialized);
 	});
 });
 
