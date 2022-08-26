@@ -18,5 +18,6 @@
 		"prepublishOnly": "npm test && npm run build"
 	},
 	"license": "MIT",
-	"type": "module"
+	"type": "module",
+	"packageManager": "pnpm@7.9.5"
 }
