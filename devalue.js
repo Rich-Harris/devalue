@@ -1,9 +1,12 @@
 const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$';
 const unsafeChars = /[<>\b\f\n\r\t\0\u2028\u2029]/g;
-const reserved = /^(?:do|if|in|for|int|let|new|try|var|byte|case|char|else|enum|goto|long|this|void|with|await|break|catch|class|const|final|float|short|super|throw|while|yield|delete|double|export|import|native|return|switch|throws|typeof|boolean|default|extends|finally|package|private|abstract|continue|debugger|function|volatile|interface|protected|transient|implements|instanceof|synchronized)$/;
-const escaped: Record<string, string> = {
+const reserved =
+	/^(?:do|if|in|for|int|let|new|try|var|byte|case|char|else|enum|goto|long|this|void|with|await|break|catch|class|const|final|float|short|super|throw|while|yield|delete|double|export|import|native|return|switch|throws|typeof|boolean|default|extends|finally|package|private|abstract|continue|debugger|function|volatile|interface|protected|transient|implements|instanceof|synchronized)$/;
+
+/** @type {Record<string, string>} */
+const escaped = {
 	'<': '\\u003C',
-	'>' : '\\u003E',
+	'>': '\\u003E',
 	'/': '\\u002F',
 	'\\': '\\\\',
 	'\b': '\\b',
@@ -15,12 +18,19 @@ const escaped: Record<string, string> = {
 	'\u2028': '\\u2028',
 	'\u2029': '\\u2029'
 };
-const objectProtoOwnPropertyNames = Object.getOwnPropertyNames(Object.prototype).sort().join('\0');
+const objectProtoOwnPropertyNames = Object.getOwnPropertyNames(Object.prototype)
+	.sort()
+	.join('\0');
 
-export default function devalue(value: any) {
+/**
+ * Turn a value into the JavaScript that creates an equivalent value
+ * @param {any} value
+ */
+export default function devalue(value) {
 	const counts = new Map();
 
-	function walk(thing: any) {
+	/** @param {any} thing */
+	function walk(thing) {
 		if (typeof thing === 'function') {
 			throw new Error(`Cannot stringify a function`);
 		}
@@ -58,7 +68,8 @@ export default function devalue(value: any) {
 					if (
 						proto !== Object.prototype &&
 						proto !== null &&
-						Object.getOwnPropertyNames(proto).sort().join('\0') !== objectProtoOwnPropertyNames
+						Object.getOwnPropertyNames(proto).sort().join('\0') !==
+							objectProtoOwnPropertyNames
 					) {
 						throw new Error(`Cannot stringify arbitrary non-POJOs`);
 					}
@@ -67,7 +78,7 @@ export default function devalue(value: any) {
 						throw new Error(`Cannot stringify POJOs with symbolic keys`);
 					}
 
-					Object.keys(thing).forEach(key => walk(thing[key]));
+					Object.keys(thing).forEach((key) => walk(thing[key]));
 			}
 		}
 	}
@@ -77,13 +88,17 @@ export default function devalue(value: any) {
 	const names = new Map();
 
 	Array.from(counts)
-		.filter(entry => entry[1] > 1)
+		.filter((entry) => entry[1] > 1)
 		.sort((a, b) => b[1] - a[1])
 		.forEach((entry, i) => {
 			names.set(entry[0], getName(i));
 		});
 
-	function stringify(thing: any): string {
+	/**
+	 * @param {any} thing
+	 * @returns {string}
+	 */
+	function stringify(thing) {
 		if (names.has(thing)) {
 			return names.get(thing);
 		}
@@ -107,8 +122,10 @@ export default function devalue(value: any) {
 				return `new Date(${thing.getTime()})`;
 
 			case 'Array':
-				const members = thing.map((v: any, i: number) => i in thing ? stringify(v) : '');
-				const tail = thing.length === 0 || (thing.length - 1 in thing) ? '' : ',';
+				const members = /** @type {any[]} */ (thing).map((v, i) =>
+					i in thing ? stringify(v) : ''
+				);
+				const tail = thing.length === 0 || thing.length - 1 in thing ? '' : ',';
 				return `[${members.join(',')}${tail}]`;
 
 			case 'Set':
@@ -116,7 +133,9 @@ export default function devalue(value: any) {
 				return `new ${type}([${Array.from(thing).map(stringify).join(',')}])`;
 
 			default:
-				const obj = `{${Object.keys(thing).map(key => `${safeKey(key)}:${stringify(thing[key])}`).join(',')}}`;
+				const obj = `{${Object.keys(thing)
+					.map((key) => `${safeKey(key)}:${stringify(thing[key])}`)
+					.join(',')}}`;
 				const proto = Object.getPrototypeOf(thing);
 				if (proto === null) {
 					return Object.keys(thing).length > 0
@@ -131,9 +150,14 @@ export default function devalue(value: any) {
 	const str = stringify(value);
 
 	if (names.size) {
-		const params: string[] = [];
-		const statements: string[] = [];
-		const values: string[] = [];
+		/** @type {string[]} */
+		const params = [];
+
+		/** @type {string[]} */
+		const statements = [];
+
+		/** @type {string[]} */
+		const values = [];
 
 		names.forEach((name, thing) => {
 			params.push(name);
@@ -162,24 +186,34 @@ export default function devalue(value: any) {
 
 				case 'Array':
 					values.push(`Array(${thing.length})`);
-					thing.forEach((v: any, i: number) => {
+					/** @type {any[]} */ (thing).forEach((v, i) => {
 						statements.push(`${name}[${i}]=${stringify(v)}`);
 					});
 					break;
 
 				case 'Set':
 					values.push(`new Set`);
-					statements.push(`${name}.${Array.from(thing).map(v => `add(${stringify(v)})`).join('.')}`);
+					statements.push(
+						`${name}.${Array.from(thing)
+							.map((v) => `add(${stringify(v)})`)
+							.join('.')}`
+					);
 					break;
 
 				case 'Map':
 					values.push(`new Map`);
-					statements.push(`${name}.${Array.from(thing).map(([k, v]) => `set(${stringify(k)}, ${stringify(v)})`).join('.')}`);
+					statements.push(
+						`${name}.${Array.from(thing)
+							.map(([k, v]) => `set(${stringify(k)}, ${stringify(v)})`)
+							.join('.')}`
+					);
 					break;
 
 				default:
-					values.push(Object.getPrototypeOf(thing) === null ? 'Object.create(null)' : '{}');
-					Object.keys(thing).forEach(key => {
+					values.push(
+						Object.getPrototypeOf(thing) === null ? 'Object.create(null)' : '{}'
+					);
+					Object.keys(thing).forEach((key) => {
 						statements.push(`${name}${safeProp(key)}=${stringify(thing[key])}`);
 					});
 			}
@@ -187,13 +221,16 @@ export default function devalue(value: any) {
 
 		statements.push(`return ${str}`);
 
-		return `(function(${params.join(',')}){${statements.join(';')}}(${values.join(',')}))`
+		return `(function(${params.join(',')}){${statements.join(
+			';'
+		)}}(${values.join(',')}))`;
 	} else {
 		return str;
 	}
 }
 
-function getName(num: number) {
+/** @param {number} num */
+function getName(num) {
 	let name = '';
 
 	do {
@@ -204,11 +241,13 @@ function getName(num: number) {
 	return reserved.test(name) ? `${name}_` : name;
 }
 
-function isPrimitive(thing: any) {
+/** @param {any} thing */
+function isPrimitive(thing) {
 	return Object(thing) !== thing;
 }
 
-function stringifyPrimitive(thing: any) {
+/** @param {any} thing */
+function stringifyPrimitive(thing) {
 	if (typeof thing === 'string') return stringifyString(thing);
 	if (thing === void 0) return 'void 0';
 	if (thing === 0 && 1 / thing < 0) return '-0';
@@ -217,27 +256,37 @@ function stringifyPrimitive(thing: any) {
 	return str;
 }
 
-function getType(thing: any) {
+/** @param {any} thing */
+function getType(thing) {
 	return Object.prototype.toString.call(thing).slice(8, -1);
 }
 
-function escapeUnsafeChar(c: string) {
-	return escaped[c] || c
+/** @param {string} c */
+function escapeUnsafeChar(c) {
+	return escaped[c] || c;
 }
 
-function escapeUnsafeChars(str: string) {
-	return str.replace(unsafeChars, escapeUnsafeChar)
+/** @param {string} str */
+function escapeUnsafeChars(str) {
+	return str.replace(unsafeChars, escapeUnsafeChar);
 }
 
-function safeKey(key: string) {
-	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key) ? key : escapeUnsafeChars(JSON.stringify(key));
+/** @param {string} key */
+function safeKey(key) {
+	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key)
+		? key
+		: escapeUnsafeChars(JSON.stringify(key));
 }
 
-function safeProp(key: string) {
-	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key) ? `.${key}` : `[${escapeUnsafeChars(JSON.stringify(key))}]`;
+/** @param {string} key */
+function safeProp(key) {
+	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key)
+		? `.${key}`
+		: `[${escapeUnsafeChars(JSON.stringify(key))}]`;
 }
 
-function stringifyString(str: string) {
+/** @param {string} str */
+function stringifyString(str) {
 	let result = '"';
 
 	for (let i = 0; i < str.length; i += 1) {
@@ -253,7 +302,7 @@ function stringifyString(str: string) {
 
 			// If this is the beginning of a [high, low] surrogate pair,
 			// add the next two characters, otherwise escape
-			if (code <= 0xdbff && (next >= 0xdc00 && next <= 0xdfff)) {
+			if (code <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
 				result += char + str[++i];
 			} else {
 				result += `\\u${code.toString(16).toUpperCase()}`;
