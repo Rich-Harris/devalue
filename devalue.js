@@ -47,6 +47,7 @@ export function devalue(value) {
 
 			switch (type) {
 				case 'Number':
+				case 'BigInt':
 				case 'String':
 				case 'Boolean':
 				case 'Date':
@@ -253,6 +254,7 @@ function stringifyPrimitive(thing) {
 	if (thing === 0 && 1 / thing < 0) return '-0';
 	const str = String(thing);
 	if (typeof thing === 'number') return str.replace(/^(-)?0\./, '$1.');
+	if (typeof thing === 'bigint') return thing + 'n';
 	return str;
 }
 

@@ -68,6 +68,7 @@ describe('basics', (t) => {
 	t('Object', { foo: 'bar', 'x-y': 'z' }, '{foo:"bar","x-y":"z"}');
 	t('Set', new Set([1, 2, 3]), 'new Set([1,2,3])');
 	t('Map', new Map([['a', 'b']]), 'new Map([["a","b"]])');
+	t('BigInt', BigInt('1'), '1n');
 });
 
 describe('strings', (t) => {
