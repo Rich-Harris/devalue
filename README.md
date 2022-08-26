@@ -10,8 +10,6 @@ Like `JSON.stringify`, but handles
 - `Map` and `Set`
 - `BigInt`
 
-Try it out on [runkit.com](https://npm.runkit.com/devalue).
-
 ## Goals:
 
 - Performance
