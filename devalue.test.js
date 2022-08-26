@@ -1,8 +1,7 @@
 import * as vm from 'vm';
+import * as assert from 'uvu/assert';
+import * as uvu from 'uvu';
 import { devalue } from './devalue.js';
-
-let passed = 0;
-let failed = 0;
 
 /**
  * @typedef {(name: string, input: any, expected: string) => void} TestFunction
@@ -12,21 +11,15 @@ let failed = 0;
  * @param {string} name
  * @param {(test: TestFunction) => void} fn
  */
-function describe(name, fn) {
-	console.group(`\n${name}`);
+function compare(name, fn) {
+	const test = uvu.suite(name);
 	fn((name, input, expected) => {
-		const actual = devalue(input);
-		if (actual === expected) {
-			console.log(`✅ ${name}`);
-			passed += 1;
-		} else {
-			console.log(`❌ ${name}`);
-			console.log(`  actual: ${actual}`);
-			console.log(`  expected: ${expected}`);
-			failed += 1;
-		}
+		test(name, () => {
+			const actual = devalue(input);
+			assert.equal(actual, expected);
+		});
 	});
-	console.groupEnd();
+	test.run();
 }
 
 /**
@@ -61,7 +54,7 @@ function allows(name, fn) {
 	}
 }
 
-describe('basics', (t) => {
+compare('basics', (t) => {
 	t('number', 42, '42');
 	t('negative number', -42, '-42');
 	t('negative zero', -0, '-0');
@@ -87,7 +80,7 @@ describe('basics', (t) => {
 	t('BigInt', BigInt('1'), '1n');
 });
 
-describe('strings', (t) => {
+compare('strings', (t) => {
 	t('newline', 'a\nb', JSON.stringify('a\nb'));
 	t('double quotes', '"yar"', JSON.stringify('"yar"'));
 	t('lone low surrogate', 'a\uDC00b', '"a\\uDC00b"');
@@ -100,7 +93,7 @@ describe('strings', (t) => {
 	t('backslash', '\\', JSON.stringify('\\'));
 });
 
-describe('cycles', (t) => {
+compare('cycles', (t) => {
 	let map = new Map();
 	map.set('self', map);
 	t('Map (cyclical)', map, `(function(a){a.set("self", a);return a}(new Map))`);
@@ -144,7 +137,7 @@ describe('cycles', (t) => {
 	);
 });
 
-describe('repetition', (t) => {
+compare('repetition', (t) => {
 	let str = 'a string';
 	t(
 		'String (repetition)',
@@ -153,7 +146,7 @@ describe('repetition', (t) => {
 	);
 });
 
-describe('XSS', (t) => {
+compare('XSS', (t) => {
 	t(
 		'Dangerous string',
 		`</script><script src='https://evil.com/script.js'>alert('pwned')</script><script>`,
@@ -171,36 +164,27 @@ describe('XSS', (t) => {
 	);
 });
 
-describe('misc', (t) => {
+compare('misc', (t) => {
 	t('Object without prototype', Object.create(null), 'Object.create(null)');
-
-	// let arr = [];
-	// arr.x = 42;
-	// test('Array with named properties', arr, `TODO`);
-
 	t('cross-realm POJO', vm.runInNewContext('({})'), '{}');
-
-	throws('throws for non-POJOs', () => {
-		class Foo {}
-		const foo = new Foo();
-		devalue(foo);
-	});
-
-	throws('throws for symbolic keys', () => {
-		devalue({ [Symbol()]: null });
-	});
-
-	allows('does not create duplicate parameter names', () => {
-		const foo = new Array(20000).fill(0).map((_, i) => i);
-		const bar = foo.map((_, i) => ({ [i]: foo[i] }));
-		const serialized = devalue([foo, ...bar]);
-
-		eval(serialized);
-	});
 });
 
-console.log(`\n---\n${passed} passed, ${failed} failed\n`);
+uvu.test('throws for non-POJOs', () => {
+	class Foo {}
+	const foo = new Foo();
+	assert.throws(() => devalue(foo));
+});
 
-if (failed > 0) {
-	process.exit(1);
-}
+uvu.test('throws for symbolic keys', () => {
+	assert.throws(() => devalue({ [Symbol()]: null }));
+});
+
+uvu.test('does not create duplicate parameter names', () => {
+	const foo = new Array(20000).fill(0).map((_, i) => i);
+	const bar = foo.map((_, i) => ({ [i]: foo[i] }));
+	const serialized = devalue([foo, ...bar]);
+
+	eval(serialized);
+});
+
+uvu.test.run();
