@@ -1,7 +1,7 @@
 {
 	"name": "devalue",
 	"description": "Gets the job done when JSON.stringify can't",
-	"version": "3.1.2",
+	"version": "3.1.3",
 	"repository": "Rich-Harris/devalue",
 	"exports": {
 		".": {
@@ -9,6 +9,7 @@
 			"types": "./types/devalue.d.ts"
 		}
 	},
+	"main": "devalue.js",
 	"files": [
 		"devalue.js",
 		"types"
