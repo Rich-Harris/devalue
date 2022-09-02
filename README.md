@@ -10,7 +10,7 @@ Like `JSON.stringify`, but handles
 - `Map` and `Set`
 - `BigInt`
 
-Try it out on [runkit.com](https://npm.runkit.com/devalue).
+Try it out [here](https://svelte.dev/repl/138d70def7a748ce9eda736ef1c71239?version=3.49.0).
 
 ## Goals:
 
