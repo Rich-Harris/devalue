@@ -35,6 +35,9 @@ devalue(obj); // '{a:1,b:2,c:3}'
 
 obj.self = obj;
 devalue(obj); // '(function(a){a.a=1;a.b=2;a.c=3;a.self=a;return a}({}))'
+
+// Deserialize into new object
+let newObject = (0, eval)("(" + devalue(obj) + ")");
 ```
 
 ## Error handling
