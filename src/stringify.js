@@ -23,7 +23,7 @@ export function stringify(value) {
 	const stringified = [];
 
 	/** @type {Map<any, number>} */
-	const map = new Map();
+	const indexes = new Map();
 
 	/** @type {string[]} */
 	const keys = [];
@@ -36,7 +36,7 @@ export function stringify(value) {
 			throw new DevalueError(`Cannot stringify a function`, keys);
 		}
 
-		if (map.has(thing)) return map.get(thing);
+		if (indexes.has(thing)) return indexes.get(thing);
 
 		if (thing === undefined) return UNDEFINED;
 		if (Number.isNaN(thing)) return NAN;
@@ -45,7 +45,7 @@ export function stringify(value) {
 		if (thing === 0 && 1 / thing < 0) return NEGATIVE_ZERO;
 
 		const index = p++;
-		map.set(thing, index);
+		indexes.set(thing, index);
 
 		let str = '';
 
