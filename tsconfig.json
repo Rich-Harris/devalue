@@ -9,10 +9,10 @@
 		"diagnostics": true,
 		"noImplicitThis": true,
 		"noEmitOnError": true,
-		"lib": ["es5", "es6", "dom"]
+		"lib": ["es6", "es2020"],
+		"target": "es2020"
 	},
-	"target": "ES2018",
 	"module": "ES6",
-	"include": ["*.js"],
-	"exclude": ["node_modules", "**/*.test.js"]
+	"include": ["index.js", "src/*.js"],
+	"exclude": ["node_modules"]
 }
