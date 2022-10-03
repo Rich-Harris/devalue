@@ -12,64 +12,69 @@ import {
  * @param {string} serialized
  */
 export function parse(serialized) {
-	const values = JSON.parse(serialized);
+	const parsed = JSON.parse(serialized);
 
-	if (typeof values === 'number') return get_value(values);
+	if (typeof parsed === 'number') return hydrate(parsed);
+
+	const values = /** @type {any[]} */ (parsed);
+	const hydrated = Array(values.length);
 
 	/** @param {number} index */
-	function get_value(index) {
+	function hydrate(index) {
 		if (index === UNDEFINED) return undefined;
 		if (index === NAN) return NaN;
 		if (index === POSITIVE_INFINITY) return Infinity;
 		if (index === NEGATIVE_INFINITY) return -Infinity;
 		if (index === NEGATIVE_ZERO) return -0;
 
-		return values[index];
-	}
+		if (index in hydrated) return hydrated[index];
 
-	let i = values.length;
-	while (i--) {
-		const value = values[i];
+		const value = values[index];
 
-		if (!value || typeof value !== 'object') continue;
-
-		if (Array.isArray(value)) {
+		if (!value || typeof value !== 'object') {
+			hydrated[index] = value;
+		} else if (Array.isArray(value)) {
 			if (typeof value[0] === 'string') {
 				const type = value[0];
 
 				switch (type) {
 					case 'Date':
-						values[i] = new Date(value[1]);
+						hydrated[index] = new Date(value[1]);
 						break;
 
 					case 'Set':
 						const set = new Set();
-						values[i] = set;
-						for (const n of value[1]) set.add(get_value(n));
+						hydrated[index] = set;
+						for (const n of value[1]) set.add(hydrate(n));
 						break;
 
 					case 'Map':
 						const map = new Map();
-						values[i] = map;
+						hydrated[index] = map;
 						for (let i = 0; i < value[1].length; i += 2) {
-							map.set(get_value(value[i]), get_value(value[i + 1]));
+							map.set(hydrate(value[i]), hydrate(value[i + 1]));
 						}
 						break;
 
 					case 'RegExp':
-						values[i] = new RegExp(value[1], value[2]);
+						hydrated[index] = new RegExp(value[1], value[2]);
 						break;
 
 					case 'Object':
-						values[i] = Object(value[1]);
+						hydrated[index] = Object(value[1]);
 						break;
 
 					case 'BigInt':
-						values[i] = BigInt(value[1]);
+						hydrated[index] = BigInt(value[1]);
 						break;
 
 					case 'null':
-						const object = Object.create(null);
+						const obj = Object.create(null);
+						hydrated[index] = obj;
+						for (let i = 1; i < value.length; i += 2) {
+							obj[value[i]] = hydrate(value[i + 1]);
+						}
+						break;
 				}
 			} else {
 				const array = new Array(value.length);
@@ -78,10 +83,10 @@ export function parse(serialized) {
 					const n = value[i];
 					if (n === HOLE) continue;
 
-					array[i] = get_value(n);
+					array[i] = hydrate(n);
 				}
 
-				values[i] = array;
+				hydrated[index] = array;
 			}
 		} else {
 			/** @type {Record<string, any>} */
@@ -89,12 +94,14 @@ export function parse(serialized) {
 
 			for (const key in value) {
 				const n = value[key];
-				object[key] = get_value(n);
+				object[key] = hydrate(n);
 			}
 
-			values[i] = object;
+			hydrated[index] = object;
 		}
+
+		return hydrated[index];
 	}
 
-	return values[0];
+	return hydrate(0);
 }

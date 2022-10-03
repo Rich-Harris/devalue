@@ -227,7 +227,12 @@ const fixtures = {
 				name: 'Set (cyclical)',
 				value: set,
 				js: '(function(a){a.add(a).add(42);return a}(new Set))',
-				json: '[["Set",[0,1]],42]'
+				json: '[["Set",[0,1]],42]',
+				validate: (value) => {
+					assert.equal(value.size, 2);
+					assert.ok(value.has(42));
+					assert.ok(value.has(value));
+				}
 			};
 		})(new Set()),
 
@@ -257,7 +262,11 @@ const fixtures = {
 				name: 'Object with null prototype (cyclical)',
 				value: obj,
 				js: '(function(a){a.self=a;return a}(Object.create(null)))',
-				json: '[["null","self",0]]'
+				json: '[["null","self",0]]',
+				validate: (value) => {
+					assert.equal(Object.getPrototypeOf(value), null);
+					assert.is(value.self, value);
+				}
 			};
 		})(Object.create(null)),
 
@@ -308,13 +317,21 @@ const fixtures = {
 			name: 'Object without prototype',
 			value: Object.create(null),
 			js: 'Object.create(null)',
-			json: '[["null"]]'
+			json: '[["null"]]',
+			validate: (value) => {
+				assert.equal(Object.getPrototypeOf(value), null);
+				assert.equal(Object.keys(value).length, 0);
+			}
 		},
 		{
 			name: 'cross-realm POJO',
 			value: vm.runInNewContext('({})'),
 			js: '{}',
-			json: '[{}]'
+			json: '[{}]',
+			validate: (value) => {
+				assert.equal(Object.getPrototypeOf(value), Object.prototype);
+				assert.equal(Object.keys(value).length, 0);
+			}
 		}
 	]
 };
@@ -349,7 +366,12 @@ for (const [name, tests] of Object.entries(fixtures)) {
 		test(t.name, () => {
 			const actual = parse(t.json);
 			const expected = t.value;
-			assert.equal(actual, expected);
+
+			if (t.validate) {
+				t.validate(actual);
+			} else {
+				assert.equal(actual, expected);
+			}
 		});
 	}
 	test.run();
