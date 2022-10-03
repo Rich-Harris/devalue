@@ -1,5 +1,10 @@
 # devalue changelog
 
+## 4.0.0
+
+- Rename `devalue` function to `uneval`
+- Add `parse` and `stringify` functions
+
 ## 3.1.3
 
 - Add `pkg.main`
