@@ -45,8 +45,14 @@ export function parse(serialized) {
 					case 'Set':
 						const set = new Set();
 						values[i] = set;
-						for (let j = 1; j < value.length; j += 1) {
-							set.add(get_value(value[j]));
+						for (const n of value[1]) set.add(get_value(n));
+						break;
+
+					case 'Map':
+						const map = new Map();
+						values[i] = map;
+						for (let i = 0; i < value[1].length; i += 2) {
+							map.set(get_value(value[i]), get_value(value[i + 1]));
 						}
 						break;
 
@@ -90,6 +96,5 @@ export function parse(serialized) {
 		}
 	}
 
-	console.log(values);
 	return values[0];
 }

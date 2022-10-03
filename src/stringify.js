@@ -132,21 +132,25 @@ export function stringify(value) {
 						);
 					}
 
-					/** @type {string[]} */
-					const flattened_object = [];
-
-					for (const key in thing) {
-						keys.push(`.${key}`);
-						flattened_object.push(
-							`${stringify_string(key)}:${flatten(thing[key])}`
-						);
-						keys.pop();
-					}
-
-					stringified[index] = `{${flattened_object.join(',')}}`;
-
 					if (Object.getPrototypeOf(thing) === null) {
-						stringified[index] = `["null",${stringified[index]}]`;
+						let str = '["null"';
+						for (const key in thing) {
+							keys.push(`.${key}`);
+							str += `,${stringify_string(key)},${flatten(thing[key])}`;
+							keys.pop();
+						}
+						stringified[index] = str + ']';
+					} else {
+						let str = '{';
+						let started = false;
+						for (const key in thing) {
+							if (started) str += ',';
+							started = true;
+							keys.push(`.${key}`);
+							str += `${stringify_string(key)}:${flatten(thing[key])}`;
+							keys.pop();
+						}
+						stringified[index] = str + '}';
 					}
 			}
 		}

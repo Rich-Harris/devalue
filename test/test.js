@@ -1,3 +1,4 @@
+import * as util from 'util';
 import * as vm from 'vm';
 import * as assert from 'uvu/assert';
 import * as uvu from 'uvu';
@@ -256,7 +257,7 @@ const fixtures = {
 				name: 'Object with null prototype (cyclical)',
 				value: obj,
 				js: '(function(a){a.self=a;return a}(Object.create(null)))',
-				json: '[["null",{"self":0}]]'
+				json: '[["null","self",0]]'
 			};
 		})(Object.create(null)),
 
@@ -307,7 +308,7 @@ const fixtures = {
 			name: 'Object without prototype',
 			value: Object.create(null),
 			js: 'Object.create(null)',
-			json: '[["null",{}]]'
+			json: '[["null"]]'
 		},
 		{
 			name: 'cross-realm POJO',
