@@ -1,38 +1,19 @@
+import {
+	DevalueError,
+	escaped,
+	get_type,
+	is_primitive,
+	stringify_primitive,
+	stringify_string
+} from './utils.js';
+
 const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$';
 const unsafe_chars = /[<>\b\f\n\r\t\0\u2028\u2029]/g;
 const reserved =
 	/^(?:do|if|in|for|int|let|new|try|var|byte|case|char|else|enum|goto|long|this|void|with|await|break|catch|class|const|final|float|short|super|throw|while|yield|delete|double|export|import|native|return|switch|throws|typeof|boolean|default|extends|finally|package|private|abstract|continue|debugger|function|volatile|interface|protected|transient|implements|instanceof|synchronized)$/;
-
-/** @type {Record<string, string>} */
-const escaped = {
-	'<': '\\u003C',
-	'>': '\\u003E',
-	'/': '\\u002F',
-	'\\': '\\\\',
-	'\b': '\\b',
-	'\f': '\\f',
-	'\n': '\\n',
-	'\r': '\\r',
-	'\t': '\\t',
-	'\0': '\\0',
-	'\u2028': '\\u2028',
-	'\u2029': '\\u2029'
-};
 const object_proto_names = Object.getOwnPropertyNames(Object.prototype)
 	.sort()
 	.join('\0');
-
-class DevalueError extends Error {
-	/**
-	 * @param {string} message
-	 * @param {string[]} keys
-	 */
-	constructor(message, keys) {
-		super(message);
-		this.name = 'DevalueError';
-		this.path = keys.join('');
-	}
-}
 
 /**
  * Turn a value into the JavaScript that creates an equivalent value
@@ -284,27 +265,6 @@ function get_name(num) {
 	return reserved.test(name) ? `${name}0` : name;
 }
 
-/** @param {any} thing */
-function is_primitive(thing) {
-	return Object(thing) !== thing;
-}
-
-/** @param {any} thing */
-function stringify_primitive(thing) {
-	if (typeof thing === 'string') return stringify_string(thing);
-	if (thing === void 0) return 'void 0';
-	if (thing === 0 && 1 / thing < 0) return '-0';
-	const str = String(thing);
-	if (typeof thing === 'number') return str.replace(/^(-)?0\./, '$1.');
-	if (typeof thing === 'bigint') return thing + 'n';
-	return str;
-}
-
-/** @param {any} thing */
-function get_type(thing) {
-	return Object.prototype.toString.call(thing).slice(8, -1);
-}
-
 /** @param {string} c */
 function escape_unsafe_char(c) {
 	return escaped[c] || c;
@@ -327,35 +287,4 @@ function safe_prop(key) {
 	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key)
 		? `.${key}`
 		: `[${escape_unsafe_chars(JSON.stringify(key))}]`;
-}
-
-/** @param {string} str */
-function stringify_string(str) {
-	let result = '"';
-
-	for (let i = 0; i < str.length; i += 1) {
-		const char = str.charAt(i);
-		const code = char.charCodeAt(0);
-
-		if (char === '"') {
-			result += '\\"';
-		} else if (char in escaped) {
-			result += escaped[char];
-		} else if (code >= 0xd800 && code <= 0xdfff) {
-			const next = str.charCodeAt(i + 1);
-
-			// If this is the beginning of a [high, low] surrogate pair,
-			// add the next two characters, otherwise escape
-			if (code <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
-				result += char + str[++i];
-			} else {
-				result += `\\u${code.toString(16).toUpperCase()}`;
-			}
-		} else {
-			result += char;
-		}
-	}
-
-	result += '"';
-	return result;
 }
