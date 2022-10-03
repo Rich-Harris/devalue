@@ -9,8 +9,8 @@
 		"diagnostics": true,
 		"noImplicitThis": true,
 		"noEmitOnError": true,
-		"lib": ["es2022"],
-		"target": "es2022"
+		"lib": ["es6", "es2020"],
+		"target": "es2020"
 	},
 	"module": "ES6",
 	"include": ["index.js", "src/*.js"],
