@@ -32,6 +32,10 @@ export function stringify(value) {
 
 	/** @param {any} thing */
 	function flatten(thing) {
+		if (typeof thing === 'function') {
+			throw new DevalueError(`Cannot stringify a function`, keys);
+		}
+
 		if (map.has(thing)) return map.get(thing);
 
 		if (thing === undefined) return UNDEFINED;
@@ -43,12 +47,10 @@ export function stringify(value) {
 		const index = p++;
 		map.set(thing, index);
 
-		if (typeof thing === 'function') {
-			throw new DevalueError(`Cannot stringify a function`, keys);
-		}
+		let str = '';
 
 		if (is_primitive(thing)) {
-			stringified[index] = stringify_primitive(thing);
+			str = stringify_primitive(thing);
 		} else {
 			const type = get_type(thing);
 
@@ -56,20 +58,20 @@ export function stringify(value) {
 				case 'Number':
 				case 'String':
 				case 'Boolean':
-					stringified[index] = `["Object",${stringify_primitive(thing)}]`;
+					str = `["Object",${stringify_primitive(thing)}]`;
 					break;
 
 				case 'BigInt':
-					stringified[index] = `["BigInt",${thing}]`;
+					str = `["BigInt",${thing}]`;
 					break;
 
 				case 'Date':
-					stringified[index] = `["Date","${thing.toISOString()}"]`;
+					str = `["Date","${thing.toISOString()}"]`;
 					break;
 
 				case 'RegExp':
 					const { source, flags } = thing;
-					stringified[index] = flags
+					str = flags
 						? `["RegExp",${stringify_string(source)},"${flags}"]`
 						: `["RegExp",${stringify_string(source)}]`;
 					break;
@@ -88,33 +90,31 @@ export function stringify(value) {
 						}
 					}
 
-					stringified[index] = `[${flattened_array.join(',')}]`;
+					str = `[${flattened_array.join(',')}]`;
 
 					break;
 
 				case 'Set':
-					/** @type {number[]} */
-					const flattened_set = [];
+					str = '["Set"';
 
 					for (const value of thing) {
-						flattened_set.push(flatten(value));
+						str += `,${flatten(value)}`;
 					}
 
-					stringified[index] = `["Set",[${flattened_set.join(',')}]]`;
+					str += ']';
 					break;
 
 				case 'Map':
-					/** @type {number[]} */
-					const flattened_map = [];
+					str = '["Map"';
 
 					for (const [key, value] of thing) {
 						keys.push(
 							`.get(${is_primitive(key) ? stringify_primitive(key) : '...'})`
 						);
-						flattened_map.push(flatten(key), flatten(value));
+						str += `,${flatten(key)},${flatten(value)}`;
 					}
 
-					stringified[index] = `["Map",[${flattened_map.join(',')}]]`;
+					str += ']';
 					break;
 
 				default:
@@ -133,15 +133,15 @@ export function stringify(value) {
 					}
 
 					if (Object.getPrototypeOf(thing) === null) {
-						let str = '["null"';
+						str = '["null"';
 						for (const key in thing) {
 							keys.push(`.${key}`);
 							str += `,${stringify_string(key)},${flatten(thing[key])}`;
 							keys.pop();
 						}
-						stringified[index] = str + ']';
+						str += ']';
 					} else {
-						let str = '{';
+						str = '{';
 						let started = false;
 						for (const key in thing) {
 							if (started) str += ',';
@@ -150,11 +150,12 @@ export function stringify(value) {
 							str += `${stringify_string(key)}:${flatten(thing[key])}`;
 							keys.pop();
 						}
-						stringified[index] = str + '}';
+						str += '}';
 					}
 			}
 		}
 
+		stringified[index] = str;
 		return index;
 	}
 

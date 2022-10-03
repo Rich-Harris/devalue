@@ -129,13 +129,13 @@ const fixtures = {
 			name: 'Set',
 			value: new Set([1, 2, 3]),
 			js: 'new Set([1,2,3])',
-			json: '[["Set",[1,2,3]],1,2,3]'
+			json: '[["Set",1,2,3],1,2,3]'
 		},
 		{
 			name: 'Map',
 			value: new Map([['a', 'b']]),
 			js: 'new Map([["a","b"]])',
-			json: '[["Map",[1,2]],"a","b"]'
+			json: '[["Map",1,2],"a","b"]'
 		},
 		{
 			name: 'BigInt',
@@ -215,7 +215,10 @@ const fixtures = {
 				name: 'Map (cyclical)',
 				value: map,
 				js: '(function(a){a.set("self", a);return a}(new Map))',
-				json: '[["Map",[1,0]],"self"]'
+				json: '[["Map",1,0],"self"]',
+				validate: (value) => {
+					assert.is(value.get('self'), value);
+				}
 			};
 		})(new Map()),
 
@@ -226,9 +229,9 @@ const fixtures = {
 				name: 'Set (cyclical)',
 				value: set,
 				js: '(function(a){a.add(a).add(42);return a}(new Set))',
-				json: '[["Set",[0,1]],42]',
+				json: '[["Set",0,1],42]',
 				validate: (value) => {
-					assert.equal(value.size, 2);
+					assert.is(value.size, 2);
 					assert.ok(value.has(42));
 					assert.ok(value.has(value));
 				}
@@ -243,8 +246,8 @@ const fixtures = {
 				js: '(function(a){a[0]=a;return a}(Array(1)))',
 				json: '[[0]]',
 				validate: (value) => {
-					assert.equal(value.length, 1);
-					assert.equal(value[0], value);
+					assert.is(value.length, 1);
+					assert.is(value[0], value);
 				}
 			};
 		})([]),
@@ -257,7 +260,7 @@ const fixtures = {
 				js: '(function(a){a.self=a;return a}({}))',
 				json: '[{"self":0}]',
 				validate: (value) => {
-					assert.equal(value.self, value);
+					assert.is(value.self, value);
 				}
 			};
 		})({}),
@@ -270,7 +273,7 @@ const fixtures = {
 				js: '(function(a){a.self=a;return a}(Object.create(null)))',
 				json: '[["null","self",0]]',
 				validate: (value) => {
-					assert.equal(Object.getPrototypeOf(value), null);
+					assert.is(Object.getPrototypeOf(value), null);
 					assert.is(value.self, value);
 				}
 			};
@@ -285,8 +288,8 @@ const fixtures = {
 				js: '(function(a,b){a.second=b;b.first=a;return [a,b]}({},{}))',
 				json: '[[1,2],{"second":2},{"first":1}]',
 				validate: (value) => {
-					assert.equal(value[0].second, value[1]);
-					assert.equal(value[1].first, value[0]);
+					assert.is(value[0].second, value[1]);
+					assert.is(value[1].first, value[0]);
 				}
 			};
 		})({}, {})

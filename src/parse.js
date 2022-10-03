@@ -45,13 +45,15 @@ export function parse(serialized) {
 					case 'Set':
 						const set = new Set();
 						hydrated[index] = set;
-						for (const n of value[1]) set.add(hydrate(n));
+						for (let i = 1; i < value.length; i += 1) {
+							set.add(hydrate(value[i]));
+						}
 						break;
 
 					case 'Map':
 						const map = new Map();
 						hydrated[index] = map;
-						for (let i = 0; i < value[1].length; i += 2) {
+						for (let i = 1; i < value.length; i += 2) {
 							map.set(hydrate(value[i]), hydrate(value[i + 1]));
 						}
 						break;
