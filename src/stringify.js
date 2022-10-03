@@ -77,20 +77,21 @@ export function stringify(value) {
 					break;
 
 				case 'Array':
-					/** @type {number[]} */
-					let flattened_array = [];
+					str = '[';
 
 					for (let i = 0; i < thing.length; i += 1) {
+						if (i > 0) str += ',';
+
 						if (i in thing) {
 							keys.push(`[${i}]`);
-							flattened_array.push(flatten(thing[i]));
+							str += flatten(thing[i]);
 							keys.pop();
 						} else {
-							flattened_array.push(HOLE);
+							str += HOLE;
 						}
 					}
 
-					str = `[${flattened_array.join(',')}]`;
+					str += ']';
 
 					break;
 
