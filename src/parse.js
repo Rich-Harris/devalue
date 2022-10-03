@@ -78,6 +78,7 @@ export function parse(serialized) {
 				}
 			} else {
 				const array = new Array(value.length);
+				hydrated[index] = array;
 
 				for (let i = 0; i < value.length; i += 1) {
 					const n = value[i];
@@ -85,19 +86,16 @@ export function parse(serialized) {
 
 					array[i] = hydrate(n);
 				}
-
-				hydrated[index] = array;
 			}
 		} else {
 			/** @type {Record<string, any>} */
 			const object = {};
+			hydrated[index] = object;
 
 			for (const key in value) {
 				const n = value[key];
 				object[key] = hydrate(n);
 			}
-
-			hydrated[index] = object;
 		}
 
 		return hydrated[index];

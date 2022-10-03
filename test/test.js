@@ -242,7 +242,11 @@ const fixtures = {
 				name: 'Array (cyclical)',
 				value: arr,
 				js: '(function(a){a[0]=a;return a}(Array(1)))',
-				json: '[[0]]'
+				json: '[[0]]',
+				validate: (value) => {
+					assert.equal(value.length, 1);
+					assert.equal(value[0], value);
+				}
 			};
 		})([]),
 
@@ -252,7 +256,10 @@ const fixtures = {
 				name: 'Object (cyclical)',
 				value: obj,
 				js: '(function(a){a.self=a;return a}({}))',
-				json: '[{"self":0}]'
+				json: '[{"self":0}]',
+				validate: (value) => {
+					assert.equal(value.self, value);
+				}
 			};
 		})({}),
 
@@ -277,7 +284,11 @@ const fixtures = {
 				name: 'Object (cyclical)',
 				value: [first, second],
 				js: '(function(a,b){a.second=b;b.first=a;return [a,b]}({},{}))',
-				json: '[[1,2],{"second":2},{"first":1}]'
+				json: '[[1,2],{"second":2},{"first":1}]',
+				validate: (value) => {
+					assert.equal(value[0].second, value[1]);
+					assert.equal(value[1].first, value[0]);
+				}
 			};
 		})({}, {})
 	],
