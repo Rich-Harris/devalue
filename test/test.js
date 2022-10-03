@@ -1,4 +1,3 @@
-import * as util from 'util';
 import * as vm from 'vm';
 import * as assert from 'uvu/assert';
 import * as uvu from 'uvu';
