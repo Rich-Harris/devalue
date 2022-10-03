@@ -32,13 +32,13 @@ There are two ways to use `devalue`:
 This function takes a JavaScript value and returns the JavaScript code to create an equivalent value — sort of like `eval` in reverse:
 
 ```js
-import { uneval } from 'devalue';
+import * as devalue from 'devalue';
 
 let obj = { message: 'hello' };
-uneval(obj); // '{message:"hello"}'
+devalue.uneval(obj); // '{message:"hello"}'
 
 obj.self = obj;
-uneval(obj); // '(function(a){a.message="hello";a.self=a;return a}({}))'
+devalue.uneval(obj); // '(function(a){a.message="hello";a.self=a;return a}({}))'
 ```
 
 Use `uneval` when you want the most compact possible output and don't want to include any code for parsing the serialized value.
@@ -48,17 +48,17 @@ Use `uneval` when you want the most compact possible output and don't want to in
 These two functions are analogous to `JSON.stringify` and `JSON.parse`:
 
 ```js
-import { stringify, parse } from 'devalue';
+import * as devalue from 'devalue';
 
 let obj = { message: 'hello' };
 
-let stringified = stringify(obj); // '[{"message":1},"hello"]'
-parse(stringified); // { message: 'hello' }
+let stringified = devalue.stringify(obj); // '[{"message":1},"hello"]'
+devalue.parse(stringified); // { message: 'hello' }
 
 obj.self = obj;
 
-stringified = stringify(obj); // '[{"message":1,"self":0},"hello"]'
-parse(stringified); // { message: 'hello', self: [Circular] }
+stringified = devalue.stringify(obj); // '[{"message":1,"self":0},"hello"]'
+devalue.parse(stringified); // { message: 'hello', self: [Circular] }
 ```
 
 Use `stringify` and `parse` when evaluating JavaScript isn't an option.
