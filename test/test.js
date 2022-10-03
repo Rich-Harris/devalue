@@ -1,7 +1,7 @@
 import * as vm from 'vm';
 import * as assert from 'uvu/assert';
 import * as uvu from 'uvu';
-import { devalue, parse, stringify } from '../index.js';
+import { uneval, parse, stringify } from '../index.js';
 
 const fixtures = {
 	basics: [
@@ -350,10 +350,10 @@ const fixtures = {
 };
 
 for (const [name, tests] of Object.entries(fixtures)) {
-	const test = uvu.suite(`devalue: ${name}`);
+	const test = uvu.suite(`uneval: ${name}`);
 	for (const t of tests) {
 		test(t.name, () => {
-			const actual = devalue(t.value);
+			const actual = uneval(t.value);
 			const expected = t.js;
 			assert.equal(actual, expected);
 		});
@@ -390,7 +390,7 @@ for (const [name, tests] of Object.entries(fixtures)) {
 	test.run();
 }
 
-for (const fn of [devalue, stringify]) {
+for (const fn of [uneval, stringify]) {
 	uvu.test(`${fn.name} throws for non-POJOs`, () => {
 		class Foo {}
 		const foo = new Foo();
@@ -432,7 +432,7 @@ for (const fn of [devalue, stringify]) {
 uvu.test('does not create duplicate parameter names', () => {
 	const foo = new Array(20000).fill(0).map((_, i) => i);
 	const bar = foo.map((_, i) => ({ [i]: foo[i] }));
-	const serialized = devalue([foo, ...bar]);
+	const serialized = uneval([foo, ...bar]);
 
 	eval(serialized);
 });
