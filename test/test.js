@@ -198,8 +198,8 @@ const fixtures = {
 		{
 			name: 'nul',
 			value: '\0',
-			js: '"\\0"',
-			json: '["\\0"]'
+			js: '"\\u0000"',
+			json: '["\\u0000"]'
 		},
 		{
 			name: 'backslash',
