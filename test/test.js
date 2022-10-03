@@ -21,7 +21,7 @@ const fixtures = {
 			name: 'negative zero',
 			value: -0,
 			js: '-0',
-			json: '[-6]'
+			json: '-6'
 		},
 		{
 			name: 'positive decimal',
@@ -69,7 +69,7 @@ const fixtures = {
 			name: 'undefined',
 			value: undefined,
 			js: 'void 0',
-			json: '[-1]'
+			json: '-1'
 		},
 		{
 			name: 'null',
@@ -81,13 +81,13 @@ const fixtures = {
 			name: 'NaN',
 			value: NaN,
 			js: 'NaN',
-			json: '[-3]'
+			json: '-3'
 		},
 		{
 			name: 'Infinity',
 			value: Infinity,
 			js: 'Infinity',
-			json: '[-4]'
+			json: '-4'
 		},
 		{
 			name: 'RegExp',
@@ -342,17 +342,17 @@ for (const [name, tests] of Object.entries(fixtures)) {
 	test.run();
 }
 
-// for (const [name, tests] of Object.entries(fixtures)) {
-// 	const test = uvu.suite(`parse: ${name}`);
-// 	for (const t of tests) {
-// 		test(t.name, () => {
-// 			const actual = parse(t.json);
-// 			const expected = t.value;
-// 			assert.equal(actual, expected);
-// 		});
-// 	}
-// 	test.run();
-// }
+for (const [name, tests] of Object.entries(fixtures)) {
+	const test = uvu.suite(`parse: ${name}`);
+	for (const t of tests) {
+		test(t.name, () => {
+			const actual = parse(t.json);
+			const expected = t.value;
+			assert.equal(actual, expected);
+		});
+	}
+	test.run();
+}
 
 for (const fn of [devalue, stringify]) {
 	uvu.test(`${fn.name} throws for non-POJOs`, () => {

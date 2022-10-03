@@ -5,13 +5,14 @@ import {
 	is_primitive,
 	stringify_string
 } from './utils.js';
-
-const UNDEFINED = -1;
-const HOLE = -2;
-const NAN = -3;
-const POSITIVE_INFINITY = -4;
-const NEGATIVE_INFINITY = -5;
-const NEGATIVE_ZERO = -6;
+import {
+	HOLE,
+	NAN,
+	NEGATIVE_INFINITY,
+	NEGATIVE_ZERO,
+	POSITIVE_INFINITY,
+	UNDEFINED
+} from './constants.js';
 
 /**
  * Turn a value into a JSON string that can be parsed with `devalue.parse`
@@ -156,7 +157,7 @@ export function stringify(value) {
 	const index = flatten(value);
 
 	// special case — value is represented as a negative index
-	if (index < 0) return `[${index}]`;
+	if (index < 0) return `${index}`;
 
 	return `[${stringified.join(',')}]`;
 }

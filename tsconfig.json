@@ -9,9 +9,9 @@
 		"diagnostics": true,
 		"noImplicitThis": true,
 		"noEmitOnError": true,
-		"lib": ["es5", "es6", "dom"]
+		"lib": ["es2022"],
+		"target": "es2022"
 	},
-	"target": "ES2018",
 	"module": "ES6",
 	"include": ["index.js", "src/*.js"],
 	"exclude": ["node_modules"]
