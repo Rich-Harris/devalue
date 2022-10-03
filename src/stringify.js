@@ -3,7 +3,7 @@ import {
 	get_type,
 	is_plain_object,
 	is_primitive,
-	stringify_primitive
+	stringify_string
 } from './utils.js';
 
 const UNDEFINED = -1;
@@ -19,13 +19,15 @@ const NEGATIVE_ZERO = -6;
  */
 export function stringify(value) {
 	/** @type {any[]} */
-	const array = [];
+	const stringified = [];
 
 	/** @type {Map<any, number>} */
 	const map = new Map();
 
 	/** @type {string[]} */
 	const keys = [];
+
+	let p = 0;
 
 	/** @param {any} thing */
 	function flatten(thing) {
@@ -37,7 +39,7 @@ export function stringify(value) {
 		if (thing === -Infinity) return NEGATIVE_INFINITY;
 		if (thing === 0 && 1 / thing < 0) return NEGATIVE_ZERO;
 
-		const index = array.length;
+		const index = p++;
 		map.set(thing, index);
 
 		if (typeof thing === 'function') {
@@ -45,7 +47,7 @@ export function stringify(value) {
 		}
 
 		if (is_primitive(thing)) {
-			array.push(thing);
+			stringified[index] = stringify_primitive(thing);
 		} else {
 			const type = get_type(thing);
 
@@ -53,26 +55,27 @@ export function stringify(value) {
 				case 'Number':
 				case 'String':
 				case 'Boolean':
-					array.push(['Object', thing]);
+					stringified[index] = `["Object",${stringify_primitive(thing)}]`;
 					break;
 
 				case 'BigInt':
-					array.push(['BigInt', thing.toString()]);
+					stringified[index] = `["BigInt",${thing}]`;
 					break;
 
 				case 'Date':
-					array.push(['Date', thing.toISOString()]);
+					stringified[index] = `["Date","${thing.toISOString()}"]`;
 					break;
 
 				case 'RegExp':
 					const { source, flags } = thing;
-					array.push(flags ? ['RegExp', source, flags] : ['RegExp', source]);
+					stringified[index] = flags
+						? `["RegExp",${stringify_string(source)},"${flags}"]`
+						: `["RegExp",${stringify_string(source)}]`;
 					break;
 
 				case 'Array':
 					/** @type {number[]} */
-					const flattened_array = [];
-					array.push(flattened_array);
+					let flattened_array = [];
 
 					for (let i = 0; i < thing.length; i += 1) {
 						if (i in thing) {
@@ -84,29 +87,33 @@ export function stringify(value) {
 						}
 					}
 
+					stringified[index] = `[${flattened_array.join(',')}]`;
+
 					break;
 
 				case 'Set':
-					/** @type {any[]} */
-					const flattened_set = ['Set', []];
-					array.push(flattened_set);
+					/** @type {number[]} */
+					const flattened_set = [];
 
 					for (const value of thing) {
-						flattened_set[1].push(flatten(value));
+						flattened_set.push(flatten(value));
 					}
+
+					stringified[index] = `["Set",[${flattened_set.join(',')}]]`;
 					break;
 
 				case 'Map':
-					/** @type {any[]} */
-					const flattened_map = ['Map', []];
-					array.push(flattened_map);
+					/** @type {number[]} */
+					const flattened_map = [];
 
 					for (const [key, value] of thing) {
 						keys.push(
 							`.get(${is_primitive(key) ? stringify_primitive(key) : '...'})`
 						);
-						flattened_map[1].push(flatten(key), flatten(value));
+						flattened_map.push(flatten(key), flatten(value));
 					}
+
+					stringified[index] = `["Map",[${flattened_map.join(',')}]]`;
 					break;
 
 				default:
@@ -124,14 +131,21 @@ export function stringify(value) {
 						);
 					}
 
-					/** @type {Record<string, any>} */
-					const flattened_object = {};
-					array.push(flattened_object);
+					/** @type {string[]} */
+					const flattened_object = [];
 
 					for (const key in thing) {
 						keys.push(`.${key}`);
-						flattened_object[key] = flatten(thing[key]);
+						flattened_object.push(
+							`${stringify_string(key)}:${flatten(thing[key])}`
+						);
 						keys.pop();
+					}
+
+					stringified[index] = `{${flattened_object.join(',')}}`;
+
+					if (Object.getPrototypeOf(thing) === null) {
+						stringified[index] = `["null",${stringified[index]}]`;
 					}
 			}
 		}
@@ -144,5 +158,19 @@ export function stringify(value) {
 	// special case — value is represented as a negative index
 	if (index < 0) return `[${index}]`;
 
-	return JSON.stringify(array);
+	return `[${stringified.join(',')}]`;
+}
+
+/**
+ * @param {any} thing
+ * @returns {string}
+ */
+function stringify_primitive(thing) {
+	const type = typeof thing;
+	if (type === 'string') return stringify_string(thing);
+	if (thing instanceof String) return stringify_string(thing.toString());
+	if (thing === void 0) return UNDEFINED.toString();
+	if (thing === 0 && 1 / thing < 0) return NEGATIVE_ZERO.toString();
+	if (type === 'bigint') return `["BigInt","${thing}"]`;
+	return String(thing);
 }

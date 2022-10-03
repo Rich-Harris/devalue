@@ -3,7 +3,6 @@ import {
 	escaped,
 	get_type,
 	is_primitive,
-	stringify_primitive,
 	stringify_string
 } from './utils.js';
 
@@ -287,4 +286,15 @@ function safe_prop(key) {
 	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key)
 		? `.${key}`
 		: `[${escape_unsafe_chars(JSON.stringify(key))}]`;
+}
+
+/** @param {any} thing */
+function stringify_primitive(thing) {
+	if (typeof thing === 'string') return stringify_string(thing);
+	if (thing === void 0) return 'void 0';
+	if (thing === 0 && 1 / thing < 0) return '-0';
+	const str = String(thing);
+	if (typeof thing === 'number') return str.replace(/^(-)?0\./, '$1.');
+	if (typeof thing === 'bigint') return thing + 'n';
+	return str;
 }

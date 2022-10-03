@@ -253,10 +253,10 @@ const fixtures = {
 		((obj) => {
 			obj.self = obj;
 			return {
-				name: 'Object (cyclical)',
+				name: 'Object with null prototype (cyclical)',
 				value: obj,
 				js: '(function(a){a.self=a;return a}(Object.create(null)))',
-				json: 'TODO'
+				json: '[["null",{"self":0}]]'
 			};
 		})(Object.create(null)),
 
@@ -286,19 +286,19 @@ const fixtures = {
 			name: 'Dangerous string',
 			value: `</script><script src='https://evil.com/script.js'>alert('pwned')</script><script>`,
 			js: `"\\u003C\\u002Fscript\\u003E\\u003Cscript src='https:\\u002F\\u002Fevil.com\\u002Fscript.js'\\u003Ealert('pwned')\\u003C\\u002Fscript\\u003E\\u003Cscript\\u003E"`,
-			json: 'TODO'
+			json: `["\\u003C\\u002Fscript\\u003E\\u003Cscript src='https:\\u002F\\u002Fevil.com\\u002Fscript.js'\\u003Ealert('pwned')\\u003C\\u002Fscript\\u003E\\u003Cscript\\u003E"]`
 		},
 		{
 			name: 'Dangerous key',
 			value: { '<svg onload=alert("xss_works")>': 'bar' },
 			js: '{"\\u003Csvg onload=alert(\\"xss_works\\")\\u003E":"bar"}',
-			json: 'TODO'
+			json: '[{"\\u003Csvg onload=alert(\\"xss_works\\")\\u003E":1},"bar"]'
 		},
 		{
 			name: 'Dangerous regex',
 			value: /[</script><script>alert('xss')//]/,
 			js: `new RegExp("[\\u003C\\u002Fscript\\u003E\\u003Cscript\\u003Ealert('xss')\\u002F\\u002F]", "")`,
-			json: `["RegExp","[\\u003C\\u002Fscript\\u003E\\u003Cscript\\u003Ealert('xss')\\u002F\\u002F]",""]`
+			json: `[["RegExp","[\\u003C\\u002Fscript\\u003E\\u003Cscript\\u003Ealert('xss')\\u002F\\u002F]"]]`
 		}
 	],
 
@@ -307,7 +307,7 @@ const fixtures = {
 			name: 'Object without prototype',
 			value: Object.create(null),
 			js: 'Object.create(null)',
-			json: '[["Object"]]'
+			json: '[["null",{}]]'
 		},
 		{
 			name: 'cross-realm POJO',
