@@ -1,5 +1,9 @@
 # devalue changelog
 
+## 4.0.1
+
+- Remove `devalue` export so that run time errors become build time errors
+
 ## 4.0.0
 
 - Rename `devalue` function to `uneval`
