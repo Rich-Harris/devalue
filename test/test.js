@@ -390,6 +390,55 @@ for (const [name, tests] of Object.entries(fixtures)) {
 	test.run();
 }
 
+const syntaxErrorFixtures = [
+	{
+		name: 'empty string',
+		json: ''
+	},
+	{
+		name: 'invalid JSON',
+		json: ']['
+	},
+	{
+		name: 'hole',
+		json: '-2'
+	},
+	{
+		name: 'string',
+		json: '"hello"',
+	},
+	{
+		name: 'number',
+		json: '42'
+	},
+	{
+		name: 'boolean',
+		json: 'true'
+	},
+	{
+		name: 'null',
+		json: 'null'
+	},
+	{
+		name: 'object',
+		json: '{}'
+	},
+	{
+		name: 'empty array',
+		json: '[]'
+	}
+];
+
+const syntaxErrorTest = uvu.suite("parse: syntax errors");
+
+for (const fixture of syntaxErrorFixtures) {
+	syntaxErrorTest(fixture.name, () => {
+		assert.throws(() => parse(fixture.json), (error) => error instanceof SyntaxError);
+	});
+}
+
+syntaxErrorTest.run();
+
 for (const fn of [uneval, stringify]) {
 	uvu.test(`${fn.name} throws for non-POJOs`, () => {
 		class Foo {}

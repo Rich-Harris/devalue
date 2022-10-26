@@ -14,18 +14,23 @@ import {
 export function parse(serialized) {
 	const parsed = JSON.parse(serialized);
 
-	if (typeof parsed === 'number') return hydrate(parsed);
+	if (typeof parsed === 'number') {
+		const constant = hydrateConstant(parsed);
+		if (constant === NOT_A_CONSTANT) throw new SyntaxError(`Unexpected number ${parsed}`);
+		return constant;
+	}
+
+	if (!Array.isArray(parsed)) throw new SyntaxError(`Expected array, got ${parsed === null ? 'null' : typeof parsed}`);
 
 	const values = /** @type {any[]} */ (parsed);
+	if (values.length === 0) throw new SyntaxError(`Unexpected empty array`);
+
 	const hydrated = Array(values.length);
 
 	/** @param {number} index */
 	function hydrate(index) {
-		if (index === UNDEFINED) return undefined;
-		if (index === NAN) return NaN;
-		if (index === POSITIVE_INFINITY) return Infinity;
-		if (index === NEGATIVE_INFINITY) return -Infinity;
-		if (index === NEGATIVE_ZERO) return -0;
+		const constant = hydrateConstant(index);
+		if (constant !== NOT_A_CONSTANT) return constant;
 
 		if (index in hydrated) return hydrated[index];
 
@@ -104,4 +109,16 @@ export function parse(serialized) {
 	}
 
 	return hydrate(0);
+}
+
+const NOT_A_CONSTANT = Symbol('not a constant');
+
+/** @param {number} constant */
+function hydrateConstant(constant) {
+	if (constant === UNDEFINED) return undefined;
+	if (constant === NAN) return NaN;
+	if (constant === POSITIVE_INFINITY) return Infinity;
+	if (constant === NEGATIVE_INFINITY) return -Infinity;
+	if (constant === NEGATIVE_ZERO) return -0;
+	return NOT_A_CONSTANT;
 }
