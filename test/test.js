@@ -406,6 +406,63 @@ for (const [name, tests] of Object.entries(fixtures)) {
 	test.run();
 }
 
+const invalid = [
+	{
+		name: 'empty string',
+		json: '',
+		message: 'Unexpected end of JSON input'
+	},
+	{
+		name: 'invalid JSON',
+		json: '][',
+		message: 'Unexpected token ] in JSON at position 0'
+	},
+	{
+		name: 'hole',
+		json: '-2',
+		message: 'Invalid input'
+	},
+	{
+		name: 'string',
+		json: '"hello"',
+		message: 'Invalid input'
+	},
+	{
+		name: 'number',
+		json: '42',
+		message: 'Invalid input'
+	},
+	{
+		name: 'boolean',
+		json: 'true',
+		message: 'Invalid input'
+	},
+	{
+		name: 'null',
+		json: 'null',
+		message: 'Invalid input'
+	},
+	{
+		name: 'object',
+		json: '{}',
+		message: 'Invalid input'
+	},
+	{
+		name: 'empty array',
+		json: '[]',
+		message: 'Invalid input'
+	}
+];
+
+for (const { name, json, message } of invalid) {
+	uvu.test(`parse error: ${name}`, () => {
+		assert.throws(
+			() => parse(json),
+			(error) => error.message === message
+		);
+	});
+}
+
 for (const fn of [uneval, stringify]) {
 	uvu.test(`${fn.name} throws for non-POJOs`, () => {
 		class Foo {}
