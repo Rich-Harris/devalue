@@ -299,9 +299,25 @@ const fixtures = {
 		{
 			name: 'String (repetition)',
 			value: ['a string', 'a string'],
-			js: '(function(a){return [a,a]}("a string"))',
+			js: '["a string","a string"]',
 			json: '[[1,1],"a string"]'
-		}
+		},
+
+		{
+			name: 'null (repetition)',
+			value: [null, null],
+			js: '[null,null]',
+			json: '[[1,1],null]'
+		},
+
+		((object) => {
+			return {
+				name: 'Object (repetition)',
+				value: [object, object],
+				js: '(function(a){return [a,a]}({}))',
+				json: '[[1,1],{}]'
+			};
+		})({})
 	],
 
 	XSS: [
