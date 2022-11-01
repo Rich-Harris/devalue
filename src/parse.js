@@ -17,7 +17,7 @@ export function parse(serialized) {
 	if (typeof parsed === 'number') return hydrate(parsed, true);
 
 	if (!Array.isArray(parsed) || parsed.length === 0) {
-		throw new SyntaxError('Invalid input');
+		throw new Error('Invalid input');
 	}
 
 	const values = /** @type {any[]} */ (parsed);
@@ -32,7 +32,7 @@ export function parse(serialized) {
 		if (index === NEGATIVE_INFINITY) return -Infinity;
 		if (index === NEGATIVE_ZERO) return -0;
 
-		if (standalone) throw new SyntaxError(`Invalid input`);
+		if (standalone) throw new Error(`Invalid input`);
 
 		if (index in hydrated) return hydrated[index];
 

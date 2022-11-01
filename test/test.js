@@ -442,7 +442,7 @@ for (const { name, json, message } of invalid) {
 	uvu.test(`parse error: ${name}`, () => {
 		assert.throws(
 			() => parse(json),
-			(error) => error instanceof SyntaxError && error.message === message
+			(error) => error.message === message
 		);
 	});
 }
