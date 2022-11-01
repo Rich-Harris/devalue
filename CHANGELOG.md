@@ -1,5 +1,11 @@
 # devalue changelog
 
+## 4.1.0
+
+- Only deduplicate non-primitives ([#44](https://github.com/Rich-Harris/devalue/pull/44))
+- Error on invalid input ([#43](https://github.com/Rich-Harris/devalue/pull/43))
+- Fix `pkg.exports` ([#45](https://github.com/Rich-Harris/devalue/pull/45))
+
 ## 4.0.1
 
 - Remove `devalue` export so that run time errors become build time errors
