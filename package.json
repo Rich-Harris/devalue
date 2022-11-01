@@ -5,8 +5,9 @@
 	"repository": "Rich-Harris/devalue",
 	"exports": {
 		".": {
+			"types": "./types/index.d.ts",
 			"import": "./index.js",
-			"types": "./types/index.d.ts"
+			"default": "./index.js"
 		}
 	},
 	"main": "index.js",
