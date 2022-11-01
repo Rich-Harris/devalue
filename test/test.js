@@ -390,54 +390,62 @@ for (const [name, tests] of Object.entries(fixtures)) {
 	test.run();
 }
 
-const syntaxErrorFixtures = [
+const invalid = [
 	{
 		name: 'empty string',
-		json: ''
+		json: '',
+		message: 'Unexpected end of JSON input'
 	},
 	{
 		name: 'invalid JSON',
-		json: ']['
+		json: '][',
+		message: 'Unexpected token ] in JSON at position 0'
 	},
 	{
 		name: 'hole',
-		json: '-2'
+		json: '-2',
+		message: 'Unexpected number -2'
 	},
 	{
 		name: 'string',
 		json: '"hello"',
+		message: 'Expected array, got string'
 	},
 	{
 		name: 'number',
-		json: '42'
+		json: '42',
+		message: 'Unexpected number 42'
 	},
 	{
 		name: 'boolean',
-		json: 'true'
+		json: 'true',
+		message: 'Expected array, got boolean'
 	},
 	{
 		name: 'null',
-		json: 'null'
+		json: 'null',
+		message: 'Expected array, got null'
 	},
 	{
 		name: 'object',
-		json: '{}'
+		json: '{}',
+		message: 'Expected array, got object'
 	},
 	{
 		name: 'empty array',
-		json: '[]'
+		json: '[]',
+		message: 'Unexpected empty array'
 	}
 ];
 
-const syntaxErrorTest = uvu.suite("parse: syntax errors");
-
-for (const fixture of syntaxErrorFixtures) {
-	syntaxErrorTest(fixture.name, () => {
-		assert.throws(() => parse(fixture.json), (error) => error instanceof SyntaxError);
+for (const { name, json, message } of invalid) {
+	uvu.test(`parse error: ${name}`, () => {
+		assert.throws(
+			() => parse(json),
+			(error) => error instanceof SyntaxError && error.message === message
+		);
 	});
 }
-
-syntaxErrorTest.run();
 
 for (const fn of [uneval, stringify]) {
 	uvu.test(`${fn.name} throws for non-POJOs`, () => {
