@@ -30,14 +30,14 @@ export function uneval(value) {
 			throw new DevalueError(`Cannot stringify a function`, keys);
 		}
 
-		if (counts.has(thing)) {
-			counts.set(thing, counts.get(thing) + 1);
-			return;
-		}
-
-		counts.set(thing, 1);
-
 		if (!is_primitive(thing)) {
+			if (counts.has(thing)) {
+				counts.set(thing, counts.get(thing) + 1);
+				return;
+			}
+
+			counts.set(thing, 1);
+
 			const type = get_type(thing);
 
 			switch (type) {
