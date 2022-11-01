@@ -16,14 +16,11 @@ export function parse(serialized) {
 
 	if (typeof parsed === 'number') return hydrate(parsed, true);
 
-	if (!Array.isArray(parsed)) {
-		throw new SyntaxError(
-			`Expected array, got ${parsed === null ? 'null' : typeof parsed}`
-		);
+	if (!Array.isArray(parsed) || parsed.length === 0) {
+		throw new SyntaxError('Invalid input');
 	}
 
 	const values = /** @type {any[]} */ (parsed);
-	if (values.length === 0) throw new SyntaxError(`Unexpected empty array`);
 
 	const hydrated = Array(values.length);
 
@@ -35,7 +32,7 @@ export function parse(serialized) {
 		if (index === NEGATIVE_INFINITY) return -Infinity;
 		if (index === NEGATIVE_ZERO) return -0;
 
-		if (standalone) throw new SyntaxError(`Unexpected number ${index}`);
+		if (standalone) throw new SyntaxError(`Invalid input`);
 
 		if (index in hydrated) return hydrated[index];
 

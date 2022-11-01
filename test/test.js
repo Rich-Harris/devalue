@@ -404,37 +404,37 @@ const invalid = [
 	{
 		name: 'hole',
 		json: '-2',
-		message: 'Unexpected number -2'
+		message: 'Invalid input'
 	},
 	{
 		name: 'string',
 		json: '"hello"',
-		message: 'Expected array, got string'
+		message: 'Invalid input'
 	},
 	{
 		name: 'number',
 		json: '42',
-		message: 'Unexpected number 42'
+		message: 'Invalid input'
 	},
 	{
 		name: 'boolean',
 		json: 'true',
-		message: 'Expected array, got boolean'
+		message: 'Invalid input'
 	},
 	{
 		name: 'null',
 		json: 'null',
-		message: 'Expected array, got null'
+		message: 'Invalid input'
 	},
 	{
 		name: 'object',
 		json: '{}',
-		message: 'Expected array, got object'
+		message: 'Invalid input'
 	},
 	{
 		name: 'empty array',
 		json: '[]',
-		message: 'Unexpected empty array'
+		message: 'Invalid input'
 	}
 ];
 
