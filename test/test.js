@@ -1,7 +1,7 @@
 import * as vm from 'vm';
 import * as assert from 'uvu/assert';
 import * as uvu from 'uvu';
-import { uneval, parse, stringify } from '../index.js';
+import { uneval, unflatten, parse, stringify } from '../index.js';
 
 const fixtures = {
 	basics: [
@@ -394,6 +394,23 @@ for (const [name, tests] of Object.entries(fixtures)) {
 	for (const t of tests) {
 		test(t.name, () => {
 			const actual = parse(t.json);
+			const expected = t.value;
+
+			if (t.validate) {
+				t.validate(actual);
+			} else {
+				assert.equal(actual, expected);
+			}
+		});
+	}
+	test.run();
+}
+
+for (const [name, tests] of Object.entries(fixtures)) {
+	const test = uvu.suite(`unflatten: ${name}`);
+	for (const t of tests) {
+		test(t.name, () => {
+			const actual = unflatten(JSON.parse(t.json));
 			const expected = t.value;
 
 			if (t.validate) {

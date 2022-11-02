@@ -12,8 +12,14 @@ import {
  * @param {string} serialized
  */
 export function parse(serialized) {
-	const parsed = JSON.parse(serialized);
+	return unflatten(JSON.parse(serialized));
+}
 
+/**
+ * Revive a value flattened with `devalue.flatten`
+ * @param {number | any[]} parsed
+ */
+export function unflatten(parsed) {
 	if (typeof parsed === 'number') return hydrate(parsed, true);
 
 	if (!Array.isArray(parsed) || parsed.length === 0) {
