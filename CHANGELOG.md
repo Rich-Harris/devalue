@@ -1,5 +1,9 @@
 # devalue changelog
 
+## 4.2.0
+
+- Add `unflatten` ([#48](https://github.com/Rich-Harris/devalue/pull/48))
+
 ## 4.1.0
 
 - Only deduplicate non-primitives ([#44](https://github.com/Rich-Harris/devalue/pull/44))
