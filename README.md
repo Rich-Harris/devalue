@@ -63,22 +63,37 @@ devalue.parse(stringified); // { message: 'hello', self: [Circular] }
 
 Use `stringify` and `parse` when evaluating JavaScript isn't an option.
 
+### `unflatten`
+
+In the case where devalued data is one part of a larger JSON string, `unflatten` allows you to revive just the bit you need:
+
+```js
+import * as devalue from 'devalue';
+
+const json = `{
+  "type": "data",
+  "data": ${devalue.stringify(data)}
+}`;
+
+const data = devalue.unflatten(JSON.parse(json).data);
+```
+
 ## Error handling
 
 If `uneval` or `stringify` encounters a function or a non-POJO, it will throw an error. You can find where in the input data the offending value lives by inspecting `error.path`:
 
 ```js
 try {
-  const map = new Map();
-  map.set('key', function invalid() {});
+	const map = new Map();
+	map.set('key', function invalid() {});
 
-  uneval({
-    object: {
-      array: [map]
-    }
-  });
+	uneval({
+		object: {
+			array: [map]
+		}
+	});
 } catch (e) {
-  console.log(e.path); // '.object.array[0].get("key")'
+	console.log(e.path); // '.object.array[0].get("key")'
 }
 ```
 
@@ -88,7 +103,7 @@ Say you're server-rendering a page and want to serialize some state, which could
 
 ```js
 const state = {
-  userinput: `</script><script src='https://evil.com/mwahaha.js'>`
+	userinput: `</script><script src='https://evil.com/mwahaha.js'>`
 };
 
 const template = `
@@ -102,11 +117,11 @@ Which would result in this:
 
 ```html
 <script>
-  // NEVER DO THIS
-  var preloaded = {"userinput":"
+	// NEVER DO THIS
+	var preloaded = {"userinput":"
 </script>
 <script src="https://evil.com/mwahaha.js">
-  "};
+	"};
 </script>
 ```
 
@@ -121,10 +136,10 @@ const template = `
 
 ```html
 <script>
-  var preloaded = {
-    userinput:
-      "\\u003C\\u002Fscript\\u003E\\u003Cscript src='https:\\u002F\\u002Fevil.com\\u002Fmwahaha.js'\\u003E"
-  };
+	var preloaded = {
+		userinput:
+			"\\u003C\\u002Fscript\\u003E\\u003Cscript src='https:\\u002F\\u002Fevil.com\\u002Fmwahaha.js'\\u003E"
+	};
 </script>
 ```
 
@@ -142,9 +157,9 @@ When using `eval`, ensure that you call it _indirectly_ so that the evaluated co
 
 ```js
 {
-  const sensitiveData = 'Setec Astronomy';
-  eval('sendToEvilServer(sensitiveData)'); // pwned :(
-  (0, eval)('sendToEvilServer(sensitiveData)'); // nice try, evildoer!
+	const sensitiveData = 'Setec Astronomy';
+	eval('sendToEvilServer(sensitiveData)'); // pwned :(
+	(0, eval)('sendToEvilServer(sensitiveData)'); // nice try, evildoer!
 }
 ```
 
