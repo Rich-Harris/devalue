@@ -205,6 +205,12 @@ const fixtures = {
 			value: '\\',
 			js: JSON.stringify('\\'),
 			json: '["\\\\"]'
+		},
+		{
+			name: 'group separator',
+			value: '\x1D',
+			js: JSON.stringify('\x1D'),
+			json: '["\\u001d"]'
 		}
 	],
 

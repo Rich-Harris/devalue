@@ -11,7 +11,8 @@ export const escaped = {
 	'\t': '\\t',
 	'\0': '\\u0000',
 	'\u2028': '\\u2028',
-	'\u2029': '\\u2029'
+	'\u2029': '\\u2029',
+	'\x1D': '\\u001d'
 };
 
 export class DevalueError extends Error {
