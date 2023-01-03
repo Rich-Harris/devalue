@@ -174,6 +174,7 @@ Using `new Function(code)` is akin to using indirect eval.
 - [serialize-javascript](https://github.com/yahoo/serialize-javascript) by Eric Ferraiuolo
 - [jsesc](https://github.com/mathiasbynens/jsesc) by Mathias Bynens
 - [superjson](https://github.com/blitz-js/superjson) by Blitz
+- [next-json](https://github.com/iccicci/next-json) by Daniele Ricci
 
 ## License
 
