@@ -1,5 +1,9 @@
 # devalue changelog
 
+## 4.2.1
+
+- Re-use internal helper ([#55](https://github.com/Rich-Harris/devalue/pull/55))
+
 ## 4.2.0
 
 - Add `unflatten` ([#48](https://github.com/Rich-Harris/devalue/pull/48))
