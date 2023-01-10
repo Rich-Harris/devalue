@@ -2,6 +2,7 @@ import {
 	DevalueError,
 	escaped,
 	get_type,
+	is_plain_object,
 	is_primitive,
 	stringify_string
 } from './utils.js';
@@ -10,9 +11,6 @@ const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$';
 const unsafe_chars = /[<>\b\f\n\r\t\0\u2028\u2029]/g;
 const reserved =
 	/^(?:do|if|in|for|int|let|new|try|var|byte|case|char|else|enum|goto|long|this|void|with|await|break|catch|class|const|final|float|short|super|throw|while|yield|delete|double|export|import|native|return|switch|throws|typeof|boolean|default|extends|finally|package|private|abstract|continue|debugger|function|volatile|interface|protected|transient|implements|instanceof|synchronized)$/;
-const object_proto_names = Object.getOwnPropertyNames(Object.prototype)
-	.sort()
-	.join('\0');
 
 /**
  * Turn a value into the JavaScript that creates an equivalent value
@@ -72,14 +70,7 @@ export function uneval(value) {
 					break;
 
 				default:
-					const proto = Object.getPrototypeOf(thing);
-
-					if (
-						proto !== Object.prototype &&
-						proto !== null &&
-						Object.getOwnPropertyNames(proto).sort().join('\0') !==
-							object_proto_names
-					) {
+					if (!is_plain_object(thing)) {
 						throw new DevalueError(
 							`Cannot stringify arbitrary non-POJOs`,
 							keys
