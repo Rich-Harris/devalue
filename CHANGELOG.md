@@ -1,5 +1,9 @@
 # devalue changelog
 
+## 4.2.2
+
+- Remove `pkg.main` ([#56](https://github.com/Rich-Harris/devalue/pull/56))
+
 ## 4.2.1
 
 - Re-use internal helper ([#55](https://github.com/Rich-Harris/devalue/pull/55))
