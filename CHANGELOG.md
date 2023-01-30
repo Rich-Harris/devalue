@@ -1,5 +1,9 @@
 # devalue changelog
 
+## 4.2.3
+
+- Correctly escape control characters ([#57](https://github.com/Rich-Harris/devalue/pull/57))
+
 ## 4.2.2
 
 - Remove `pkg.main` ([#56](https://github.com/Rich-Harris/devalue/pull/56))
