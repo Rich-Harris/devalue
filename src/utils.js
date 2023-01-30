@@ -63,7 +63,7 @@ export function stringify_string(str) {
 			result += '\\"';
 		} else if (char in escaped) {
 			result += escaped[char];
-		} else if (code >= 0x0000 && code <= 0x001F) {
+		} else if (code <= 0x001F) {
 			result += `\\u${code.toString(16).toUpperCase().padStart(4, "0")}`
 		} else if (code >= 0xd800 && code <= 0xdfff) {
 			const next = str.charCodeAt(i + 1);
