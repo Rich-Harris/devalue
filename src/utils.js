@@ -75,7 +75,7 @@ export function stringify_string(str) {
 			} else {
 				result += `\\u${code.toString(16).toUpperCase()}`;
 			}
-		} else{
+		} else {
 			result += char;
 		}
 	}
