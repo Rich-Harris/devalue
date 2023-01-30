@@ -201,6 +201,18 @@ const fixtures = {
 			json: '["\\u0000"]'
 		},
 		{
+			name: 'control character',
+			value: '\u0001',
+			js: '"\\u0001"',
+			json: '["\\u0001"]'
+		},
+		{
+			name: 'control character extremum',
+			value: '\u001F',
+			js: '"\\u001F"',
+			json: '["\\u001F"]'
+		},
+		{
 			name: 'backslash',
 			value: '\\',
 			js: JSON.stringify('\\'),
