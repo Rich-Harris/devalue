@@ -3,6 +3,12 @@ import * as assert from 'uvu/assert';
 import * as uvu from 'uvu';
 import { uneval, unflatten, parse, stringify } from '../index.js';
 
+class Custom {
+	constructor(value) {
+		this.value = value;
+	}
+}
+
 const fixtures = {
 	basics: [
 		{
@@ -374,12 +380,32 @@ const fixtures = {
 				assert.equal(Object.keys(value).length, 0);
 			}
 		}
+	],
+
+	custom: [
+		{
+			name: 'Custom type',
+			value: new Custom({ answer: 42 }),
+			js: null,
+			json: '[["Custom",1],{"answer":2},42]',
+			reducers: {
+				Custom: (value) => value instanceof Custom && value.value
+			},
+			revivers: {
+				Custom: (value) => new Custom(value)
+			},
+			validate: (obj) => {
+				assert.ok(obj instanceof Custom);
+				assert.equal(obj.value.answer, 42);
+			}
+		}
 	]
 };
 
 for (const [name, tests] of Object.entries(fixtures)) {
 	const test = uvu.suite(`uneval: ${name}`);
 	for (const t of tests) {
+		if (t.reducers) continue;
 		test(t.name, () => {
 			const actual = uneval(t.value);
 			const expected = t.js;
@@ -393,7 +419,7 @@ for (const [name, tests] of Object.entries(fixtures)) {
 	const test = uvu.suite(`stringify: ${name}`);
 	for (const t of tests) {
 		test(t.name, () => {
-			const actual = stringify(t.value);
+			const actual = stringify(t.value, t.reducers);
 			const expected = t.json;
 			assert.equal(actual, expected);
 		});
@@ -405,7 +431,7 @@ for (const [name, tests] of Object.entries(fixtures)) {
 	const test = uvu.suite(`parse: ${name}`);
 	for (const t of tests) {
 		test(t.name, () => {
-			const actual = parse(t.json);
+			const actual = parse(t.json, t.revivers);
 			const expected = t.value;
 
 			if (t.validate) {
@@ -421,6 +447,7 @@ for (const [name, tests] of Object.entries(fixtures)) {
 for (const [name, tests] of Object.entries(fixtures)) {
 	const test = uvu.suite(`unflatten: ${name}`);
 	for (const t of tests) {
+		if (t.reducers) continue;
 		test(t.name, () => {
 			const actual = unflatten(JSON.parse(t.json));
 			const expected = t.value;

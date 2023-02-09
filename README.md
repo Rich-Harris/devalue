@@ -78,6 +78,37 @@ const json = `{
 const data = devalue.unflatten(JSON.parse(json).data);
 ```
 
+## Custom types
+
+You can serialize and serialize custom types by passing a second argument to `stringify` containing an object of types and their _reducers_, and a second argument to `parse` or `unflatten` containing an object of types and their _revivers_:
+
+```js
+class Vector {
+	constructor(x, y) {
+		this.x = x;
+		this.y = y;
+	}
+
+	magnitude() {
+		return Math.sqrt(this.x * this.x + this.y * this.y);
+	}
+}
+
+const stringified = devalue.stringify(new Vector(30, 40), {
+	Vector: (value) => value instanceof Vector && [value.x, value.y]
+});
+
+console.log(stringified); // [["Vector",1],[2,3],30,40]
+
+const vector = devalue.parse(stringified, {
+	Vector: ([x, y]) => new Vector(x, y)
+});
+
+console.log(vector.magnitude()); // 50
+```
+
+If a function passed to `stringify` returns a truthy value, it's treated as a match.
+
 ## Error handling
 
 If `uneval` or `stringify` encounters a function or a non-POJO, it will throw an error. You can find where in the input data the offending value lives by inspecting `error.path`:
