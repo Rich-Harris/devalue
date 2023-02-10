@@ -15,7 +15,7 @@ const reserved =
 /**
  * Turn a value into the JavaScript that creates an equivalent value
  * @param {any} value
- * @param {(value: any, callback: (value: any) => any) => string | void} [replacer]
+ * @param {(value: any) => string | void} [replacer]
  */
 export function uneval(value, replacer) {
 	const counts = new Map();
@@ -23,7 +23,7 @@ export function uneval(value, replacer) {
 	/** @type {string[]} */
 	const keys = [];
 
-	const custom = new Set();
+	const custom = new Map();
 
 	/** @param {any} thing */
 	function walk(thing) {
@@ -40,13 +40,10 @@ export function uneval(value, replacer) {
 			counts.set(thing, 1);
 
 			if (replacer) {
-				const str = replacer(thing, (child) => {
-					walk(child);
-					return '<pending>';
-				});
+				const str = replacer(thing);
 
 				if (typeof str === 'string') {
-					custom.add(thing);
+					custom.set(thing, str);
 					return;
 				}
 			}
@@ -133,8 +130,7 @@ export function uneval(value, replacer) {
 		}
 
 		if (custom.has(thing)) {
-			const str = replacer(thing, stringify);
-			if (typeof str === 'string') return str;
+			return custom.get(thing);
 		}
 
 		const type = get_type(thing);
@@ -195,7 +191,7 @@ export function uneval(value, replacer) {
 			params.push(name);
 
 			if (custom.has(thing)) {
-				values.push(/** @type {string} */ (replacer(thing, stringify)));
+				values.push(/** @type {string} */ (custom.get(thing)));
 				return;
 			}
 

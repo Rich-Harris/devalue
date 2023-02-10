@@ -388,7 +388,7 @@ const fixtures = {
 			value: [instance, instance],
 			js: '(function(a){return [a,a]}(new Custom({answer:42})))',
 			json: '[[1,1],["Custom",2],{"answer":3},42]',
-			replacer: (value, uneval) => {
+			replacer: (value) => {
 				if (value instanceof Custom) {
 					return `new Custom(${uneval(value.value)})`;
 				}
