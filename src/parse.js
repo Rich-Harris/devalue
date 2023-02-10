@@ -10,7 +10,7 @@ import {
 /**
  * Revive a value serialized with `devalue.stringify`
  * @param {string} serialized
- * @param {Record<string, (value: any) => any>} revivers
+ * @param {Record<string, (value: any) => any>} [revivers]
  */
 export function parse(serialized, revivers) {
 	return unflatten(JSON.parse(serialized), revivers);
@@ -19,7 +19,7 @@ export function parse(serialized, revivers) {
 /**
  * Revive a value flattened with `devalue.stringify`
  * @param {number | any[]} parsed
- * @param {Record<string, (value: any) => any>} revivers
+ * @param {Record<string, (value: any) => any>} [revivers]
  */
 export function unflatten(parsed, revivers) {
 	if (typeof parsed === 'number') return hydrate(parsed, true);
