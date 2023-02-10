@@ -382,24 +382,25 @@ const fixtures = {
 		}
 	],
 
-	custom: [
+	custom: ((instance) => [
 		{
 			name: 'Custom type',
-			value: new Custom({ answer: 42 }),
+			value: [instance, instance],
 			js: null,
-			json: '[["Custom",1],{"answer":2},42]',
+			json: '[[1,1],["Custom",2],{"answer":3},42]',
 			reducers: {
-				Custom: (value) => value instanceof Custom && value.value
+				Custom: (x) => x instanceof Custom && x.value
 			},
 			revivers: {
-				Custom: (value) => new Custom(value)
+				Custom: (x) => new Custom(x)
 			},
-			validate: (obj) => {
-				assert.ok(obj instanceof Custom);
-				assert.equal(obj.value.answer, 42);
+			validate: ([obj1, obj2]) => {
+				assert.is(obj1, obj2);
+				assert.ok(obj1 instanceof Custom);
+				assert.equal(obj1.value.answer, 42);
 			}
 		}
-	]
+	])(new Custom({ answer: 42 }))
 };
 
 for (const [name, tests] of Object.entries(fixtures)) {
