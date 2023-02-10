@@ -109,6 +109,18 @@ console.log(vector.magnitude()); // 50
 
 If a function passed to `stringify` returns a truthy value, it's treated as a match.
 
+You can also use custom types with `uneval` by specifying a custom replacer:
+
+```js
+devalue.uneval(vector, (value, uneval) => {
+	if (value instanceof Vector) {
+		return `new Vector(${value.x},${value.y})`;
+	}
+}); // `new Vector(30,40)`
+```
+
+Note that any variables referenced in the resulting JavaScript (like `Vector` in the example above) must be in scope when it runs.
+
 ## Error handling
 
 If `uneval` or `stringify` encounters a function or a non-POJO, it will throw an error. You can find where in the input data the offending value lives by inspecting `error.path`:
