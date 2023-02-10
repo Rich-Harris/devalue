@@ -412,7 +412,7 @@ for (const [name, tests] of Object.entries(fixtures)) {
 	const test = uvu.suite(`uneval: ${name}`);
 	for (const t of tests) {
 		test(t.name, () => {
-			const actual = uneval(t.value);
+			const actual = uneval(t.value, t.replacer);
 			const expected = t.js;
 			assert.equal(actual, expected);
 		});
