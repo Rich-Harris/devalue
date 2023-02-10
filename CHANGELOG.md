@@ -1,5 +1,9 @@
 # devalue changelog
 
+## 4.3.0
+
+- Support custom types ([#58](https://github.com/Rich-Harris/devalue/pull/58))
+
 ## 4.2.3
 
 - Correctly escape control characters ([#57](https://github.com/Rich-Harris/devalue/pull/57))

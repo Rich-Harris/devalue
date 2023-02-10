@@ -9,6 +9,7 @@ Like `JSON.stringify`, but handles
 - dates
 - `Map` and `Set`
 - `BigInt`
+- custom types via replacers, reducers and revivers
 
 Try it out [here](https://svelte.dev/repl/138d70def7a748ce9eda736ef1c71239?version=3.49.0).
 
@@ -21,7 +22,7 @@ Try it out [here](https://svelte.dev/repl/138d70def7a748ce9eda736ef1c71239?versi
 ## Non-goals:
 
 - Human-readable output
-- Stringifying functions or non-POJOs
+- Stringifying functions
 
 ## Usage
 
@@ -123,7 +124,7 @@ Note that any variables referenced in the resulting JavaScript (like `Vector` in
 
 ## Error handling
 
-If `uneval` or `stringify` encounters a function or a non-POJO, it will throw an error. You can find where in the input data the offending value lives by inspecting `error.path`:
+If `uneval` or `stringify` encounters a function or a non-POJO that isn't handled by a custom replacer/reducer, it will throw an error. You can find where in the input data the offending value lives by inspecting `error.path`:
 
 ```js
 try {
