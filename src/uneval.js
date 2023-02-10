@@ -15,12 +15,15 @@ const reserved =
 /**
  * Turn a value into the JavaScript that creates an equivalent value
  * @param {any} value
+ * @param {(value: any) => string | void} [replacer]
  */
-export function uneval(value) {
+export function uneval(value, replacer) {
 	const counts = new Map();
 
 	/** @type {string[]} */
 	const keys = [];
+
+	const custom = new Map();
 
 	/** @param {any} thing */
 	function walk(thing) {
@@ -35,6 +38,15 @@ export function uneval(value) {
 			}
 
 			counts.set(thing, 1);
+
+			if (replacer) {
+				const str = replacer(thing);
+
+				if (typeof str === 'string') {
+					custom.set(thing, str);
+					return;
+				}
+			}
 
 			const type = get_type(thing);
 
@@ -117,6 +129,10 @@ export function uneval(value) {
 			return stringify_primitive(thing);
 		}
 
+		if (custom.has(thing)) {
+			return custom.get(thing);
+		}
+
 		const type = get_type(thing);
 
 		switch (type) {
@@ -173,6 +189,11 @@ export function uneval(value) {
 
 		names.forEach((name, thing) => {
 			params.push(name);
+
+			if (custom.has(thing)) {
+				values.push(/** @type {string} */ (custom.get(thing)));
+				return;
+			}
 
 			if (is_primitive(thing)) {
 				values.push(stringify_primitive(thing));

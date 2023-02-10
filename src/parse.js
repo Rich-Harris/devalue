@@ -10,16 +10,18 @@ import {
 /**
  * Revive a value serialized with `devalue.stringify`
  * @param {string} serialized
+ * @param {Record<string, (value: any) => any>} [revivers]
  */
-export function parse(serialized) {
-	return unflatten(JSON.parse(serialized));
+export function parse(serialized, revivers) {
+	return unflatten(JSON.parse(serialized), revivers);
 }
 
 /**
- * Revive a value flattened with `devalue.flatten`
+ * Revive a value flattened with `devalue.stringify`
  * @param {number | any[]} parsed
+ * @param {Record<string, (value: any) => any>} [revivers]
  */
-export function unflatten(parsed) {
+export function unflatten(parsed, revivers) {
 	if (typeof parsed === 'number') return hydrate(parsed, true);
 
 	if (!Array.isArray(parsed) || parsed.length === 0) {
@@ -30,7 +32,10 @@ export function unflatten(parsed) {
 
 	const hydrated = Array(values.length);
 
-	/** @param {number} index */
+	/**
+	 * @param {number} index
+	 * @returns {any}
+	 */
 	function hydrate(index, standalone = false) {
 		if (index === UNDEFINED) return undefined;
 		if (index === NAN) return NaN;
@@ -49,6 +54,11 @@ export function unflatten(parsed) {
 		} else if (Array.isArray(value)) {
 			if (typeof value[0] === 'string') {
 				const type = value[0];
+
+				const reviver = revivers?.[type];
+				if (reviver) {
+					return (hydrated[index] = reviver(hydrate(value[1])));
+				}
 
 				switch (type) {
 					case 'Date':
@@ -90,6 +100,9 @@ export function unflatten(parsed) {
 							obj[value[i]] = hydrate(value[i + 1]);
 						}
 						break;
+
+					default:
+						throw new Error(`Unknown type ${type}`);
 				}
 			} else {
 				const array = new Array(value.length);

@@ -17,13 +17,20 @@ import {
 /**
  * Turn a value into a JSON string that can be parsed with `devalue.parse`
  * @param {any} value
+ * @param {Record<string, (value: any) => any>} [reducers]
  */
-export function stringify(value) {
+export function stringify(value, reducers) {
 	/** @type {any[]} */
 	const stringified = [];
 
 	/** @type {Map<any, number>} */
 	const indexes = new Map();
+
+	/** @type {Array<{ key: string, fn: (value: any) => any }>} */
+	const custom = [];
+	for (const key in reducers) {
+		custom.push({ key, fn: reducers[key] });
+	}
 
 	/** @type {string[]} */
 	const keys = [];
@@ -46,6 +53,14 @@ export function stringify(value) {
 
 		const index = p++;
 		indexes.set(thing, index);
+
+		for (const { key, fn } of custom) {
+			const value = fn(thing);
+			if (value) {
+				stringified[index] = `["${key}",${flatten(value)}]`;
+				return index;
+			}
+		}
 
 		let str = '';
 
