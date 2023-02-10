@@ -386,7 +386,7 @@ const fixtures = {
 		{
 			name: 'Custom type',
 			value: [instance, instance],
-			js: null,
+			js: '(function(a){return [a,a]}(new Custom({answer:42})))',
 			json: '[[1,1],["Custom",2],{"answer":3},42]',
 			reducers: {
 				Custom: (x) => x instanceof Custom && x.value
@@ -406,7 +406,6 @@ const fixtures = {
 for (const [name, tests] of Object.entries(fixtures)) {
 	const test = uvu.suite(`uneval: ${name}`);
 	for (const t of tests) {
-		if (t.reducers) continue;
 		test(t.name, () => {
 			const actual = uneval(t.value);
 			const expected = t.js;
@@ -448,9 +447,8 @@ for (const [name, tests] of Object.entries(fixtures)) {
 for (const [name, tests] of Object.entries(fixtures)) {
 	const test = uvu.suite(`unflatten: ${name}`);
 	for (const t of tests) {
-		if (t.reducers) continue;
 		test(t.name, () => {
-			const actual = unflatten(JSON.parse(t.json));
+			const actual = unflatten(JSON.parse(t.json), t.revivers);
 			const expected = t.value;
 
 			if (t.validate) {
