@@ -57,6 +57,7 @@ export function uneval(value, replacer) {
 				case 'Boolean':
 				case 'Date':
 				case 'RegExp':
+				case 'Decimal':
 					return;
 
 				case 'Array':
@@ -206,6 +207,7 @@ export function uneval(value, replacer) {
 				case 'Number':
 				case 'String':
 				case 'Boolean':
+				case 'Decimal':
 					values.push(`Object(${stringify(thing.valueOf())})`);
 					break;
 

@@ -73,6 +73,7 @@ export function stringify(value, reducers) {
 				case 'Number':
 				case 'String':
 				case 'Boolean':
+				case 'Decimal':
 					str = `["Object",${stringify_primitive(thing)}]`;
 					break;
 
