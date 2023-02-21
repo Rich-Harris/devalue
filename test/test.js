@@ -108,6 +108,15 @@ const fixtures = {
 			json: '[["Date","2001-09-09T01:46:40.000Z"]]'
 		},
 		{
+			name: 'invalid Date',
+			value: new Date(''),
+			js: 'new Date(NaN)',
+			json: '[["Date",""]]',
+			validate: (value) => {
+				assert.ok(isNaN(value.valueOf()));
+			}
+		},
+		{
 			name: 'Array',
 			value: ['a', 'b', 'c'],
 			js: '["a","b","c"]',
@@ -455,7 +464,6 @@ for (const [name, tests] of Object.entries(fixtures)) {
 		test(t.name, () => {
 			const actual = unflatten(JSON.parse(t.json), t.revivers);
 			const expected = t.value;
-
 			if (t.validate) {
 				t.validate(actual);
 			} else {
