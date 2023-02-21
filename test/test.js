@@ -464,6 +464,7 @@ for (const [name, tests] of Object.entries(fixtures)) {
 		test(t.name, () => {
 			const actual = unflatten(JSON.parse(t.json), t.revivers);
 			const expected = t.value;
+
 			if (t.validate) {
 				t.validate(actual);
 			} else {
