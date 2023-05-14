@@ -167,26 +167,26 @@ const fixtures = {
 		{
 			name: 'lone low surrogate',
 			value: 'a\uDC00b',
-			js: '"a\\uDC00b"',
-			json: '["a\\uDC00b"]'
+			js: '"a\uDC00b"',
+			json: '["a\uDC00b"]'
 		},
 		{
 			name: 'lone high surrogate',
 			value: 'a\uD800b',
-			js: '"a\\uD800b"',
-			json: '["a\\uD800b"]'
+			js: '"a\uD800b"',
+			json: '["a\uD800b"]'
 		},
 		{
 			name: 'two low surrogates',
 			value: 'a\uDC00\uDC00b',
-			js: '"a\\uDC00\\uDC00b"',
-			json: '["a\\uDC00\\uDC00b"]'
+			js: '"a\uDC00\uDC00b"',
+			json: '["a\uDC00\uDC00b"]'
 		},
 		{
 			name: 'two high surrogates',
 			value: 'a\uD800\uD800b',
-			js: '"a\\uD800\\uD800b"',
-			json: '["a\\uD800\\uD800b"]'
+			js: '"a\uD800\uD800b"',
+			json: '["a\uD800\uD800b"]'
 		},
 		{
 			name: 'surrogate pair',
@@ -197,8 +197,8 @@ const fixtures = {
 		{
 			name: 'surrogate pair in wrong order',
 			value: 'a\uDC00\uD800b',
-			js: '"a\\uDC00\\uD800b"',
-			json: '["a\\uDC00\\uD800b"]'
+			js: '"a\uDC00\uD800b"',
+			json: '["a\uDC00\uD800b"]'
 		},
 		{
 			name: 'nul',
@@ -215,8 +215,8 @@ const fixtures = {
 		{
 			name: 'control character extremum',
 			value: '\u001F',
-			js: '"\\u001F"',
-			json: '["\\u001F"]'
+			js: '"\\u001f"',
+			json: '["\\u001f"]'
 		},
 		{
 			name: 'backslash',
@@ -342,20 +342,20 @@ const fixtures = {
 		{
 			name: 'Dangerous string',
 			value: `</script><script src='https://evil.com/script.js'>alert('pwned')</script><script>`,
-			js: `"\\u003C\\u002Fscript\\u003E\\u003Cscript src='https:\\u002F\\u002Fevil.com\\u002Fscript.js'\\u003Ealert('pwned')\\u003C\\u002Fscript\\u003E\\u003Cscript\\u003E"`,
-			json: `["\\u003C\\u002Fscript\\u003E\\u003Cscript src='https:\\u002F\\u002Fevil.com\\u002Fscript.js'\\u003Ealert('pwned')\\u003C\\u002Fscript\\u003E\\u003Cscript\\u003E"]`
+			js: `"\\u003C/script>\\u003Cscript src='https://evil.com/script.js'>alert('pwned')\\u003C/script>\\u003Cscript>"`,
+			json: `["\\u003C/script>\\u003Cscript src='https://evil.com/script.js'>alert('pwned')\\u003C/script>\\u003Cscript>"]`
 		},
 		{
 			name: 'Dangerous key',
 			value: { '<svg onload=alert("xss_works")>': 'bar' },
-			js: '{"\\u003Csvg onload=alert(\\"xss_works\\")\\u003E":"bar"}',
-			json: '[{"\\u003Csvg onload=alert(\\"xss_works\\")\\u003E":1},"bar"]'
+			js: '{"\\u003Csvg onload=alert(\\"xss_works\\")>":"bar"}',
+			json: '[{"\\u003Csvg onload=alert(\\"xss_works\\")>":1},"bar"]'
 		},
 		{
 			name: 'Dangerous regex',
 			value: /[</script><script>alert('xss')//]/,
-			js: `new RegExp("[\\u003C\\u002Fscript\\u003E\\u003Cscript\\u003Ealert('xss')\\u002F\\u002F]", "")`,
-			json: `[["RegExp","[\\u003C\\u002Fscript\\u003E\\u003Cscript\\u003Ealert('xss')\\u002F\\u002F]"]]`
+			js: `new RegExp("[\\u003C/script>\\u003Cscript>alert('xss')//]", "")`,
+			json: `[["RegExp","[\\u003C/script>\\u003Cscript>alert('xss')//]"]]`
 		}
 	],
 
