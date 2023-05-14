@@ -28,7 +28,9 @@ export function is_primitive(thing) {
 	return Object(thing) !== thing;
 }
 
-const object_proto_names = /* @__PURE__ */ Object.getOwnPropertyNames(Object.prototype)
+const object_proto_names = /* @__PURE__ */ Object.getOwnPropertyNames(
+	Object.prototype
+)
 	.sort()
 	.join('\0');
 
@@ -93,7 +95,5 @@ export function stringify_string(str) {
 		}
 	}
 
-	result += str.slice(last_pos);
-
-	return `"${result}"`;
+	return `"${last_pos === 0 ? str : result + str.slice(last_pos)}"`;
 }
