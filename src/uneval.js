@@ -8,7 +8,7 @@ import {
 } from './utils.js';
 
 const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$';
-const unsafe_chars = /[<>\b\f\n\r\t\0\u2028\u2029]/g;
+const unsafe_chars = /[<\b\f\n\r\t\0\u2028\u2029]/g;
 const reserved =
 	/^(?:do|if|in|for|int|let|new|try|var|byte|case|char|else|enum|goto|long|this|void|with|await|break|catch|class|const|final|float|short|super|throw|while|yield|delete|double|export|import|native|return|switch|throws|typeof|boolean|default|extends|finally|package|private|abstract|continue|debugger|function|volatile|interface|protected|transient|implements|instanceof|synchronized)$/;
 
