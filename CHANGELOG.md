@@ -1,5 +1,9 @@
 # devalue changelog
 
+## 4.3.1
+
+- Faster ([#65](https://github.com/Rich-Harris/devalue/pull/65))
+
 ## 4.3.0
 
 - Support custom types ([#58](https://github.com/Rich-Harris/devalue/pull/58))
