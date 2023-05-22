@@ -1,5 +1,9 @@
 # devalue changelog
 
+## 4.3.2
+
+- Better type declarations ([#66](https://github.com/Rich-Harris/devalue/pull/66))
+
 ## 4.3.1
 
 - Faster ([#65](https://github.com/Rich-Harris/devalue/pull/65))
