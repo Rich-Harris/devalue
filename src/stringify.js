@@ -128,6 +128,7 @@ export function stringify(value, reducers) {
 							`.get(${is_primitive(key) ? stringify_primitive(key) : '...'})`
 						);
 						str += `,${flatten(key)},${flatten(value)}`;
+						keys.pop();
 					}
 
 					str += ']';
