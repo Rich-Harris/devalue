@@ -81,7 +81,8 @@ export function stringify(value, reducers) {
 					break;
 
 				case 'Date':
-					str = `["Date","${thing.toISOString()}"]`;
+					const isValidDate = !isNaN(thing.getDate())
+					str = `["Date","${isValidDate ? thing.toISOString() : ''}"]`;
 					break;
 
 				case 'RegExp':
