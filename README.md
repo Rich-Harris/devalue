@@ -81,7 +81,7 @@ const data = devalue.unflatten(JSON.parse(json).data);
 
 ## Custom types
 
-You can serialize and serialize custom types by passing a second argument to `stringify` containing an object of types and their _reducers_, and a second argument to `parse` or `unflatten` containing an object of types and their _revivers_:
+You can serialize and deserialize custom types by passing a second argument to `stringify` containing an object of types and their _reducers_, and a second argument to `parse` or `unflatten` containing an object of types and their _revivers_:
 
 ```js
 class Vector {
