@@ -9,6 +9,7 @@ Like `JSON.stringify`, but handles
 - dates
 - `Map` and `Set`
 - `BigInt`
+- `ArrayBuffer` and Typed Arrays
 - custom types via replacers, reducers and revivers
 
 Try it out [here](https://svelte.dev/repl/138d70def7a748ce9eda736ef1c71239?version=3.49.0).
