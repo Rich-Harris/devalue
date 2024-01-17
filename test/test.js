@@ -475,7 +475,7 @@ const invalid = [
 	{
 		name: 'invalid JSON',
 		json: '][',
-		message: 'Unexpected token ] in JSON at position 0'
+		message: 'Unexpected token \']\', "][" is not valid JSON'
 	},
 	{
 		name: 'hole',
