@@ -110,6 +110,15 @@ const fixtures = {
 			json: '[["Date","2001-09-09T01:46:40.000Z"]]'
 		},
 		{
+			name: 'invalid Date',
+			value: new Date(''),
+			js: 'new Date(NaN)',
+			json: '[["Date",""]]',
+			validate: (value) => {
+				assert.ok(isNaN(value.valueOf()));
+			}
+		},
+		{
 			name: 'Array',
 			value: ['a', 'b', 'c'],
 			js: '["a","b","c"]',
