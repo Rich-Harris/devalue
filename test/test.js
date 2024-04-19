@@ -560,6 +560,21 @@ for (const fn of [uneval, stringify]) {
 			assert.equal(e.path, '.foo.map.get("key")');
 		}
 	});
+
+	uvu.test(`${fn.name} populates error.path after maps (#64)`, () => {
+		try {
+			fn({
+				map: new Map([['key', 'value']]),
+				object: {
+					invalid() {}
+				}
+			});
+		} catch (e) {
+			assert.equal(e.name, 'DevalueError');
+			assert.equal(e.message, 'Cannot stringify a function');
+			assert.equal(e.path, '.object.invalid');
+		}
+	});
 }
 
 uvu.test('does not create duplicate parameter names', () => {
