@@ -9,6 +9,8 @@ class Custom {
 	}
 }
 
+const node_version = +process.versions.node.split('.')[0];
+
 const fixtures = {
 	basics: [
 		{
@@ -475,7 +477,10 @@ const invalid = [
 	{
 		name: 'invalid JSON',
 		json: '][',
-		message: 'Unexpected token ] in JSON at position 0'
+		message:
+			node_version >= 20
+				? `Unexpected token ']', "][" is not valid JSON`
+				: 'Unexpected token ] in JSON at position 0'
 	},
 	{
 		name: 'hole',
@@ -518,7 +523,13 @@ for (const { name, json, message } of invalid) {
 	uvu.test(`parse error: ${name}`, () => {
 		assert.throws(
 			() => parse(json),
-			(error) => error.message === message
+			(error) => {
+				const match = error.message === message;
+				if (!match) {
+					console.error(`Expected: ${message}, got: ${error.message}`);
+				}
+				return match;
+			}
 		);
 	});
 }
