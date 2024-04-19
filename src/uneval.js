@@ -1,5 +1,6 @@
 import {
 	DevalueError,
+	enumerable_symbols,
 	escaped,
 	get_type,
 	is_plain_object,
@@ -89,7 +90,7 @@ export function uneval(value, replacer) {
 						);
 					}
 
-					if (Object.getOwnPropertySymbols(thing).length > 0) {
+					if (enumerable_symbols(thing).length > 0) {
 						throw new DevalueError(
 							`Cannot stringify POJOs with symbolic keys`,
 							keys

@@ -97,3 +97,10 @@ export function stringify_string(str) {
 
 	return `"${last_pos === 0 ? str : result + str.slice(last_pos)}"`;
 }
+
+/** @param {Record<string | symbol, any>} object */
+export function enumerable_symbols(object) {
+	return Object.getOwnPropertySymbols(object).filter(
+		(symbol) => Object.getOwnPropertyDescriptor(object, symbol).enumerable
+	);
+}
