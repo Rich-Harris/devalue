@@ -390,6 +390,19 @@ const fixtures = {
 				assert.equal(Object.getPrototypeOf(value), Object.prototype);
 				assert.equal(Object.keys(value).length, 0);
 			}
+		},
+		{
+			name: 'non-enumerable symbolic key',
+			value: (() => {
+				const obj = { x: 1 };
+				Object.defineProperty(obj, Symbol('key'), {
+					value: 'value',
+					enumerable: false
+				});
+				return obj;
+			})(),
+			js: '{x:1}',
+			json: '[{"x":1},1]'
 		}
 	],
 

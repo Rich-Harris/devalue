@@ -1,5 +1,6 @@
 import {
 	DevalueError,
+	enumerable_symbols,
 	get_type,
 	is_plain_object,
 	is_primitive,
@@ -143,7 +144,7 @@ export function stringify(value, reducers) {
 						);
 					}
 
-					if (Object.getOwnPropertySymbols(thing).length > 0) {
+					if (enumerable_symbols(thing).length > 0) {
 						throw new DevalueError(
 							`Cannot stringify POJOs with symbolic keys`,
 							keys
