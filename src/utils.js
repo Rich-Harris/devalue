@@ -1,15 +1,12 @@
 /** @type {Record<string, string>} */
 export const escaped = {
 	'<': '\\u003C',
-	'>': '\\u003E',
-	'/': '\\u002F',
 	'\\': '\\\\',
 	'\b': '\\b',
 	'\f': '\\f',
 	'\n': '\\n',
 	'\r': '\\r',
 	'\t': '\\t',
-	'\0': '\\u0000',
 	'\u2028': '\\u2028',
 	'\u2029': '\\u2029'
 };
@@ -31,7 +28,9 @@ export function is_primitive(thing) {
 	return Object(thing) !== thing;
 }
 
-const object_proto_names = Object.getOwnPropertyNames(Object.prototype)
+const object_proto_names = /* @__PURE__ */ Object.getOwnPropertyNames(
+	Object.prototype
+)
 	.sort()
 	.join('\0');
 
@@ -51,35 +50,50 @@ export function get_type(thing) {
 	return Object.prototype.toString.call(thing).slice(8, -1);
 }
 
+/** @param {string} char */
+function get_escaped_char(char) {
+	switch (char) {
+		case '"':
+			return '\\"';
+		case '<':
+			return '\\u003C';
+		case '\\':
+			return '\\\\';
+		case '\n':
+			return '\\n';
+		case '\r':
+			return '\\r';
+		case '\t':
+			return '\\t';
+		case '\b':
+			return '\\b';
+		case '\f':
+			return '\\f';
+		case '\u2028':
+			return '\\u2028';
+		case '\u2029':
+			return '\\u2029';
+		default:
+			return char < ' '
+				? `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`
+				: '';
+	}
+}
+
 /** @param {string} str */
 export function stringify_string(str) {
-	let result = '"';
+	let result = '';
+	let last_pos = 0;
+	const len = str.length;
 
-	for (let i = 0; i < str.length; i += 1) {
-		const char = str.charAt(i);
-		const code = char.charCodeAt(0);
-
-		if (char === '"') {
-			result += '\\"';
-		} else if (char in escaped) {
-			result += escaped[char];
-		} else if (code <= 0x001F) {
-			result += `\\u${code.toString(16).toUpperCase().padStart(4, "0")}`
-		} else if (code >= 0xd800 && code <= 0xdfff) {
-			const next = str.charCodeAt(i + 1);
-
-			// If this is the beginning of a [high, low] surrogate pair,
-			// add the next two characters, otherwise escape
-			if (code <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
-				result += char + str[++i];
-			} else {
-				result += `\\u${code.toString(16).toUpperCase()}`;
-			}
-		} else {
-			result += char;
+	for (let i = 0; i < len; i += 1) {
+		const char = str[i];
+		const replacement = get_escaped_char(char);
+		if (replacement) {
+			result += str.slice(last_pos, i) + replacement;
+			last_pos = i + 1;
 		}
 	}
 
-	result += '"';
-	return result;
+	return `"${last_pos === 0 ? str : result + str.slice(last_pos)}"`;
 }
