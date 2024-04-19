@@ -25,7 +25,7 @@
 	"scripts": {
 		"build": "dts-buddy",
 		"test": "uvu test",
-		"prepublishOnly": "npm test && publint && npm run build"
+		"prepublishOnly": "npm test && npm run build && publint"
 	},
 	"license": "MIT",
 	"type": "module",
