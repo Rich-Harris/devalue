@@ -1,5 +1,9 @@
 # devalue changelog
 
+## 5.0.0
+
+- Ignore non-enumerable symbolic keys ([#78](https://github.com/Rich-Harris/devalue/pull/78))
+
 ## 4.3.3
 
 - Support invalid dates ([#61](https://github.com/Rich-Harris/devalue/pull/61))

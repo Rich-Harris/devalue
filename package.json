@@ -1,7 +1,7 @@
 {
 	"name": "devalue",
 	"description": "Gets the job done when JSON.stringify can't",
-	"version": "4.3.3",
+	"version": "5.0.0",
 	"repository": "Rich-Harris/devalue",
 	"exports": {
 		".": {
