@@ -4,6 +4,7 @@
 		"checkJs": true,
 		"declaration": true,
 		"declarationDir": "types",
+		"declarationMap": true,
 		"emitDeclarationOnly": true,
 		"noImplicitAny": true,
 		"diagnostics": true,
