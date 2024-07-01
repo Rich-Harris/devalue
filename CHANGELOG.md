@@ -1,5 +1,14 @@
 # devalue changelog
 
+## 5.0.0
+
+- Ignore non-enumerable symbolic keys ([#78](https://github.com/Rich-Harris/devalue/pull/78))
+
+## 4.3.3
+
+- Support invalid dates ([#61](https://github.com/Rich-Harris/devalue/pull/61))
+- Fix incorrect `error.path` when object contains a map ([#64](https://github.com/Rich-Harris/devalue/pull/64))
+
 ## 4.3.2
 
 - Better type declarations ([#66](https://github.com/Rich-Harris/devalue/pull/66))

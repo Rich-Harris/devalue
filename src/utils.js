@@ -59,3 +59,10 @@ export function stringify_string(str) {
 
 	return JSON.stringify(str).replace(/[<\u2028\u2029]/g, char => escaped[char]);
 }
+
+/** @param {Record<string | symbol, any>} object */
+export function enumerable_symbols(object) {
+	return Object.getOwnPropertySymbols(object).filter(
+		(symbol) => Object.getOwnPropertyDescriptor(object, symbol).enumerable
+	);
+}

@@ -1,7 +1,7 @@
 {
 	"name": "devalue",
 	"description": "Gets the job done when JSON.stringify can't",
-	"version": "4.3.2",
+	"version": "5.0.0",
 	"repository": "Rich-Harris/devalue",
 	"exports": {
 		".": {
@@ -25,7 +25,7 @@
 	"scripts": {
 		"build": "dts-buddy",
 		"test": "uvu test",
-		"prepublishOnly": "npm test && publint && npm run build"
+		"prepublishOnly": "npm test && npm run build && publint"
 	},
 	"license": "MIT",
 	"type": "module",

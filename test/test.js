@@ -9,6 +9,8 @@ class Custom {
 	}
 }
 
+const node_version = +process.versions.node.split('.')[0];
+
 const fixtures = {
 	basics: [
 		{
@@ -106,6 +108,15 @@ const fixtures = {
 			value: new Date(1e12),
 			js: 'new Date(1000000000000)',
 			json: '[["Date","2001-09-09T01:46:40.000Z"]]'
+		},
+		{
+			name: 'invalid Date',
+			value: new Date(''),
+			js: 'new Date(NaN)',
+			json: '[["Date",""]]',
+			validate: (value) => {
+				assert.ok(isNaN(value.valueOf()));
+			}
 		},
 		{
 			name: 'Array',
@@ -379,6 +390,19 @@ const fixtures = {
 				assert.equal(Object.getPrototypeOf(value), Object.prototype);
 				assert.equal(Object.keys(value).length, 0);
 			}
+		},
+		{
+			name: 'non-enumerable symbolic key',
+			value: (() => {
+				const obj = { x: 1 };
+				Object.defineProperty(obj, Symbol('key'), {
+					value: 'value',
+					enumerable: false
+				});
+				return obj;
+			})(),
+			js: '{x:1}',
+			json: '[{"x":1},1]'
 		}
 	],
 
@@ -475,7 +499,10 @@ const invalid = [
 	{
 		name: 'invalid JSON',
 		json: '][',
-		message: 'Unexpected token ] in JSON at position 0'
+		message:
+			node_version >= 20
+				? `Unexpected token ']', "][" is not valid JSON`
+				: 'Unexpected token ] in JSON at position 0'
 	},
 	{
 		name: 'hole',
@@ -518,7 +545,13 @@ for (const { name, json, message } of invalid) {
 	uvu.test(`parse error: ${name}`, () => {
 		assert.throws(
 			() => parse(json),
-			(error) => error.message === message
+			(error) => {
+				const match = error.message === message;
+				if (!match) {
+					console.error(`Expected: ${message}, got: ${error.message}`);
+				}
+				return match;
+			}
 		);
 	});
 }
@@ -558,6 +591,21 @@ for (const fn of [uneval, stringify]) {
 			assert.equal(e.name, 'DevalueError');
 			assert.equal(e.message, 'Cannot stringify arbitrary non-POJOs');
 			assert.equal(e.path, '.foo.map.get("key")');
+		}
+	});
+
+	uvu.test(`${fn.name} populates error.path after maps (#64)`, () => {
+		try {
+			fn({
+				map: new Map([['key', 'value']]),
+				object: {
+					invalid() {}
+				}
+			});
+		} catch (e) {
+			assert.equal(e.name, 'DevalueError');
+			assert.equal(e.message, 'Cannot stringify a function');
+			assert.equal(e.path, '.object.invalid');
 		}
 	});
 }
