@@ -51,13 +51,19 @@ export function get_type(thing) {
 }
 
 const escape_chars = /["<\\\n\r\t\b\f\u2028\u2029\x00-\x1f]/
+const u2028_all = /\u2028/g;
+const u2029_all = /\u2029/g;
+const lt_all = /</g;
 /** @param {string} str */
 export function stringify_string(str) {
 	if (!escape_chars.test(str)){
 		return `"${str}"`;
 	}
 
-	return JSON.stringify(str).replace(/[<\u2028\u2029]/g, char => escaped[char]);
+	return JSON.stringify(str)
+		.replace(u2028_all, '\\u2028')
+		.replace(u2029_all, '\\u2029')
+		.replace(lt_all, '\\u003C');
 }
 
 /** @param {Record<string | symbol, any>} object */
