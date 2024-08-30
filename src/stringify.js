@@ -29,7 +29,7 @@ export function stringify(value, reducers) {
 
 	/** @type {Array<{ key: string, fn: (value: any) => any }>} */
 	const custom = [];
-	for (const key in reducers) {
+	for (const key of Object.getOwnPropertyNames(reducers)) {
 		custom.push({ key, fn: reducers[key] });
 	}
 
