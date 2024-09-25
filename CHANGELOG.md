@@ -1,5 +1,9 @@
 # devalue changelog
 
+## 5.1.1
+
+- Only iterate over own properties of reducers ([#80](https://github.com/Rich-Harris/devalue/pull/80))
+
 ## 5.1.0
 
 - Handle typed arrays and array buffers ([#69](https://github.com/Rich-Harris/devalue/pull/69))
