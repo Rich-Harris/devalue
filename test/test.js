@@ -584,13 +584,13 @@ for (const fn of [uneval, stringify]) {
 			class Whatever {}
 			fn({
 				foo: {
-					map: new Map([['key', new Whatever()]])
+					['string-key']: new Map([['key', new Whatever()]])
 				}
 			});
 		} catch (e) {
 			assert.equal(e.name, 'DevalueError');
 			assert.equal(e.message, 'Cannot stringify arbitrary non-POJOs');
-			assert.equal(e.path, '.foo.map.get("key")');
+			assert.equal(e.path, '.foo["string-key"].get("key")');
 		}
 	});
 
