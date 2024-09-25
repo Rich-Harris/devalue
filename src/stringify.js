@@ -1,5 +1,6 @@
 import {
 	DevalueError,
+	enumerable_symbols,
 	get_type,
 	is_plain_object,
 	is_primitive,
@@ -82,7 +83,8 @@ export function stringify(value, reducers) {
 					break;
 
 				case 'Date':
-					str = `["Date","${thing.toISOString()}"]`;
+					const valid = !isNaN(thing.getDate());
+					str = `["Date","${valid ? thing.toISOString() : ''}"]`;
 					break;
 
 				case 'RegExp':
@@ -129,6 +131,7 @@ export function stringify(value, reducers) {
 							`.get(${is_primitive(key) ? stringify_primitive(key) : '...'})`
 						);
 						str += `,${flatten(key)},${flatten(value)}`;
+						keys.pop();
 					}
 
 					str += ']';
@@ -169,7 +172,7 @@ export function stringify(value, reducers) {
 						);
 					}
 
-					if (Object.getOwnPropertySymbols(thing).length > 0) {
+					if (enumerable_symbols(thing).length > 0) {
 						throw new DevalueError(
 							`Cannot stringify POJOs with symbolic keys`,
 							keys
