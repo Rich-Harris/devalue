@@ -5,6 +5,7 @@ import {
 	get_type,
 	is_plain_object,
 	is_primitive,
+	stringify_key,
 	stringify_string
 } from './utils.js';
 
@@ -81,6 +82,22 @@ export function uneval(value, replacer) {
 						keys.pop();
 					}
 					break;
+				
+				case "Int8Array":
+				case "Uint8Array":
+				case "Uint8ClampedArray":
+				case "Int16Array":
+				case "Uint16Array":
+				case "Int32Array":
+				case "Uint32Array":
+				case "Float32Array":
+				case "Float64Array":
+				case "BigInt64Array":
+				case "BigUint64Array":
+					return;
+				
+				case "ArrayBuffer":
+					return;
 
 				default:
 					if (!is_plain_object(thing)) {
@@ -98,7 +115,7 @@ export function uneval(value, replacer) {
 					}
 
 					for (const key in thing) {
-						keys.push(`.${key}`);
+						keys.push(stringify_key(key));
 						walk(thing[key]);
 						keys.pop();
 					}
@@ -160,6 +177,27 @@ export function uneval(value, replacer) {
 			case 'Set':
 			case 'Map':
 				return `new ${type}([${Array.from(thing).map(stringify).join(',')}])`;
+			
+			case "Int8Array":
+			case "Uint8Array":
+			case "Uint8ClampedArray":
+			case "Int16Array":
+			case "Uint16Array":
+			case "Int32Array":
+			case "Uint32Array":
+			case "Float32Array":
+			case "Float64Array":
+			case "BigInt64Array":
+			case "BigUint64Array": {
+				/** @type {import("./types.js").TypedArray} */
+				const typedArray = thing;
+				return `new ${type}([${typedArray.toString()}])`;
+			}
+				
+			case "ArrayBuffer": {
+				const ui8 = new Uint8Array(thing);
+				return `new Uint8Array([${ui8.toString()}]).buffer`;
+			}
 
 			default:
 				const obj = `{${Object.keys(thing)

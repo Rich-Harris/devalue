@@ -4,6 +4,7 @@ import {
 	get_type,
 	is_plain_object,
 	is_primitive,
+	stringify_key,
 	stringify_string
 } from './utils.js';
 import {
@@ -14,6 +15,7 @@ import {
 	POSITIVE_INFINITY,
 	UNDEFINED
 } from './constants.js';
+import { encode64 } from './base64.js';
 
 /**
  * Turn a value into a JSON string that can be parsed with `devalue.parse`
@@ -136,6 +138,33 @@ export function stringify(value, reducers) {
 					str += ']';
 					break;
 
+				case "Int8Array":
+				case "Uint8Array":
+				case "Uint8ClampedArray":
+				case "Int16Array":
+				case "Uint16Array":
+				case "Int32Array":
+				case "Uint32Array":
+				case "Float32Array":
+				case "Float64Array":
+				case "BigInt64Array":
+				case "BigUint64Array": {
+					/** @type {import("./types.js").TypedArray} */
+					const typedArray = thing;
+					const base64 = encode64(typedArray.buffer);
+					str = '["' + type + '","' + base64 + '"]';
+					break;
+				}
+					
+				case "ArrayBuffer": {
+					/** @type {ArrayBuffer} */
+					const arraybuffer = thing;
+					const base64 = encode64(arraybuffer);
+					
+					str = `["ArrayBuffer","${base64}"]`;
+					break;
+				}
+				
 				default:
 					if (!is_plain_object(thing)) {
 						throw new DevalueError(
@@ -154,7 +183,7 @@ export function stringify(value, reducers) {
 					if (Object.getPrototypeOf(thing) === null) {
 						str = '["null"';
 						for (const key in thing) {
-							keys.push(`.${key}`);
+							keys.push(stringify_key(key));
 							str += `,${stringify_string(key)},${flatten(thing[key])}`;
 							keys.pop();
 						}
@@ -165,7 +194,7 @@ export function stringify(value, reducers) {
 						for (const key in thing) {
 							if (started) str += ',';
 							started = true;
-							keys.push(`.${key}`);
+							keys.push(stringify_key(key));
 							str += `${stringify_string(key)}:${flatten(thing[key])}`;
 							keys.pop();
 						}
