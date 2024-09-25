@@ -31,8 +31,10 @@ export function stringify(value, reducers) {
 
 	/** @type {Array<{ key: string, fn: (value: any) => any }>} */
 	const custom = [];
-	for (const key of Object.getOwnPropertyNames(reducers)) {
-		custom.push({ key, fn: reducers[key] });
+	if (reducers) {
+		for (const key of Object.getOwnPropertyNames(reducers)) {
+			custom.push({ key, fn: reducers[key] });
+		}
 	}
 
 	/** @type {string[]} */
