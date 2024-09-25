@@ -159,6 +159,18 @@ const fixtures = {
 			value: BigInt('1'),
 			js: '1n',
 			json: '[["BigInt","1"]]'
+		},
+		{
+			name: 'Uint8Array',
+			value: new Uint8Array([1, 2, 3]),
+			js: 'new Uint8Array([1,2,3])',
+			json: '[["Uint8Array","AQID"]]'
+		},
+		{
+			name: "ArrayBuffer",
+			value: new Uint8Array([1, 2, 3]).buffer,
+			js: 'new Uint8Array([1,2,3]).buffer',
+			json: '[["ArrayBuffer","AQID"]]'
 		}
 	],
 
