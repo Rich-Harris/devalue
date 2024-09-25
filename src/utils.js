@@ -50,52 +50,20 @@ export function get_type(thing) {
 	return Object.prototype.toString.call(thing).slice(8, -1);
 }
 
-/** @param {string} char */
-function get_escaped_char(char) {
-	switch (char) {
-		case '"':
-			return '\\"';
-		case '<':
-			return '\\u003C';
-		case '\\':
-			return '\\\\';
-		case '\n':
-			return '\\n';
-		case '\r':
-			return '\\r';
-		case '\t':
-			return '\\t';
-		case '\b':
-			return '\\b';
-		case '\f':
-			return '\\f';
-		case '\u2028':
-			return '\\u2028';
-		case '\u2029':
-			return '\\u2029';
-		default:
-			return char < ' '
-				? `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`
-				: '';
-	}
-}
-
+const escape_chars = /["<\\\n\r\t\b\f\u2028\u2029\x00-\x1f]/
+const u2028_all = /\u2028/g;
+const u2029_all = /\u2029/g;
+const lt_all = /</g;
 /** @param {string} str */
 export function stringify_string(str) {
-	let result = '';
-	let last_pos = 0;
-	const len = str.length;
-
-	for (let i = 0; i < len; i += 1) {
-		const char = str[i];
-		const replacement = get_escaped_char(char);
-		if (replacement) {
-			result += str.slice(last_pos, i) + replacement;
-			last_pos = i + 1;
-		}
+	if (!escape_chars.test(str)){
+		return `"${str}"`;
 	}
 
-	return `"${last_pos === 0 ? str : result + str.slice(last_pos)}"`;
+	return JSON.stringify(str)
+		.replace(u2028_all, '\\u2028')
+		.replace(u2029_all, '\\u2029')
+		.replace(lt_all, '\\u003C');
 }
 
 /** @param {Record<string | symbol, any>} object */
