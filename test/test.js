@@ -167,7 +167,7 @@ const fixtures = {
 			json: '[["Uint8Array","AQID"]]'
 		},
 		{
-			name: "ArrayBuffer",
+			name: 'ArrayBuffer',
 			value: new Uint8Array([1, 2, 3]).buffer,
 			js: 'new Uint8Array([1,2,3]).buffer',
 			json: '[["ArrayBuffer","AQID"]]'
@@ -429,9 +429,10 @@ const fixtures = {
 					return `new Custom(${uneval(value.value)})`;
 				}
 			},
-			reducers: {
+			// test for https://github.com/Rich-Harris/devalue/pull/80
+			reducers: Object.assign(Object.create({ polluted: true }), {
 				Custom: (x) => x instanceof Custom && x.value
-			},
+			}),
 			revivers: {
 				Custom: (x) => new Custom(x)
 			},
