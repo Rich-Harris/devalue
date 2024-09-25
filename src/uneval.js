@@ -5,6 +5,7 @@ import {
 	get_type,
 	is_plain_object,
 	is_primitive,
+	stringify_key,
 	stringify_string
 } from './utils.js';
 
@@ -98,7 +99,7 @@ export function uneval(value, replacer) {
 					}
 
 					for (const key in thing) {
-						keys.push(`.${key}`);
+						keys.push(stringify_key(key));
 						walk(thing[key]);
 						keys.pop();
 					}

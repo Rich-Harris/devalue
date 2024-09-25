@@ -104,3 +104,10 @@ export function enumerable_symbols(object) {
 		(symbol) => Object.getOwnPropertyDescriptor(object, symbol).enumerable
 	);
 }
+
+const is_identifier = /^[a-zA-Z_$][a-zA-Z_$0-9]*$/;
+
+/** @param {string} key */
+export function stringify_key(key) {
+	return is_identifier.test(key) ? '.' + key : '[' + JSON.stringify(key) + ']';
+}

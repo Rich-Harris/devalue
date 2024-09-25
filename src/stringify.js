@@ -4,6 +4,7 @@ import {
 	get_type,
 	is_plain_object,
 	is_primitive,
+	stringify_key,
 	stringify_string
 } from './utils.js';
 import {
@@ -154,7 +155,7 @@ export function stringify(value, reducers) {
 					if (Object.getPrototypeOf(thing) === null) {
 						str = '["null"';
 						for (const key in thing) {
-							keys.push(`.${key}`);
+							keys.push(stringify_key(key));
 							str += `,${stringify_string(key)},${flatten(thing[key])}`;
 							keys.pop();
 						}
@@ -165,7 +166,7 @@ export function stringify(value, reducers) {
 						for (const key in thing) {
 							if (started) str += ',';
 							started = true;
-							keys.push(`.${key}`);
+							keys.push(stringify_key(key));
 							str += `${stringify_string(key)}:${flatten(thing[key])}`;
 							keys.pop();
 						}
