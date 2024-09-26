@@ -1,7 +1,7 @@
 import * as vm from 'vm';
 import * as assert from 'uvu/assert';
 import * as uvu from 'uvu';
-import { uneval, unflatten, parse, stringify } from '../index.js';
+import { uneval, unflatten, parse, stringify, unflattenAsync, parseAsync } from '../index.js';
 
 class Custom {
 	constructor(value) {
@@ -436,6 +436,9 @@ const fixtures = {
 			revivers: {
 				Custom: (x) => new Custom(x)
 			},
+			asyncRevivers: {
+				Custom: async (x) => new Custom(x)
+			},
 			validate: ([obj1, obj2]) => {
 				assert.is(obj1, obj2);
 				assert.ok(obj1 instanceof Custom);
@@ -482,6 +485,16 @@ for (const [name, tests] of Object.entries(fixtures)) {
 				assert.equal(actual, expected);
 			}
 		});
+		test(`${t.name} (async)`, async () => {
+			const actual = await parseAsync(t.json, t.asyncRevivers);
+			const expected = t.value;
+
+			if (t.validate) {
+				t.validate(actual);
+			} else {
+				assert.equal(actual, expected);
+			}
+		});
 	}
 	test.run();
 }
@@ -491,6 +504,16 @@ for (const [name, tests] of Object.entries(fixtures)) {
 	for (const t of tests) {
 		test(t.name, () => {
 			const actual = unflatten(JSON.parse(t.json), t.revivers);
+			const expected = t.value;
+
+			if (t.validate) {
+				t.validate(actual);
+			} else {
+				assert.equal(actual, expected);
+			}
+		});
+		test(`${t.name} (async)`, async () => {
+			const actual = await unflattenAsync(JSON.parse(t.json), t.asyncRevivers);
 			const expected = t.value;
 
 			if (t.validate) {
@@ -554,6 +577,7 @@ const invalid = [
 	}
 ];
 
+// SYNC
 for (const { name, json, message } of invalid) {
 	uvu.test(`parse error: ${name}`, () => {
 		assert.throws(
@@ -566,6 +590,18 @@ for (const { name, json, message } of invalid) {
 				return match;
 			}
 		);
+	});
+}
+// ASYNC
+for (const { name, json, message } of invalid) {
+	uvu.test(`parseAsync error: ${name}`, async () => {
+		try {
+			await parseAsync(json);
+			assert.unreachable('Expected parseAsync to throw')
+		}
+		catch (error) {
+			assert.equal(error.message, message);
+		}
 	});
 }
 
