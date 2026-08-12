@@ -1,2 +1,5 @@
+packages:
+  - playground/*
+
 minimumReleaseAge: 2880
 blockExoticSubdeps: true
