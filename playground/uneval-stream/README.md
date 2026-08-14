@@ -27,12 +27,22 @@ For inspection only, the worker drains reconstructed client `AsyncIterable`s int
 
 ## User file contract
 
-The editor is a single TypeScript CommonJS-transpiled module. It must provide a graph as its default export:
+The editor is a single TypeScript CommonJS-transpiled module. It must provide a graph as its default export, and may provide an `unevalStream` replacer as a named `replacer` export:
 
 ```ts
-const graph = { answer: Promise.resolve(42) };
+export class Point {
+	constructor(readonly x: number, readonly y: number) {}
+}
+
+export const replacer = (value: unknown, uneval: (v: unknown) => string) => {
+	if (value instanceof Point) return `new Point(${uneval(value.x)},${uneval(value.y)})`;
+};
+
+const graph = { answer: Promise.resolve(new Point(3, 4)) };
 export default graph;
 ```
+
+All other named exports are promoted onto the worker's global scope before head/tail blocks are evaluated, so custom constructor source emitted by the replacer (e.g. `new Point(…)`) can revive. The worker is discarded after every run, so promoted globals never leak across runs.
 
 Static/dynamic imports and dependencies are not exposed to the user module.
 
