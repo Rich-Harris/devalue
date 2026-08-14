@@ -34,7 +34,7 @@
 		"changeset:publish": "changeset publish",
 		"build": "dts-buddy",
 		"test": "uvu",
-		"test:types": "tsc -p . --noEmit",
+		"test:types": "tsc -p . --noEmit && tsc -p type-tests",
 		"prepublishOnly": "npm test && npm run test:types && npm run build && publint",
 		"bench": "node --allow-natives-syntax ./benchmarking/run.js",
 		"bench:compare": "node --allow-natives-syntax ./benchmarking/compare/index.js"
