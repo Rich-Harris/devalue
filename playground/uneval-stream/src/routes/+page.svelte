@@ -28,6 +28,16 @@ async function* telemetry() {
 const first = wait(1450, { phase: 'indexed', shared });
 const second = wait(3200, new Map([[shared, new Set([shared])]]));
 
+// Exported classes are visible when blocks are evaluated, so a replacer
+// can emit custom constructor source for them.
+export class Vector {
+  constructor(readonly x: number, readonly y: number) {}
+}
+
+export const replacer = (value: unknown, uneval: (v: unknown) => string) => {
+  if (value instanceof Vector) return \`new Vector(\${uneval(value.x)},\${uneval(value.y)})\`;
+};
+
 const graph = {
   protocol: 'uneval-stream',
   shared,
@@ -35,6 +45,7 @@ const graph = {
   first,
   second,
   sequence: telemetry(),
+  heading: wait(1900, new Vector(3, 4)),
   view: new Uint16Array([21, 34, 55]),
   generatedAt: new Date()
 };
@@ -90,7 +101,7 @@ export default graph;`;
 					{#if running}<Button variant="outline" size="sm" onclick={stop}>■ Stop</Button>{/if}
 					<Button size="sm" onclick={run} disabled={running}>▶ Run <kbd>⌘↵</kbd></Button></div></div>
 				<div class="editor-wrap"><CodeEditor bind:value={source} onrun={run} /></div>
-				<footer class="editor-footer"><span>TypeScript · ES2022</span><span>export default graph</span><span>isolated worker</span></footer>
+				<footer class="editor-footer"><span>TypeScript · ES2022</span><span>export default graph · optional replacer</span><span>isolated worker</span></footer>
 			</section>
 
 			<section class="panel results-panel" aria-label="Stream output">

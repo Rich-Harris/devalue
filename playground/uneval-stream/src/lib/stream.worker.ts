@@ -23,8 +23,17 @@ scope.onmessage = async ({ data }: MessageEvent<{ runId: number; source: string 
 		new Function('module', 'exports', `${output.outputText}\n//# sourceURL=example.ts`)(module, module.exports);
 		const graph = module.exports.default;
 		if (graph === undefined) throw new Error('example.ts must export a default graph');
+		const replacer = module.exports.replacer;
+		if (replacer !== undefined && typeof replacer !== 'function') throw new Error('example.ts `replacer` export must be a function');
+		// Custom replacer output may reference module-scope constructors (e.g. `new Point(…)`).
+		// Head/tail blocks are evaluated in the worker's global scope, so named exports are
+		// promoted onto it, letting users revive custom sources by exporting their classes.
+		// The worker is discarded after every run, so this cannot leak across runs.
+		for (const [key, value] of Object.entries(module.exports)) {
+			if (key !== 'default' && key !== 'replacer') (scope as unknown as Record<string, unknown>)[key] = value;
+		}
 
-		const stream = await unevalStream(graph, undefined, { id: `playground-${runId}` });
+		const stream = await unevalStream(graph, replacer as Parameters<typeof unevalStream>[1], { id: `playground-${runId}` });
 		post({ type: 'status', status: 'streaming' });
 		post({ type: 'block', kind: 'head', index: 0, source: stream.head, bytes: new Blob([stream.head]).size });
 		const root = new Function(`return (${stream.head})`)();
