@@ -69,9 +69,23 @@ export type UnevalReplacer = (
 
 /** JavaScript source references for a reconstructed async value and its optional private control. */
 export interface ClientReference {
-	/** Source expression for the reconstructed async value, for example `s.a[0].job`. */
+	/**
+	 * The source expression for "the whole thing" created by the `construct`. For example, if
+	 * `construct` returned `new Promise()`, `target` would be the source expression that evaluates to
+	 * that promise.
+	 */
 	target: string;
-	/** Source expression for the captured private control, for example `s.p[2]`. */
+	/**
+	 * The source expression for the expression passed to the `capture` callback of `construct`. For example,
+	 * if `construct` was:
+	 *
+	 * ```js
+	 * (capture) =>
+	 * 	`new Promise((resolve, reject) => { ${capture('[resolve, reject]')} })`
+	 * ```
+	 *
+	 * ...this would be the source expression that evaluates to the captured `[resolve, reject]` tuple.
+   */
 	control?: string;
 }
 
