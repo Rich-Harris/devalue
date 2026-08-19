@@ -112,6 +112,21 @@ export function stringify_string(str) {
 	return `"${last_pos === 0 ? str : result + str.slice(last_pos)}"`;
 }
 
+/**
+ * Emits executable source for a primitive value.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function stringify_primitive(value) {
+	if (typeof value === 'string') return stringify_string(value);
+	if (value === undefined) return 'void 0';
+	if (value === 0 && 1 / value < 0) return '-0';
+	if (typeof value === 'number') return String(value).replace(/^(-)?0\./, '$1.');
+	if (typeof value === 'bigint') return `${value}n`;
+	return String(value);
+}
+
 /** @param {Record<string | symbol, any>} object */
 export function enumerable_symbols(object) {
 	// Own symbols always have a descriptor; the optional chain only satisfies the lib's
@@ -172,12 +187,14 @@ function array_index_cut(keys) {
 
 /**
  * Finds the populated indices of an array.
- * @param {unknown[]} array
+ * @template {unknown[]} T
+ * @param {T} array
+ * @returns {(keyof T)[]}
  */
 export function valid_array_indices(array) {
 	const keys = Object.keys(array);
 	keys.length = array_index_cut(keys);
-	return keys;
+	return /** @type {(keyof T)[]} */ (keys);
 }
 
 /**

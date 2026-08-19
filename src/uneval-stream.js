@@ -9,7 +9,7 @@
  * } from './types.js'
  */
 
-import { DevalueError, is_primitive, stringify_string } from './utils.js';
+import { DevalueError, is_primitive, stringify_primitive, stringify_string } from './utils.js';
 import {
 	begin_region,
 	commit_region,
@@ -36,11 +36,11 @@ export async function unevalStream(value, replacer, options = {}) {
 
 	const scope = options.scope ?? 'globalThis.__d';
 	const id = options.id ?? create_session_id();
-	const session = new Session(scope, id, replacer, options);
+	const session = new Session(scope, id, value, replacer, options);
 
 	try {
-		const root = session.capture(value, true);
-		session.commit(root);
+		session.capture(value, true);
+		session.commit();
 		session.validate_new_custom();
 	} catch (error) {
 		await session.cancel(error);
@@ -102,10 +102,11 @@ class Session {
 	 *
 	 * @param {string} scope
 	 * @param {string} id
+	 * @param {unknown} root
 	 * @param {UnevalStreamReplacer | undefined} replacer
 	 * @param {UnevalStreamOptions} options
 	 */
-	constructor(scope, id, replacer, options) {
+	constructor(scope, id, root, replacer, options) {
 		const signal = options.signal;
 		/** Trusted assignable source expression that locates the client session table. */
 		this.scope = scope;
@@ -120,10 +121,7 @@ class Session {
 		/** Approximate maximum bytes of generated source per tail block. */
 		this.budget = options.budget ?? 32768;
 		/** Append-only identity graph shared by every region in this session. */
-		this.graph = create_graph({
-			root: undefined,
-			replace: (value, node) => this.classify(value, /** @type {Node} */ (node))
-		});
+		this.graph = create_graph(root, (value, node) => this.classify(value, /** @type {Node} */ (node)));
 		/**
 		 * Walked server identities mapped to protocol plans and client references.
 		 * @type {Map<object, Node>}
@@ -318,7 +316,11 @@ class Session {
 		this.transaction_depth--;
 	}
 
-	/** @param {any} target @param {string} key @param {any} value */
+	/**
+	 * @param {any} target
+	 * @param {string} key
+	 * @param {any} value
+	 */
 	set(target, key, value) {
 		const had = Object.hasOwn(target, key);
 		const previous = target[key];
@@ -334,10 +336,9 @@ class Session {
 	 * @returns {Node | undefined}
 	 */
 	capture(value, root = false) {
-		this.graph.root_value ??= value;
 		const marker = this.begin_transaction();
 		try {
-			const node = discover(this.graph, value, root);
+			const node = discover(this.graph, value);
 			if (root) this.set(this, 'root', node);
 			this.commit_transaction(marker);
 			return node;
@@ -385,7 +386,7 @@ class Session {
 			const result = this.replacer(value, (child) => {
 				if (is_primitive(child)) {
 					this.capture(child);
-					return primitive(child);
+					return stringify_primitive(child);
 				}
 				this.custom_nonce ??= create_id();
 				const token = stringify_string(`__devalue_custom_${this.custom_nonce}_${this.custom_token++}__`);
@@ -585,10 +586,8 @@ class Session {
 	/**
 	 * Commits initial capture and initializes the count of client values awaiting termination.
 	 *
-	 * @param {Node | undefined} root
 	 */
-	commit(root) {
-		this.root = root;
+	commit() {
 		this.active = this.sources.size;
 	}
 
@@ -796,7 +795,7 @@ class Session {
 	 * @param {unknown} value
 	 * @param {boolean} persistent
 	 * @param {Set<Node>} [references]
-	 * @returns {{ source: string, root: string, tokens: Map<string, { node: Node, reference: Reference }> }}
+	 * @returns {{ source: string, tokens: Map<string, { node: Node, reference: Reference }> }}
 	 */
 	emit_region(value, persistent, references) {
 		/** Canonical node list; edges carry indices into it, avoiding identity-map lookups. */
@@ -861,7 +860,10 @@ class Session {
 		};
 
 		// In-region use counts; a node used once can be inlined at its single use site.
-		/** @param {Node | undefined} node @param {number} occurrences */
+		/**
+		 * @param {Node | undefined} node
+		 * @param {number} occurrences
+		 */
 		const bump = (node, occurrences = 1) => {
 			if (node && node.epoch === epoch) node.uses += occurrences;
 		};
@@ -935,13 +937,19 @@ class Session {
 		// node: the latest declaration position its inline expansion can reach. Children
 		// precede parents in post-order, and any back-edge target is necessarily hoisted
 		// (a cycle entry always has two or more uses), so one bottom-up pass suffices.
-		/** @param {Node | undefined} node @returns {number} */
+		/**
+		 * @param {Node | undefined} node
+		 * @returns {number}
+		 */
 		const latest_of = (node) => {
 			if (!node || node.epoch !== epoch) return -1;
 			if (node.hoisted) return node.early ? -1 : node.position;
 			return node.latest;
 		};
-		/** @param {{ node: number } | { value: unknown }} reference @returns {number} */
+		/**
+		 * @param {{ node: number } | { value: unknown }} reference
+		 * @returns {number}
+		 */
 		const latest_of_ref = (reference) => 'value' in reference ? -1 : latest_of(/** @type {Node} */ (nodes_list[reference.node]));
 		if (hoisted_count > 0) {
 			for (const node of order) {
@@ -970,12 +978,15 @@ class Session {
 		 * @returns {string}
 		 */
 		const expression = (thing) => {
-			if (is_primitive(thing)) return primitive(thing);
+			if (is_primitive(thing)) return stringify_primitive(thing);
 			const node = this.nodes.get(/** @type {object} */ (thing));
 			if (!node) throw this.error('Cannot stringify value', thing);
 			return expression_node(node);
 		};
-		/** @param {Node} node @returns {string} */
+		/**
+		 * @param {Node} node
+		 * @returns {string}
+		 */
 		const expression_node = (node) => {
 			if (node.reference && node.epoch !== epoch) {
 				references?.add(node);
@@ -998,7 +1009,7 @@ class Session {
 		};
 		/** @param {{ node: number } | { value: unknown }} reference */
 		const expression_ref = (reference) =>
-			'value' in reference ? primitive(reference.value) : expression_node(/** @type {Node} */ (nodes_list[reference.node]));
+			'value' in reference ? stringify_primitive(reference.value) : expression_node(/** @type {Node} */ (nodes_list[reference.node]));
 
 		/**
 		 * Emits the full construction of a single-use node at its use site.
@@ -1140,9 +1151,10 @@ class Session {
 					const index = this.collection;
 					this.set(this, 'collection', index + 1);
 					sidecars.push(`s.c[${index}]=[${elements.map(expression_ref).join(',')}]`);
-					elements.forEach((child, i) =>
-						this.reference_node(/** @type {Node} */ (nodes_list[child.node]), { root: `s.c[${index}]`, segments: [`[${i}]`] })
-					);
+					for (let i = 0; i < elements.length; i++) {
+						const child = elements[i];
+						this.reference_node(/** @type {Node} */ (nodes_list[child.node]), { root: `s.c[${index}]`, segments: [`[${i}]`] });
+					}
 				}
 			}
 		}
@@ -1168,7 +1180,6 @@ class Session {
 		const body = [...statements, `return ${root}`].join(';');
 		return {
 			source: statements.length ? `(()=>{${body}})()` : root,
-			root,
 			tokens
 		};
 	}
@@ -1186,7 +1197,10 @@ class Session {
 		}
 	}
 
-	/** @param {Node} node @param {Reference} reference */
+	/**
+	 * @param {Node} node
+	 * @param {Reference} reference
+	 */
 	reference_node(node, reference) {
 		if (!node.reference || reference_length(reference) < reference_length(node.reference)) {
 			this.set(node, 'reference', reference);
@@ -1687,7 +1701,7 @@ function scalar(node, expression) {
 		case 'String':
 		case 'Boolean':
 		case 'BigInt':
-			return `Object(${primitive(node.data.value)})`;
+			return `Object(${stringify_primitive(node.data.value)})`;
 		case 'Date':
 			return `new Date(${node.data.time})`;
 		case 'RegExp': {
@@ -1753,21 +1767,6 @@ function is_native_promise(value) {
 		prototype = Object.getPrototypeOf(prototype);
 	}
 	return false;
-}
-
-/**
- * Emits executable source for a primitive value.
- *
- * @param {unknown} value
- * @returns {string}
- */
-function primitive(value) {
-	if (typeof value === 'string') return stringify_string(value);
-	if (value === undefined) return 'void 0';
-	if (value === 0 && 1 / value < 0) return '-0';
-	if (typeof value === 'number') return String(value).replace(/^(-)?0\./, '$1.');
-	if (typeof value === 'bigint') return `${value}n`;
-	return String(value);
 }
 
 /**
