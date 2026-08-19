@@ -5,34 +5,92 @@ import {
 	is_plain_object,
 	is_primitive,
 	stringify_key,
+	stringify_primitive,
 	stringify_string,
 	valid_array_indices
 } from './utils.js';
 
+/** @typedef {{ node: number } | { value: unknown }} ValueRef */
 /**
- * Creates an append-only identity graph that records canonical container edges so
- * emission and future asynchronous regions read a capture-time snapshot.
+ * A captured non-primitive value. Discovery fills `value` through `edges`; streaming
+ * emission temporarily fills `epoch` through `rendering` while planning its output.
  *
- * Regions make discovery transactional without journaling: every structural write is an
- * append (a node pushed onto `nodes`, an identity key pushed onto `added`), so committing
- * is free and rolling back truncates both arrays and deletes the appended identity keys.
+ * @typedef {object} GraphNode
+ * @property {number} id Index of this node in `Graph.nodes`; non-primitive `ValueRef`s store this number.
+ * @property {any} value The original value represented by this node. Its contents are not read again during emission.
+ * @property {string} kind The value type used to choose how it is reconstructed, such as `Array`, `Map`, or `Date`.
+ * @property {any} data The captured type-specific data needed to reconstruct the value.
+ * @property {ValueRef[]} edges References to every captured value contained by this value.
+ * @property {number} epoch Identifies the emission walk for which the following planning fields are valid.
+ * @property {number} position This node's position in the current emission's child-before-parent order.
+ * @property {number} uses Number of references to this node in the current emission. Multiple uses require a shared temporary variable.
+ * @property {boolean} hoisted Whether this node must be assigned to a temporary variable instead of being written inline.
+ * @property {boolean} early Whether an empty container must be created before normal declarations so an earlier constructor can refer to it.
+ * @property {number} latest Furthest declaration position reached by expanding this node inline; used to avoid references to variables not declared yet.
+ * @property {string} name Temporary variable name assigned when `hoisted` is true, or an empty string when the node is inlined.
+ * @property {boolean} rendering Whether this node is currently being expanded inline; guards against unexpected recursive expansion.
+ * @property {any} [reference] A reference emitted by an earlier streaming region that can be reused by later regions.
+ * @property {boolean} [opaque] Whether emission must preserve this node as a named value rather than inspect and duplicate it inline.
+ */
+/**
+ * The graph sizes at the start of a discovery operation. Rollback removes everything
+ * appended after these positions.
  *
- * @param {{
- *   root: unknown,
- *   replacer?: (value: any, uneval: (value: any) => string) => string | void,
- *   replace?: (value: unknown, node: GraphNode, graph: Graph) => boolean,
- *   uneval?: (value: any) => string
- * }} options
+ * @typedef {object} Region
+ * @property {number} nodes Length of `Graph.nodes` when the region began.
+ * @property {number} added Length of `Graph.added` when the region began.
+ */
+/**
+ * A reusable snapshot of the non-primitive values discovered during one stream session.
+ *
+ * @typedef {object} Graph
+ * @property {unknown} root_value The initial value, retained to provide context in serialization errors.
+ * @property {GraphNode[]} nodes Every captured non-primitive value, in discovery order. A node's `id` is its index here.
+ * @property {Map<object, GraphNode>} identities Maps each original object to its single graph node, preserving shared references and cycles.
+ * @property {(value: unknown, node: GraphNode) => boolean} try_classify Handles stream-specific values before built-in discovery; returns whether it populated the node.
+ * @property {unknown[]} keys Raw property, array-index, or map-key segments leading to the value currently being discovered.
+ * @property {number[]} key_kinds How each entry in `keys` should be formatted in an error path: array index, property, or map key.
+ * @property {object[]} added Identity-map keys added by open regions, in insertion order, so rollback can delete them.
+ * @property {number} transaction_depth Number of currently open regions. Bookkeeping is retained until the outermost region finishes.
+ */
+
+const ARRAY_INDEX = 0;
+const OBJECT_KEY = 1;
+const MAP_KEY = 2;
+
+/**
+ * Builds a snapshot of a value and everything it contains. Each object gets one node,
+ * even when it appears more than once, and each node records the values it refers to.
+ * Later code can therefore generate output from this snapshot without reading the
+ * original objects again.
+ *
+ * Streaming output reuses this graph across multiple emitted values. Before emitting
+ * one value, `uneval-stream` walks only the nodes reachable from that value and works
+ * out how to reproduce their object identity. A value used once can usually be written
+ * inline, while a shared or cyclic value needs a temporary variable so every reference
+ * points to the same object. The `epoch` through `rendering` fields on each node hold
+ * this per-emission analysis. They are reset for nodes in the current walk; `epoch`
+ * distinguishes those results from values left on nodes by previous walks.
+ *
+ * Discovery can fail after adding some objects, so every `discover` call starts a region
+ * before it adds anything. That region includes the node for the current value and all
+ * nodes added while recursively discovering its contents. We do not tag each addition;
+ * instead, the region records the starting lengths of `nodes` and `added`. Anything
+ * appended after those positions belongs to the region. If discovery succeeds, the
+ * additions stay. If it fails, they are removed along with their entries in
+ * `identities`, leaving the graph as it was before the call. Nested `discover` calls
+ * start nested regions, so their additions are also part of the caller's region.
+ *
+ * @param {unknown} root
+ * @param {(value: unknown, node: GraphNode) => boolean} try_classify
  * @returns {Graph}
  */
-export function create_graph(options) {
+export function create_graph(root, try_classify) {
 	return {
-		root_value: options.root,
+		root_value: root,
 		nodes: [],
 		identities: new Map(),
-		replacer: options.replacer,
-		replace: options.replace,
-		uneval: options.uneval,
+		try_classify,
 		keys: [],
 		key_kinds: [],
 		added: [],
@@ -46,7 +104,10 @@ export function begin_region(graph) {
 	return { nodes: graph.nodes.length, added: graph.added.length };
 }
 
-/** @param {Graph} graph @param {Region} region */
+/**
+ * @param {Graph} graph
+ * @param {Region} region
+ */
 export function commit_region(graph, region) {
 	graph.transaction_depth -= 1;
 	// Nested regions leave their appends in place so an enclosing region can still
@@ -54,7 +115,10 @@ export function commit_region(graph, region) {
 	if (graph.transaction_depth === 0) graph.added.length = region.added;
 }
 
-/** @param {Graph} graph @param {Region} region */
+/**
+ * @param {Graph} graph
+ * @param {Region} region
+ */
 export function rollback_region(graph, region) {
 	for (let i = graph.added.length - 1; i >= region.added; i -= 1) {
 		graph.identities.delete(graph.added[i]);
@@ -69,10 +133,9 @@ export function rollback_region(graph, region) {
  *
  * @param {Graph} graph
  * @param {unknown} value
- * @param {boolean} [root]
  * @returns {GraphNode | undefined}
  */
-export function discover(graph, value, root = false) {
+export function discover(graph, value) {
 	if (is_primitive(value)) {
 		if (typeof value === 'symbol') throw error(graph, 'Cannot stringify a Symbol primitive', value);
 		return undefined;
@@ -82,17 +145,14 @@ export function discover(graph, value, root = false) {
 	const existing = graph.identities.get(identity);
 	if (existing) return existing;
 
-	// The node and its identity entry are created inside this region, so rollback
-	// discards them wholesale; the node's own fields can be assigned directly.
 	const region = begin_region(graph);
-	const node = /** @type {GraphNode} */ ({
+	/** @type {GraphNode} */
+	const node = {
 		id: graph.nodes.length,
 		value,
 		kind: '',
 		data: undefined,
 		edges: [],
-		// Region-scratch fields used by emission passes; declared here so every node
-		// shares one hidden class. `epoch` tags which emission pass the rest belong to.
 		epoch: 0,
 		position: 0,
 		uses: 0,
@@ -101,28 +161,15 @@ export function discover(graph, value, root = false) {
 		latest: -1,
 		name: '',
 		rendering: false
-	});
+	};
 	graph.nodes.push(node);
 	graph.identities.set(identity, node);
 	graph.added.push(identity);
 
 	try {
-		if (graph.replace?.(value, node, graph)) {
+		if (graph.try_classify(value, node)) {
 			commit_region(graph, region);
 			return node;
-		}
-
-		if (graph.replacer) {
-			const source = graph.replacer(value, (/** @type {unknown} */ child) => {
-				if (!graph.uneval) throw new Error('Missing custom uneval callback');
-				return graph.uneval(child);
-			});
-			if (typeof source === 'string') {
-				node.kind = 'Custom';
-				node.data = { source };
-				commit_region(graph, region);
-				return node;
-			}
 		}
 
 		if (typeof value === 'function') throw error(graph, 'Cannot stringify a function', value);
@@ -161,18 +208,18 @@ export function discover(graph, value, root = false) {
 				break;
 			case 'Array': {
 				const array = /** @type {unknown[]} */ (value);
-				/** @type {Array<[string, ValueRef]>} */
+				/** @type {Array<[keyof unknown[], ValueRef]>} */
 				const entries = [];
 				for (const key of valid_array_indices(array)) {
 					graph.keys.push(key);
-					graph.key_kinds.push(0);
-					const child = edge(graph, array[Number(key)]);
+					graph.key_kinds.push(ARRAY_INDEX);
+					const child = edge(graph, array[key]);
 					graph.keys.pop();
 					graph.key_kinds.pop();
 					entries.push([key, child]);
+					node.edges.push(child);
 				}
 				node.data = { length: array.length, entries };
-				node.edges = entries.map((entry) => entry[1]);
 				break;
 			}
 			case 'Set': {
@@ -185,7 +232,7 @@ export function discover(graph, value, root = false) {
 				const entries = [];
 				for (const [key, child] of /** @type {Map<unknown, unknown>} */ (value)) {
 					graph.keys.push(key);
-					graph.key_kinds.push(2);
+					graph.key_kinds.push(MAP_KEY);
 					entries.push([edge(graph, key), edge(graph, child)]);
 					graph.keys.pop();
 					graph.key_kinds.pop();
@@ -231,15 +278,15 @@ export function discover(graph, value, root = false) {
 						throw error(graph, 'Cannot stringify objects with __proto__ keys', value);
 					}
 					graph.keys.push(key);
-					graph.key_kinds.push(1);
+					graph.key_kinds.push(OBJECT_KEY);
 					const child = edge(graph, object[key]);
 					graph.keys.pop();
 					graph.key_kinds.pop();
 					entries.push([key, child]);
+					node.edges.push(child);
 				}
 				node.kind = Object.getPrototypeOf(object) === null ? 'NullObject' : 'Object';
 				node.data = { entries };
-				node.edges = entries.map((entry) => entry[1]);
 			}
 		}
 
@@ -251,36 +298,29 @@ export function discover(graph, value, root = false) {
 	}
 }
 
-/** @param {Graph} graph @param {unknown} value @returns {ValueRef} */
+/**
+ * @param {Graph} graph
+ * @param {unknown} value
+ * @returns {ValueRef}
+ */
 function edge(graph, value) {
 	const node = discover(graph, value);
 	return node ? { node: node.id } : { value };
 }
 
-/** @param {Graph} graph @param {string} message @param {unknown} value */
+/**
+ * @param {Graph} graph
+ * @param {string} message
+ * @param {unknown} value
+ */
 function error(graph, message, value) {
 	// Path segments are stored raw during discovery (formatting per child is pure
 	// overhead on the happy path) and rendered only when an error is actually thrown.
 	const keys = graph.keys.map((key, index) => {
 		const kind = graph.key_kinds[index];
-		if (kind === 0) return `[${key}]`;
-		if (kind === 1) return stringify_key(/** @type {string} */ (key));
-		return `.get(${is_primitive(key) ? primitive(key) : '...'})`;
+		if (kind === ARRAY_INDEX) return `[${key}]`;
+		if (kind === OBJECT_KEY) return stringify_key(/** @type {string} */ (key));
+		return `.get(${is_primitive(key) ? stringify_primitive(key) : '...'})`;
 	});
 	return new DevalueError(message, keys, value, graph.root_value);
 }
-
-/** @param {unknown} value */
-function primitive(value) {
-	if (typeof value === 'string') return stringify_string(value);
-	if (value === undefined) return 'void 0';
-	if (value === 0 && 1 / value < 0) return '-0';
-	if (typeof value === 'number') return String(value).replace(/^(-)?0\./, '$1.');
-	if (typeof value === 'bigint') return `${value}n`;
-	return String(value);
-}
-
-/** @typedef {{ node: number } | { value: unknown }} ValueRef */
-/** @typedef {{ id: number, value: any, kind: string, data: any, edges: ValueRef[], epoch: number, position: number, uses: number, hoisted: boolean, early: boolean, latest: number, name: string, rendering: boolean, reference?: any, opaque?: boolean }} GraphNode */
-/** @typedef {{ nodes: number, added: number }} Region */
-/** @typedef {{ root_value: unknown, nodes: GraphNode[], identities: Map<object, GraphNode>, replacer?: Function, replace?: Function, uneval?: Function, keys: unknown[], key_kinds: number[], added: object[], transaction_depth: number }} Graph */

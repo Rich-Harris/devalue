@@ -3,13 +3,14 @@ import * as assert from 'uvu/assert';
 import { begin_region, commit_region, create_graph, discover, rollback_region } from './graph.js';
 
 const test = suite('shared graph');
+const create_test_graph = (root) => create_graph(root, () => false);
 
 test('records one node per identity', () => {
 	const shared = {};
 	const root = { first: shared, second: shared };
 	root.self = root;
-	const graph = create_graph({ root });
-	discover(graph, root, true);
+	const graph = create_test_graph(root);
+	discover(graph, root);
 
 	assert.is(graph.nodes.length, 2);
 	assert.is(graph.identities.get(root), graph.nodes[0]);
@@ -23,8 +24,8 @@ test('captures sparse arrays and container order as canonical edges', () => {
 	const map = new Map([[key, array]]);
 	const set = new Set([array, key]);
 	const root = { map, set };
-	const graph = create_graph({ root });
-	discover(graph, root, true);
+	const graph = create_test_graph(root);
+	discover(graph, root);
 
 	const array_node = graph.identities.get(array);
 	assert.equal(array_node?.data.entries.map((entry) => entry[0]), ['3']);
@@ -35,8 +36,8 @@ test('captures sparse arrays and container order as canonical edges', () => {
 
 test('rolls back appended identities without touching earlier regions', () => {
 	const shared = {};
-	const graph = create_graph({ root: shared });
-	discover(graph, shared, true);
+	const graph = create_test_graph(shared);
+	discover(graph, shared);
 	const region = begin_region(graph);
 	const value = { shared, extra: {} };
 	discover(graph, value);
@@ -50,7 +51,7 @@ test('rolls back appended identities without touching earlier regions', () => {
 });
 
 test('nested commits stay revocable until the outermost region settles', () => {
-	const graph = create_graph({ root: undefined });
+	const graph = create_test_graph(undefined);
 	const outer = begin_region(graph);
 	const inner = begin_region(graph);
 	const value = { a: {} };
