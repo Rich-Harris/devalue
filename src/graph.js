@@ -12,6 +12,13 @@ import {
 
 /** @typedef {{ node: number } | { value: unknown }} ValueRef */
 /**
+ * A source expression for reaching an object created by an earlier streamed region.
+ *
+ * @typedef {object} Reference
+ * @property {string} root Expression that evaluates to the reference's starting object.
+ * @property {string[]} segments Property-access segments appended to `root`.
+ */
+/**
  * A captured non-primitive value. Discovery fills `value` through `edges`; streaming
  * emission temporarily fills `epoch` through `rendering` while planning its output.
  *
@@ -29,7 +36,7 @@ import {
  * @property {number} latest Furthest declaration position reached by expanding this node inline; used to avoid references to variables not declared yet.
  * @property {string} name Temporary variable name assigned when `hoisted` is true, or an empty string when the node is inlined.
  * @property {boolean} rendering Whether this node is currently being expanded inline; guards against unexpected recursive expansion.
- * @property {any} [reference] A reference emitted by an earlier streaming region that can be reused by later regions.
+ * @property {Reference} [reference] A reference emitted by an earlier streaming region that can be reused by later regions.
  * @property {boolean} [opaque] Whether emission must preserve this node as a named value rather than inspect and duplicate it inline.
  */
 /**
