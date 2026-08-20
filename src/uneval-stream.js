@@ -7,6 +7,7 @@
  *   UnevalStreamResult,
  *   UnevalStreamTail
  * } from './types.js'
+ * @import { GraphNode, Reference } from './graph.js'
  */
 
 import { DevalueError, is_primitive, stringify_primitive, stringify_string } from './utils.js';
@@ -20,9 +21,8 @@ import {
 
 const promise_then = Promise.prototype.then;
 const generic_error = 'new Error("devalue: failed to serialize asynchronous value")';
-/** Maximum sequence items coalesced into one flush window before yielding to consumption. */
 const EAGER_LIMIT = 1024;
-let id_counter = 0;
+const TOKEN_PATTERN = /"\d+"/g;
 
 /**
  * Stream executable source while preserving identities across asynchronous regions.
@@ -38,6 +38,8 @@ export async function unevalStream(value, replacer, options = {}) {
 	const id = options.id ?? create_session_id();
 	const session = new Session(scope, id, value, replacer, options);
 
+	// Capture a snapshot of the complete synchronous graph and register any promises
+	// or async iterables found within it. Nothing has been emitted or observed yet.
 	try {
 		session.capture(value, true);
 		session.commit();
@@ -55,12 +57,17 @@ export async function unevalStream(value, replacer, options = {}) {
 		return { head: session.emit_region(value, false).source, tail: empty_tail(), id };
 	}
 
+	// Start observing async sources, then wait until the next ("macro")task. Outcomes
+	// that become available before then can be included in the head instead of a
+	// separate tail block.
 	session.start_sources();
 	await session.initial_window();
 
 	if (session.failure) throw session.failure;
 
 	try {
+		// Emit the captured root and record how its objects can be reached on the client.
+		// Later outcome regions use these references to preserve identity across chunks.
 		const head_region = session.emit_region(value, true);
 		session.assign_references(value, { root: 's.a[0]', segments: [] }, new Map());
 		let operations = '';
@@ -87,6 +94,8 @@ export async function unevalStream(value, replacer, options = {}) {
 			return { head: session.wrap_head(head_region, operations + session.cleanup_source()), tail: empty_tail(), id };
 		}
 
+		// Anything still pending is delivered as executable tail blocks. Each block
+		// updates the client-side objects created by the head.
 		session.emit_dispatch = true;
 		return { head: session.wrap_head(head_region, operations), tail: session.tail(), id };
 	} catch (error) {
@@ -121,12 +130,12 @@ class Session {
 		/** Approximate maximum bytes of generated source per tail block. */
 		this.budget = options.budget ?? 32768;
 		/** Append-only identity graph shared by every region in this session. */
-		this.graph = create_graph(root, (value, node) => this.classify(value, /** @type {Node} */ (node)));
+		this.graph = create_graph(root, (value, node) => this.classify(value, node));
 		/**
 		 * Walked server identities mapped to protocol plans and client references.
-		 * @type {Map<object, Node>}
+		 * @type {Map<object, GraphNode>}
 		 */
-		this.nodes = /** @type {Map<object, Node>} */ (this.graph.identities);
+		this.nodes = this.graph.identities;
 		/**
 		 * Async descriptor states discovered anywhere in the streamed graph.
 		 * @type {Set<Source>}
@@ -177,19 +186,12 @@ class Session {
 		this.slot = 0;
 		/** Next client `collections` index used for a retained Map or Set sidecar. */
 		this.collection = 0;
-		/** Next opaque source token used by a legacy custom replacer child callback. */
-		this.custom_token = 0;
-		/** Private nonce that prevents custom source tokens from colliding with caller text. */
-		/** @type {string | undefined} */
-		this.custom_nonce = undefined;
-		this.operation_token = 0;
-		/**
-		 * Cached global patterns matching this session's placeholder tokens.
-		 * @type {RegExp | undefined}
-		 */
-		this.pattern = undefined;
-		/** @type {RegExp | undefined} */
-		this.custom_pattern_cache = undefined;
+		/** Next collision-proof placeholder id shared by every replacement phase. */
+		this.token = 0;
+		/** @type {Map<string, keyof typeof RUNTIMES>} */
+		this.runtime_tokens = new Map();
+		/** @type {Map<string, number>} */
+		this.promise_tokens = new Map();
 		/**
 		 * Stable AbortSignal listener that forwards the signal reason into session cancellation.
 		 * @type {() => void}
@@ -198,7 +200,7 @@ class Session {
 		signal?.addEventListener('abort', this.abort, { once: true });
 		/**
 		 * Planned node for the initial graph root, also used as DevalueError context.
-		 * @type {Node | undefined}
+		 * @type {GraphNode | undefined}
 		 */
 		this.root = undefined;
 		/** @type {Array<() => void>} */
@@ -211,18 +213,16 @@ class Session {
 		 * @type {Record<string, boolean>}
 		 */
 		this.runtimes_emitted = {};
-		/** Cumulative count of native promise constructs resolved into emitted output. */
-		this.promise_seen = 0;
 		/** Count of native promise sources whose terminal operation has not been emitted. */
 		this.native_pending = 0;
 		/**
 		 * Custom nodes captured since the last atomic-cycle validation.
-		 * @type {Node[]}
+		 * @type {GraphNode[]}
 		 */
 		this.new_custom = [];
 		/**
 		 * Custom nodes already proven acyclic.
-		 * @type {Set<Node>}
+		 * @type {Set<GraphNode>}
 		 */
 		this.validated = new Set();
 		/**
@@ -244,53 +244,51 @@ class Session {
 	 * @returns {string}
 	 */
 	runtime_token(key) {
-		this.custom_nonce ??= create_id();
-		return `__devalue_runtime_${this.custom_nonce}_${key}__`;
+		const token = this.placeholder();
+		this.runtime_tokens.set(token, key);
+		return token;
 	}
 
 	/**
-	 * Returns a placeholder for a native pending-promise construct. Resolved at block
-	 * assembly to either an inline `new Promise` or the shared `s.w` helper, depending on
-	 * how many native promises the session has emitted.
+	 * Returns a placeholder for a native pending-promise construct. At block assembly it
+	 * is replaced with a call to the shared `s.w` helper.
 	 *
 	 * @param {number} pending
 	 * @returns {string}
 	 */
 	promise_token(pending) {
-		this.custom_nonce ??= create_id();
-		return `__devalue_promise_${this.custom_nonce}_${pending}__`;
+		const token = this.placeholder();
+		this.promise_tokens.set(token, pending);
+		return token;
 	}
 
 	/**
 	 * Replaces runtime and promise placeholders in finished block source, returning the
 	 * helper definitions that must be evaluated before it. Definitions are emitted at most
-	 * once per session; the promise-construct form is chosen so the `s.w` helper only
-	 * ships once at least two native promises exist in emitted output.
+	 * once per session.
 	 *
 	 * @param {string} source
 	 * @returns {{ defs: string[], source: string }}
 	 */
-	resolve_runtimes(source) {
+	resolve_runtime_declarations(source) {
 		/** @type {string[]} */
 		const defs = [];
-		if (!this.custom_nonce || !source.includes('__devalue_')) return { defs, source };
-		const pattern = new RegExp(`__devalue_(runtime|promise)_${this.custom_nonce}_(\\w+)__`, 'g');
+		if (this.runtime_tokens.size === 0 && this.promise_tokens.size === 0) return { defs, source };
 		/** @param {keyof typeof RUNTIMES} key */
 		const define = (key) => {
 			if (this.runtimes_emitted[key]) return;
 			this.set(this.runtimes_emitted, key, true);
 			defs.push(`s.${key}=${RUNTIMES[key]}`);
 		};
-		const promise_count = count_matches(source, pattern, 'promise');
-		const use_helper = this.runtimes_emitted.w || this.promise_seen + promise_count >= 2;
-		if (promise_count) this.set(this, 'promise_seen', this.promise_seen + promise_count);
-		const resolved = source.replace(pattern, (_, type, key) => {
-			if (type === 'promise') {
-				if (!use_helper) return `new Promise((a,b)=>{s.p[${key}]=[a,b]})`;
+		const resolved = source.replace(TOKEN_PATTERN, (token) => {
+			const pending = this.promise_tokens.get(token);
+			if (pending !== undefined) {
 				define('w');
-				return `s.w(${key})`;
+				return `s.w(${pending})`;
 			}
-			define(/** @type {keyof typeof RUNTIMES} */ (key));
+			const key = this.runtime_tokens.get(token);
+			if (!key) return token;
+			define(key);
 			return `s.${key}`;
 		});
 		return { defs, source: resolved };
@@ -333,7 +331,7 @@ class Session {
 	 *
 	 * @param {unknown} value
 	 * @param {boolean} root
-	 * @returns {Node | undefined}
+	 * @returns {GraphNode | undefined}
 	 */
 	capture(value, root = false) {
 		const marker = this.begin_transaction();
@@ -357,9 +355,9 @@ class Session {
 		if (this.new_custom.length === 0) return;
 		const pending = this.new_custom;
 		this.new_custom = [];
-		/** @type {Set<Node>} */
+		/** @type {Set<GraphNode>} */
 		const validating = new Set();
-		/** @param {Node} node */
+		/** @param {GraphNode} node */
 		const validate = (node) => {
 			if (this.validated.has(node)) return;
 			if (validating.has(node)) throw this.error('Cannot stringify an atomic custom cycle', node.value);
@@ -377,7 +375,7 @@ class Session {
 	 * Classifies a node as a user replacement, native Promise, native AsyncIterable, or built-in.
 	 *
 	 * @param {unknown} value
-	 * @param {Node} node
+	 * @param {GraphNode} node
 	 * @returns {boolean}
 	 */
 	classify(value, node) {
@@ -388,8 +386,7 @@ class Session {
 					this.capture(child);
 					return stringify_primitive(child);
 				}
-				this.custom_nonce ??= create_id();
-				const token = stringify_string(`__devalue_custom_${this.custom_nonce}_${this.custom_token++}__`);
+				const token = this.placeholder();
 				tokens.set(token, child);
 				return token;
 			});
@@ -499,7 +496,7 @@ class Session {
 	/**
 	 * Constructs an async descriptor target once and stages its server source state.
 	 *
-	 * @param {Node} node
+	 * @param {GraphNode} node
 	 * @param {any} descriptor
 	 * @param {'value' | 'sequence' | 'native'} type
 	 * @returns {Source}
@@ -794,22 +791,22 @@ class Session {
 	 *
 	 * @param {unknown} value
 	 * @param {boolean} persistent
-	 * @param {Set<Node>} [references]
-	 * @returns {{ source: string, tokens: Map<string, { node: Node, reference: Reference }> }}
+	 * @param {Set<GraphNode>} [references]
+	 * @returns {{ source: string, tokens: Map<string, { node: GraphNode, reference: Reference }> }}
 	 */
 	emit_region(value, persistent, references) {
 		/** Canonical node list; edges carry indices into it, avoiding identity-map lookups. */
 		const nodes_list = this.graph.nodes;
 		/** Resolves a recorded edge to its node, or undefined for a primitive edge. @param {{ node: number } | { value: unknown }} reference */
-		const node_of = (reference) => 'node' in reference ? /** @type {Node} */ (nodes_list[reference.node]) : undefined;
+		const node_of = (reference) => 'node' in reference ? /** @type {GraphNode} */ (nodes_list[reference.node]) : undefined;
 
 		// Region-local analysis state lives in scratch fields on the nodes themselves,
 		// tagged with a fresh epoch, instead of per-region Maps/Sets keyed by node.
 		// `node.epoch === epoch` means "included in this region".
 		const epoch = ++this.region_epoch;
-		/** @type {Node[]} */
+		/** @type {GraphNode[]} */
 		const order = [];
-		/** @param {Node | undefined} node */
+		/** @param {GraphNode | undefined} node */
 		const visit = (node) => {
 			if (!node || node.reference || node.epoch === epoch) return;
 			node.epoch = epoch;
@@ -830,8 +827,8 @@ class Session {
 		 * Invokes a callback for each represented child node (undefined for primitive
 		 * children) with its in-region occurrence count.
 		 *
-		 * @param {Node} node
-		 * @param {(child: Node | undefined, occurrences: number) => void} callback
+		 * @param {GraphNode} node
+		 * @param {(child: GraphNode | undefined, occurrences: number) => void} callback
 		 */
 		const each_child = (node, callback) => {
 			switch (node.kind) {
@@ -861,7 +858,7 @@ class Session {
 
 		// In-region use counts; a node used once can be inlined at its single use site.
 		/**
-		 * @param {Node | undefined} node
+		 * @param {GraphNode | undefined} node
 		 * @param {number} occurrences
 		 */
 		const bump = (node, occurrences = 1) => {
@@ -875,7 +872,7 @@ class Session {
 			if (persistent && (node.kind === 'Set' || node.kind === 'Map')) each_child(node, bump);
 		}
 
-		/** @param {Node} node */
+		/** @param {GraphNode} node */
 		const is_sparse = (node) => node.kind === 'Array' && node.data.entries.length !== node.data.length;
 		let hoisted_count = 0;
 		for (const node of order) {
@@ -890,9 +887,9 @@ class Session {
 		/**
 		 * Reports whether a child's expansion reaches a name declared at or after `limit`.
 		 *
-		 * @param {Node | undefined} node
+		 * @param {GraphNode | undefined} node
 		 * @param {number} limit
-		 * @param {Set<Node>} seen
+		 * @param {Set<GraphNode>} seen
 		 * @returns {boolean}
 		 */
 		const references_later = (node, limit, seen) => {
@@ -911,7 +908,7 @@ class Session {
 		// declared at or after the atomic is hoisted (its back-edges become fills); a direct
 		// child that is itself a later-declared hoisted container is declared empty up front;
 		// a direct atomic child is secured recursively (atomics cannot defer anything).
-		/** @param {Node} node */
+		/** @param {GraphNode} node */
 		const secure_atomic = (node) => {
 			const limit = node.position;
 			each_child(node, (child_node) => {
@@ -938,7 +935,7 @@ class Session {
 		// precede parents in post-order, and any back-edge target is necessarily hoisted
 		// (a cycle entry always has two or more uses), so one bottom-up pass suffices.
 		/**
-		 * @param {Node | undefined} node
+		 * @param {GraphNode | undefined} node
 		 * @returns {number}
 		 */
 		const latest_of = (node) => {
@@ -950,7 +947,7 @@ class Session {
 		 * @param {{ node: number } | { value: unknown }} reference
 		 * @returns {number}
 		 */
-		const latest_of_ref = (reference) => 'value' in reference ? -1 : latest_of(/** @type {Node} */ (nodes_list[reference.node]));
+		const latest_of_ref = (reference) => 'value' in reference ? -1 : latest_of(/** @type {GraphNode} */ (nodes_list[reference.node]));
 		if (hoisted_count > 0) {
 			for (const node of order) {
 				if (node.hoisted) continue;
@@ -984,14 +981,14 @@ class Session {
 			return expression_node(node);
 		};
 		/**
-		 * @param {Node} node
+		 * @param {GraphNode} node
 		 * @returns {string}
 		 */
 		const expression_node = (node) => {
 			if (node.reference && node.epoch !== epoch) {
 				references?.add(node);
 				if (references) {
-					const token = this.operation_placeholder();
+					const token = this.placeholder();
 					tokens.set(token, { node, reference: node.reference });
 					return token;
 				}
@@ -1009,12 +1006,12 @@ class Session {
 		};
 		/** @param {{ node: number } | { value: unknown }} reference */
 		const expression_ref = (reference) =>
-			'value' in reference ? stringify_primitive(reference.value) : expression_node(/** @type {Node} */ (nodes_list[reference.node]));
+			'value' in reference ? stringify_primitive(reference.value) : expression_node(/** @type {GraphNode} */ (nodes_list[reference.node]));
 
 		/**
 		 * Emits the full construction of a single-use node at its use site.
 		 *
-		 * @param {Node} node
+		 * @param {GraphNode} node
 		 * @returns {string}
 		 */
 		const inline = (node) => {
@@ -1036,9 +1033,8 @@ class Session {
 				case 'Async':
 					return node.data.source;
 				case 'Custom': {
-					const pattern = this.custom_pattern();
-					if (!pattern || node.data.tokens.size === 0) return node.data.source;
-					return node.data.source.replace(pattern, (/** @type {string} */ match) => {
+					if (node.data.tokens.size === 0) return node.data.source;
+					return node.data.source.replace(TOKEN_PATTERN, (/** @type {string} */ match) => {
 						const child = node.data.tokens.get(match);
 						return child ? expression_node(child) : match;
 					});
@@ -1153,7 +1149,7 @@ class Session {
 					sidecars.push(`s.c[${index}]=[${elements.map(expression_ref).join(',')}]`);
 					for (let i = 0; i < elements.length; i++) {
 						const child = elements[i];
-						this.reference_node(/** @type {Node} */ (nodes_list[child.node]), { root: `s.c[${index}]`, segments: [`[${i}]`] });
+						this.reference_node(/** @type {GraphNode} */ (nodes_list[child.node]), { root: `s.c[${index}]`, segments: [`[${i}]`] });
 					}
 				}
 			}
@@ -1198,7 +1194,7 @@ class Session {
 	}
 
 	/**
-	 * @param {Node} node
+	 * @param {GraphNode} node
 	 * @param {Reference} reference
 	 */
 	reference_node(node, reference) {
@@ -1212,7 +1208,7 @@ class Session {
 	 *
 	 * @param {unknown} value
 	 * @param {Reference} reference
-	 * @param {Map<Node, number>} seen
+	 * @param {Map<GraphNode, number>} seen
 	 */
 	assign_references(value, reference, seen) {
 		if (is_primitive(value)) return;
@@ -1221,9 +1217,9 @@ class Session {
 	}
 
 	/**
-	 * @param {Node} node
+	 * @param {GraphNode} node
 	 * @param {Reference} reference
-	 * @param {Map<Node, number>} seen
+	 * @param {Map<GraphNode, number>} seen
 	 */
 	assign_references_node(node, reference, seen) {
 		this.reference_node(node, reference);
@@ -1262,8 +1258,8 @@ class Session {
 		const dispatch = this.emit_dispatch ? ';s.b=f=>f(s,n)' : '';
 		const table = `let n=${scope}||(${scope}={__proto__:null}),s=n[${id}]={a:[],s:[],c:[],p:[]}${dispatch}`;
 		// Resolve in evaluation order: the root region runs before folded operations.
-		const resolved_region = this.resolve_runtimes(region.source);
-		const resolved_operations = this.resolve_runtimes(operations);
+		const resolved_region = this.resolve_runtime_declarations(region.source);
+		const resolved_operations = this.resolve_runtime_declarations(operations);
 		const defs = resolved_region.defs.concat(resolved_operations.defs);
 		const prelude = defs.length ? `;${defs.join(';')}` : '';
 		operations = resolved_operations.source;
@@ -1293,7 +1289,7 @@ class Session {
 		const prefix = block ? `;${this.scope}[${stringify_string(this.id)}].b((s,n)=>{` : '';
 		const marker = this.begin_transaction();
 		const operations = [];
-		/** @type {Set<Node>} */
+		/** @type {Set<GraphNode>} */
 		const references = new Set();
 		let cost = 0;
 		try {
@@ -1309,8 +1305,8 @@ class Session {
 			const node = source.node;
 			const operations_before = operations.length;
 			references.add(node);
-			const target_token = this.operation_placeholder();
-			const control_token = node.data.captured ? this.operation_placeholder() : undefined;
+			const target_token = this.placeholder();
+			const control_token = node.data.captured ? this.placeholder() : undefined;
 			const reference = {
 				target: target_token,
 				control: control_token
@@ -1341,7 +1337,7 @@ class Session {
 					// once, the write is folded into that use site. A helper call is a
 					// primary expression; only the assignment form needs parentheses.
 					anchor = { name, write, folded: use_helper ? write : `(${write})`, tokens: region.tokens };
-					value_source = this.operation_placeholder();
+					value_source = this.placeholder();
 				}
 			} else {
 				value_source = generic_error;
@@ -1400,7 +1396,7 @@ class Session {
 			// Standalone blocks are final output; resolve helper placeholders here so every
 			// definition is evaluated in the same block as (and before) its first use.
 			// Head-folded operations are resolved later by wrap_head instead.
-			const resolved = this.resolve_runtimes(body);
+			const resolved = this.resolve_runtime_declarations(body);
 			body = resolved.defs.length ? `${resolved.defs.join(';')};${resolved.source}` : resolved.source;
 		}
 		const result = prefix + body + (block ? '})' : rendered.length ? ';' : '');
@@ -1415,15 +1411,15 @@ class Session {
 	/**
 	 * Promotes repeatedly used long paths into client slots when doing so shortens this batch.
 	 *
-	 * @param {Array<{ source: string, tokens: Map<string, { node?: Node, reference?: Reference, source?: string }> }>} operations
-	 * @param {Set<Node>} references
+	 * @param {Array<{ source: string, tokens: Map<string, { node?: GraphNode, reference?: Reference, source?: string }> }>} operations
+	 * @param {Set<GraphNode>} references
 	 */
 	render_operations(operations, references) {
 		const uses = new Map();
 		const imported_references = new Map();
-		const pattern = this.operation_pattern();
+		const pattern = TOKEN_PATTERN;
 		for (const operation of operations) {
-			if (operation.tokens.size === 0 || !pattern) continue;
+			if (operation.tokens.size === 0) continue;
 			for (const match of operation.source.matchAll(pattern)) {
 				const token = operation.tokens.get(match[0]);
 				if (!token?.node) continue;
@@ -1453,9 +1449,8 @@ class Session {
 			this.set(node, 'reference', { root: slot, segments: [] });
 		}
 		return prefix.concat(operations.map((operation) => {
-			if (operation.tokens.size === 0 || !pattern) return operation.source;
-			// Single pass: every placeholder shares the session nonce, so one scan
-			// replaces them all instead of one split/join per token.
+			if (operation.tokens.size === 0) return operation.source;
+			// Single pass replaces every mapped placeholder instead of one split/join per token.
 			return operation.source.replace(pattern, (match) => {
 				const value = operation.tokens.get(match);
 				if (!value) return match;
@@ -1466,31 +1461,14 @@ class Session {
 		}));
 	}
 
-	operation_placeholder() {
-		this.custom_nonce ??= create_id();
-		return `__devalue_operation_${this.custom_nonce}_${this.operation_token++}__`;
-	}
-
 	/**
-	 * Returns the shared global pattern matching this session's operation placeholders,
-	 * or undefined when no placeholder was ever created.
+	 * Returns a quoted numeric source token. A real string containing the same quote
+	 * characters escapes them when serialized, so it cannot contain this exact source.
 	 *
-	 * @returns {RegExp | undefined}
+	 * @returns {string}
 	 */
-	operation_pattern() {
-		if (!this.custom_nonce) return undefined;
-		return (this.pattern ??= new RegExp(`__devalue_operation_${this.custom_nonce}_\\d+__`, 'g'));
-	}
-
-	/**
-	 * Returns the shared global pattern matching this session's quoted custom child tokens,
-	 * or undefined when no custom token was ever created.
-	 *
-	 * @returns {RegExp | undefined}
-	 */
-	custom_pattern() {
-		if (!this.custom_nonce) return undefined;
-		return (this.custom_pattern_cache ??= new RegExp(`"__devalue_custom_${this.custom_nonce}_\\d+__"`, 'g'));
+	placeholder() {
+		return `"${this.token++}"`;
 	}
 
 	/**
@@ -1691,7 +1669,7 @@ class Session {
 /**
  * Emits a constructor expression for a captured non-container built-in.
  *
- * @param {Node} node
+ * @param {GraphNode} node
  * @param {(value: unknown) => string} expression
  * @returns {string}
  */
@@ -1782,13 +1760,13 @@ function prop(key) {
 /**
  * Builds the placeholder token map for one async descriptor operation.
  *
- * @param {Node} node
+ * @param {GraphNode} node
  * @param {string} target_token
  * @param {string | undefined} control_token
- * @returns {Map<string, { node?: Node, reference?: Reference, source?: string }>}
+ * @returns {Map<string, { node?: GraphNode, reference?: Reference, source?: string }>}
  */
 function operation_tokens(node, target_token, control_token) {
-	/** @type {Map<string, { node?: Node, reference?: Reference, source?: string }>} */
+	/** @type {Map<string, { node?: GraphNode, reference?: Reference, source?: string }>} */
 	const tokens = new Map();
 	tokens.set(target_token, { node, reference: node.reference });
 	if (control_token) tokens.set(control_token, { source: `s.p[${node.data.pending}]` });
@@ -1852,25 +1830,6 @@ function reference_length(reference) {
 	let length = reference.root.length;
 	for (const segment of reference.segments) length += segment.length;
 	return length;
-}
-
-/**
- * Counts matches of a global placeholder pattern whose first group equals `type`.
- *
- * @param {string} source
- * @param {RegExp} pattern
- * @param {string} type
- * @returns {number}
- */
-function count_matches(source, pattern, type) {
-	pattern.lastIndex = 0;
-	let count = 0;
-	let match;
-	while ((match = pattern.exec(source)) !== null) {
-		if (match[1] === type) count++;
-	}
-	pattern.lastIndex = 0;
-	return count;
 }
 
 /**
@@ -1990,18 +1949,6 @@ function create_session_id() {
 	return Array.from(bytes, (byte) => ID_ALPHABET[byte & 63]).join('');
 }
 
-/** Generates a collision-resistant nonce for replacer placeholder tokens. */
-function create_id() {
-	const bytes = new Uint8Array(16);
-	if (globalThis.crypto?.getRandomValues) {
-		globalThis.crypto.getRandomValues(bytes);
-		return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
-	}
-	return `${Date.now().toString(36)}_${id_counter++}_${Array.from({ length: 4 }, () =>
-		Math.floor(Math.random() * 0x100000000).toString(36)
-	).join('_')}`;
-}
-
 /** Returns a completed tail iterator for graphs with no asynchronous work. */
 function empty_tail() {
 	/** @type {UnevalStreamTail} */
@@ -2019,8 +1966,6 @@ function empty_tail() {
 	return tail;
 }
 
-/** @typedef {{ root: string, segments: string[] }} Reference */
-/** @typedef {import('./graph.js').GraphNode & { reference?: Reference }} Node */
-/** @typedef {{ node: Node, descriptor: any, type: 'value' | 'sequence' | 'native', started: boolean, terminal: boolean, cleaned: boolean, active: boolean, flushed_pending: number, eager: number, iterator?: any, iterator_closed?: boolean, next?: Function, pulling?: boolean, pulled?: Promise<void>, pulled_resolve?: () => void, observer?: { active: boolean }, early?: ['resolve' | 'reject', unknown], needs_close?: boolean }} Source */
+/** @typedef {{ node: GraphNode, descriptor: any, type: 'value' | 'sequence' | 'native', started: boolean, terminal: boolean, cleaned: boolean, active: boolean, flushed_pending: number, eager: number, iterator?: any, iterator_closed?: boolean, next?: Function, pulling?: boolean, pulled?: Promise<void>, pulled_resolve?: () => void, observer?: { active: boolean }, early?: ['resolve' | 'reject', unknown], needs_close?: boolean }} Source */
 /** @typedef {{ source: Source, type: 'resolve' | 'reject' | 'next' | 'complete' | 'error', value: unknown, sequence: number, invalid: boolean }} Event */
 /** @typedef {{ events: Event[] }} Batch */

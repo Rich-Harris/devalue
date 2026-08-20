@@ -428,7 +428,7 @@ test('constructs custom child views after their buffers and before their target'
 
 test('does not replace protocol alias text that resembles a custom token', async () => {
 	class Wrapper { constructor(value) { this.value = value; } }
-	const text = '__devalue_custom_collision_0__';
+	const text = '"0"';
 	const { root } = await drain(await unevalStream(new Wrapper({}), (value, uneval) => {
 		if (!(value instanceof Wrapper)) return;
 		return `({text:${JSON.stringify(text)},value:${uneval(value.value)}})`;
@@ -1598,7 +1598,7 @@ test('does not promote a repeated short path when unprofitable', async () => {
 
 test('renders descriptor tokens without replacing similar source text', async () => {
 	const pending = deferred();
-	const marker = '__devalue_operation_similar__';
+	const marker = '"0"';
 	const result = await unevalStream(pending.promise, (value) => value === pending.promise && ({
 		type: 'async-value',
 		source: pending.promise,
@@ -1703,10 +1703,10 @@ test('defines the sequence runtime before hoisted declarations that use it', asy
 	assert.is((await root.b.next()).value, 2);
 });
 
-test('inlines a single pending promise and shares the construct helper beyond one', async () => {
+test('shares the pending promise construct helper', async () => {
 	const single = await unevalStream(new Promise(() => {}), undefined, { id: 'single-promise' });
-	assert.match(single.head, /new Promise\(\(a,b\)=>\{s\.p\[0\]=\[a,b\]\}\)/, single.head);
-	assert.not.match(single.head, /s\.w/, single.head);
+	assert.is((single.head.match(/s\.w=/g) ?? []).length, 1, single.head);
+	assert.is((single.head.match(/s\.w\(/g) ?? []).length, 1, single.head);
 	await single.tail.return();
 
 	const multiple = await unevalStream(
