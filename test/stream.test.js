@@ -736,15 +736,16 @@ test('keeps distinct sequence descriptors sharing an iterator source distinct', 
 	assert.equal(Array.from(root[1].events), [2, 'done']);
 });
 
-test('coalesces available sequence items into the head', async () => {
+test('includes at most one sequence item in each batch', async () => {
 	let pulls = 0;
 	const source = { [Symbol.asyncIterator]() { return this; }, async next() { pulls++; return pulls < 3 ? { done: false, value: pulls } : { done: true }; } };
 	const result = await unevalStream(source, sequence_replacer(source), { id: 'coalesce' });
 	const target = client();
 	const root = target.head(result.head);
-	assert.is(pulls, 3);
+	assert.is(pulls, 2);
+	assert.equal(JSON.parse(JSON.stringify(root.events)), [['next', 1]]);
+	for await (const block of result.tail) target.block(block);
 	assert.equal(JSON.parse(JSON.stringify(root.events)), [['next', 1], ['next', 2], ['complete', null]]);
-	assert.equal(await result.tail.next(), { done: true, value: undefined });
 });
 
 test('backpressures an async sequence until flushed blocks are consumed', async () => {
@@ -763,17 +764,14 @@ test('backpressures an async sequence until flushed blocks are consumed', async 
 	const target = client();
 	target.head(result.head);
 	assert.is(pulls, 1);
-	// an item observed while the flush window is open re-pulls eagerly
+	// an observed item is not re-pulled until its batch is consumed
 	gates[0].resolve({ done: false, value: 1 });
 	await delay(5);
-	assert.is(pulls, 2);
-	// once the window flushes unconsumed, observation stops buffering ahead
-	gates[1].resolve({ done: false, value: 2 });
-	await delay(5);
-	assert.is(pulls, 2);
+	assert.is(pulls, 1);
 	target.block((await result.tail.next()).value);
 	await delay(5);
 	assert.is(pulls, 2);
+	gates[1].resolve({ done: false, value: 2 });
 	target.block((await result.tail.next()).value);
 	await delay(5);
 	assert.is(pulls, 3);
@@ -993,11 +991,13 @@ test('guards native sequence adapter structure and size', async () => {
 	const target = client();
 	target.head(result.head);
 	ready.resolve();
-	// the yield and the immediately following return coalesce into one block
-	const block = (await result.tail.next()).value;
-	assert.match(block, /s\.p\[0\]\(0,1\)/, message);
-	assert.match(block, /s\.p\[0\]\(1,2\)/, message);
-	target.block(block);
+	// Each iterator pull gets its own batch, including the terminal result.
+	const item = (await result.tail.next()).value;
+	assert.match(item, /s\.p\[0\]\(0,1\)/, message);
+	target.block(item);
+	const complete = (await result.tail.next()).value;
+	assert.match(complete, /s\.p\[0\]\(1,2\)/, message);
+	target.block(complete);
 	assert.equal(await result.tail.next(), { done: true, value: undefined });
 
 	const fail = deferred();
