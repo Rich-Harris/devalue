@@ -79,14 +79,12 @@ const MAP_KEY = 2;
  * this per-emission analysis. They are reset for nodes in the current walk; `epoch`
  * distinguishes those results from values left on nodes by previous walks.
  *
- * Discovery can fail after adding some objects, so every `discover` call starts a region
- * before it adds anything. That region includes the node for the current value and all
- * nodes added while recursively discovering its contents. We do not tag each addition;
- * instead, the region records the starting lengths of `nodes` and `added`. Anything
- * appended after those positions belongs to the region. If discovery succeeds, the
- * additions stay. If it fails, they are removed along with their entries in
- * `identities`, leaving the graph as it was before the call. Nested `discover` calls
- * start nested regions, so their additions are also part of the caller's region.
+ * Callers group each independently recoverable capture in a region before calling
+ * `discover`. That region includes every node added while recursively walking the value.
+ * We do not tag each addition; instead, the region records the starting lengths of
+ * `nodes` and `added`. Anything appended after those positions belongs to the region.
+ * If capture fails, the caller removes those additions and their identity entries,
+ * leaving the graph as it was before the capture began.
  *
  * @param {unknown} root
  * @param {(value: unknown, node: GraphNode) => boolean} try_classify
@@ -152,7 +150,6 @@ export function discover(graph, value) {
 	const existing = graph.identities.get(identity);
 	if (existing) return existing;
 
-	const region = begin_region(graph);
 	/** @type {GraphNode} */
 	const node = {
 		id: graph.nodes.length,
@@ -173,136 +170,127 @@ export function discover(graph, value) {
 	graph.identities.set(identity, node);
 	graph.added.push(identity);
 
-	try {
-		if (graph.try_classify(value, node)) {
-			commit_region(graph, region);
-			return node;
+	if (graph.try_classify(value, node)) return node;
+
+	if (typeof value === 'function') throw error(graph, 'Cannot stringify a function', value);
+	const type = get_type(value);
+	node.kind = type;
+
+	switch (type) {
+		case 'Number':
+		case 'String':
+		case 'Boolean':
+		case 'BigInt':
+			node.data = { value: value.valueOf() };
+			break;
+		case 'Date':
+			node.data = { time: /** @type {Date} */ (value).getTime() };
+			break;
+		case 'RegExp': {
+			const regexp = /** @type {RegExp} */ (value);
+			node.data = { source: regexp.source, flags: regexp.flags };
+			break;
 		}
-
-		if (typeof value === 'function') throw error(graph, 'Cannot stringify a function', value);
-		const type = get_type(value);
-		node.kind = type;
-
-		switch (type) {
-			case 'Number':
-			case 'String':
-			case 'Boolean':
-			case 'BigInt':
-				node.data = { value: value.valueOf() };
-				break;
-			case 'Date':
-				node.data = { time: /** @type {Date} */ (value).getTime() };
-				break;
-			case 'RegExp': {
-				const regexp = /** @type {RegExp} */ (value);
-				node.data = { source: regexp.source, flags: regexp.flags };
-				break;
+		case 'URL':
+		case 'URLSearchParams':
+		case 'Temporal.Duration':
+		case 'Temporal.Instant':
+		case 'Temporal.PlainDate':
+		case 'Temporal.PlainTime':
+		case 'Temporal.PlainDateTime':
+		case 'Temporal.PlainMonthDay':
+		case 'Temporal.PlainYearMonth':
+		case 'Temporal.ZonedDateTime':
+			node.data = { source: String(value) };
+			break;
+		case 'ArrayBuffer':
+			node.data = { bytes: new Uint8Array(/** @type {ArrayBuffer} */ (value)) };
+			break;
+		case 'Array': {
+			const array = /** @type {unknown[]} */ (value);
+			/** @type {Array<[keyof unknown[], ValueRef]>} */
+			const entries = [];
+			for (const key of valid_array_indices(array)) {
+				graph.keys.push(key);
+				graph.key_kinds.push(ARRAY_INDEX);
+				const child = edge(graph, array[key]);
+				graph.keys.pop();
+				graph.key_kinds.pop();
+				entries.push([key, child]);
+				node.edges.push(child);
 			}
-			case 'URL':
-			case 'URLSearchParams':
-			case 'Temporal.Duration':
-			case 'Temporal.Instant':
-			case 'Temporal.PlainDate':
-			case 'Temporal.PlainTime':
-			case 'Temporal.PlainDateTime':
-			case 'Temporal.PlainMonthDay':
-			case 'Temporal.PlainYearMonth':
-			case 'Temporal.ZonedDateTime':
-				node.data = { source: String(value) };
-				break;
-			case 'ArrayBuffer':
-				node.data = { bytes: new Uint8Array(/** @type {ArrayBuffer} */ (value)) };
-				break;
-			case 'Array': {
-				const array = /** @type {unknown[]} */ (value);
-				/** @type {Array<[keyof unknown[], ValueRef]>} */
-				const entries = [];
-				for (const key of valid_array_indices(array)) {
-					graph.keys.push(key);
-					graph.key_kinds.push(ARRAY_INDEX);
-					const child = edge(graph, array[key]);
-					graph.keys.pop();
-					graph.key_kinds.pop();
-					entries.push([key, child]);
-					node.edges.push(child);
-				}
-				node.data = { length: array.length, entries };
-				break;
-			}
-			case 'Set': {
-				const values = Array.from(/** @type {Set<unknown>} */ (value), (child) => edge(graph, child));
-				node.data = { values };
-				node.edges = values;
-				break;
-			}
-			case 'Map': {
-				const entries = [];
-				for (const [key, child] of /** @type {Map<unknown, unknown>} */ (value)) {
-					graph.keys.push(key);
-					graph.key_kinds.push(MAP_KEY);
-					entries.push([edge(graph, key), edge(graph, child)]);
-					graph.keys.pop();
-					graph.key_kinds.pop();
-				}
-				node.data = { entries };
-				node.edges = entries.flat();
-				break;
-			}
-			case 'Int8Array':
-			case 'Uint8Array':
-			case 'Uint8ClampedArray':
-			case 'Int16Array':
-			case 'Uint16Array':
-			case 'Float16Array':
-			case 'Int32Array':
-			case 'Uint32Array':
-			case 'Float32Array':
-			case 'Float64Array':
-			case 'BigInt64Array':
-			case 'BigUint64Array':
-			case 'DataView': {
-				const view = /** @type {ArrayBufferView & { length?: number }} */ (value);
-				const buffer = edge(graph, view.buffer);
-				node.data = {
-					buffer,
-					byteOffset: view.byteOffset,
-					byteLength: view.byteLength,
-					length: view.length
-				};
-				node.edges = [buffer];
-				break;
-			}
-			default: {
-				const object = /** @type {Record<string | symbol, unknown>} */ (value);
-				if (!is_plain_object(object)) throw error(graph, 'Cannot stringify arbitrary non-POJOs', value);
-				if (enumerable_symbols(object).length) {
-					throw error(graph, 'Cannot stringify POJOs with symbolic keys', value);
-				}
-				/** @type {Array<[string, ValueRef]>} */
-				const entries = [];
-				for (const key of Object.keys(object)) {
-					if (key === '__proto__') {
-						throw error(graph, 'Cannot stringify objects with __proto__ keys', value);
-					}
-					graph.keys.push(key);
-					graph.key_kinds.push(OBJECT_KEY);
-					const child = edge(graph, object[key]);
-					graph.keys.pop();
-					graph.key_kinds.pop();
-					entries.push([key, child]);
-					node.edges.push(child);
-				}
-				node.kind = Object.getPrototypeOf(object) === null ? 'NullObject' : 'Object';
-				node.data = { entries };
-			}
+			node.data = { length: array.length, entries };
+			break;
 		}
-
-		commit_region(graph, region);
-		return node;
-	} catch (cause) {
-		rollback_region(graph, region);
-		throw cause;
+		case 'Set': {
+			const values = Array.from(/** @type {Set<unknown>} */ (value), (child) => edge(graph, child));
+			node.data = { values };
+			node.edges = values;
+			break;
+		}
+		case 'Map': {
+			const entries = [];
+			for (const [key, child] of /** @type {Map<unknown, unknown>} */ (value)) {
+				graph.keys.push(key);
+				graph.key_kinds.push(MAP_KEY);
+				entries.push([edge(graph, key), edge(graph, child)]);
+				graph.keys.pop();
+				graph.key_kinds.pop();
+			}
+			node.data = { entries };
+			node.edges = entries.flat();
+			break;
+		}
+		case 'Int8Array':
+		case 'Uint8Array':
+		case 'Uint8ClampedArray':
+		case 'Int16Array':
+		case 'Uint16Array':
+		case 'Float16Array':
+		case 'Int32Array':
+		case 'Uint32Array':
+		case 'Float32Array':
+		case 'Float64Array':
+		case 'BigInt64Array':
+		case 'BigUint64Array':
+		case 'DataView': {
+			const view = /** @type {ArrayBufferView & { length?: number }} */ (value);
+			const buffer = edge(graph, view.buffer);
+			node.data = {
+				buffer,
+				byteOffset: view.byteOffset,
+				byteLength: view.byteLength,
+				length: view.length
+			};
+			node.edges = [buffer];
+			break;
+		}
+		default: {
+			const object = /** @type {Record<string | symbol, unknown>} */ (value);
+			if (!is_plain_object(object)) throw error(graph, 'Cannot stringify arbitrary non-POJOs', value);
+			if (enumerable_symbols(object).length) {
+				throw error(graph, 'Cannot stringify POJOs with symbolic keys', value);
+			}
+			/** @type {Array<[string, ValueRef]>} */
+			const entries = [];
+			for (const key of Object.keys(object)) {
+				if (key === '__proto__') {
+					throw error(graph, 'Cannot stringify objects with __proto__ keys', value);
+				}
+				graph.keys.push(key);
+				graph.key_kinds.push(OBJECT_KEY);
+				const child = edge(graph, object[key]);
+				graph.keys.pop();
+				graph.key_kinds.pop();
+				entries.push([key, child]);
+				node.edges.push(child);
+			}
+			node.kind = Object.getPrototypeOf(object) === null ? 'NullObject' : 'Object';
+			node.data = { entries };
+		}
 	}
+
+	return node;
 }
 
 /**

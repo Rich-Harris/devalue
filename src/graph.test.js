@@ -64,4 +64,16 @@ test('nested commits stay revocable until the outermost region settles', () => {
 	assert.is(graph.identities.size, 0);
 });
 
+test('rolls back an entire failed recursive discovery', () => {
+	const root = { child: {}, invalid: () => {} };
+	const graph = create_test_graph(root);
+	const region = begin_region(graph);
+
+	assert.throws(() => discover(graph, root));
+	rollback_region(graph, region);
+
+	assert.is(graph.nodes.length, 0);
+	assert.is(graph.identities.size, 0);
+});
+
 test.run();
