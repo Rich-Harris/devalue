@@ -21,7 +21,6 @@ import {
 
 const promise_then = Promise.prototype.then;
 const generic_error = 'new Error("devalue: failed to serialize asynchronous value")';
-const EAGER_LIMIT = 1024;
 const TOKEN_PATTERN = /"\d+"/g;
 
 /**
@@ -516,7 +515,7 @@ class Session {
 		const pending = this.pending;
 		this.set(this, 'pending', pending + 1);
 		/** @type {Source} */
-		const state = { node, descriptor, type, started: false, terminal: false, cleaned: false, active: true, flushed_pending: 0, eager: 0 };
+		const state = { node, descriptor, type, started: false, terminal: false, cleaned: false, active: true, flushed_pending: 0 };
 		node.data = { source, pending, captured, state };
 		this.sources.add(state);
 		this.unstarted.push(state);
@@ -742,12 +741,9 @@ class Session {
 			this.flushing = true;
 			setTimeout(() => this.flush(), 0);
 		}
-		// Coalesce items that are available before the window closes into the same batch,
-		// but never buffer ahead of the client while flushed events remain unconsumed.
-		if (event.type === 'next' && source.flushed_pending === 0 && source.eager < EAGER_LIMIT) {
-			source.eager++;
-			this.pull(source);
-		}
+		// Iterators contribute at most one item to each batch. The next pull starts when
+		// this batch is consumed, preventing an immediately-ready iterator from starving
+		// other sources or growing the head without bound.
 	}
 
 	/**
@@ -770,10 +766,7 @@ class Session {
 		const events = this.ready;
 		this.ready = [];
 		events.sort((a, b) => a.sequence - b.sequence);
-		for (const event of events) {
-			event.source.flushed_pending++;
-			event.source.eager = 0;
-		}
+		for (const event of events) event.source.flushed_pending++;
 		this.batches.push({ events });
 		this.notify();
 	}
@@ -1966,6 +1959,6 @@ function empty_tail() {
 	return tail;
 }
 
-/** @typedef {{ node: GraphNode, descriptor: any, type: 'value' | 'sequence' | 'native', started: boolean, terminal: boolean, cleaned: boolean, active: boolean, flushed_pending: number, eager: number, iterator?: any, iterator_closed?: boolean, next?: Function, pulling?: boolean, pulled?: Promise<void>, pulled_resolve?: () => void, observer?: { active: boolean }, early?: ['resolve' | 'reject', unknown], needs_close?: boolean }} Source */
+/** @typedef {{ node: GraphNode, descriptor: any, type: 'value' | 'sequence' | 'native', started: boolean, terminal: boolean, cleaned: boolean, active: boolean, flushed_pending: number, iterator?: any, iterator_closed?: boolean, next?: Function, pulling?: boolean, pulled?: Promise<void>, pulled_resolve?: () => void, observer?: { active: boolean }, early?: ['resolve' | 'reject', unknown], needs_close?: boolean }} Source */
 /** @typedef {{ source: Source, type: 'resolve' | 'reject' | 'next' | 'complete' | 'error', value: unknown, sequence: number, invalid: boolean }} Event */
 /** @typedef {{ events: Event[] }} Batch */
