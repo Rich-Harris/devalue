@@ -7,7 +7,7 @@
  *   UnevalStreamResult,
  *   UnevalStreamTail
  * } from './types.js'
- * @import { Capture, Classification, GraphNode, Reference } from './graph.js'
+ * @import { Classification, Graph, GraphNode, Reference } from './graph.js'
  */
 
 import { DevalueError, is_primitive, stringify_primitive, stringify_string } from './utils.js';
@@ -129,7 +129,7 @@ class Session {
 		/** Approximate maximum bytes of generated source per tail block. */
 		this.budget = options.budget ?? 32768;
 		/** Append-only identity graph shared by every region in this session. */
-		this.graph = create_graph(root, (value, node, capture) => this.classify(value, node, capture));
+		this.graph = create_graph(root, (value, node, graph) => this.classify(value, node, graph));
 		/**
 		 * Async descriptor states discovered anywhere in the streamed graph.
 		 * @type {Set<Source>}
@@ -372,15 +372,15 @@ class Session {
 	 *
 	 * @param {unknown} value
 	 * @param {GraphNode} node
-	 * @param {Capture} capture
+	 * @param {Graph} graph
 	 * @returns {Classification | false}
 	 */
-	classify(value, node, capture) {
+	classify(value, node, graph) {
 		if (this.replacer) {
 			const tokens = new Map();
 			const result = this.replacer(value, (child) => {
 				if (is_primitive(child)) {
-					capture.discover(child);
+					discover(graph, child);
 					return stringify_primitive(child);
 				}
 				const token = this.placeholder();
@@ -394,7 +394,7 @@ class Session {
 						tokens.delete(token);
 						continue;
 					}
-					const captured = capture.discover(child);
+					const captured = discover(graph, child);
 					tokens.set(token, captured);
 					edges.push(captured ? { node: captured.id } : { value: child });
 					if (captured) this.set(captured, 'opaque', true);

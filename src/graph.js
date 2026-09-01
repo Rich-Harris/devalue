@@ -12,7 +12,6 @@ import {
 
 /** @typedef {{ node: number } | { value: unknown }} ValueRef */
 /** @typedef {{ kind: string, data: any, edges: ValueRef[] }} Classification */
-/** @typedef {{ discover: (value: unknown) => GraphNode | undefined, edge: (value: unknown) => ValueRef }} Capture */
 /**
  * A source expression for reaching an object created by an earlier streamed region.
  *
@@ -56,8 +55,7 @@ import {
  * @property {unknown} root_value The initial value, retained to provide context in serialization errors.
  * @property {GraphNode[]} nodes Every captured non-primitive value, in discovery order. A node's `id` is its index here.
  * @property {Map<object, GraphNode>} identities Maps each original object to its single graph node, preserving shared references and cycles.
- * @property {(value: unknown, node: GraphNode, capture: Capture) => Classification | false} try_classify Handles stream-specific values before built-in discovery.
- * @property {Capture} capture Stable recursive capture operations exposed to the classifier.
+ * @property {(value: unknown, node: GraphNode, graph: Graph) => Classification | false} try_classify Handles stream-specific values before built-in discovery.
  * @property {unknown[]} keys Raw property, array-index, or map-key segments leading to the value currently being discovered.
  * @property {number[]} key_kinds How each entry in `keys` should be formatted in an error path: array index, property, or map key.
  * @property {object[]} added Identity-map keys added by open regions, in insertion order, so rollback can delete them.
@@ -89,7 +87,7 @@ const MAP_KEY = 2;
  * leaving the graph as it was before the capture began.
  *
  * @param {unknown} root
- * @param {(value: unknown, node: GraphNode, capture: Capture) => Classification | false} try_classify
+ * @param {(value: unknown, node: GraphNode, graph: Graph) => Classification | false} try_classify
  * @returns {Graph}
  */
 export function create_graph(root, try_classify) {
@@ -99,14 +97,9 @@ export function create_graph(root, try_classify) {
 		nodes: [],
 		identities: new Map(),
 		try_classify,
-		capture: /** @type {Capture} */ (undefined),
 		keys: [],
 		key_kinds: [],
 		added: []
-	};
-	graph.capture = {
-		discover: (value) => discover(graph, value),
-		edge: (value) => edge(graph, value)
 	};
 	return graph;
 }
@@ -173,7 +166,7 @@ export function discover(graph, value) {
 	graph.identities.set(identity, node);
 	graph.added.push(identity);
 
-	const classification = graph.try_classify(value, node, graph.capture);
+	const classification = graph.try_classify(value, node, graph);
 	if (classification) {
 		node.kind = classification.kind;
 		node.data = classification.data;
