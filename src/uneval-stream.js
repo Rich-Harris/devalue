@@ -22,9 +22,6 @@ import {
 const promise_then = Promise.prototype.then;
 const generic_error = 'new Error("devalue: failed to serialize asynchronous value")';
 const TOKEN_PATTERN = /"\d+"/g;
-const HOISTED = 1;
-const EARLY = 2;
-const RENDERING = 4;
 
 /**
  * Stream executable source while preserving identities across asynchronous regions.
@@ -229,8 +226,6 @@ class Session {
 		this.emit_dispatch = false;
 		/** Monotonic tag for per-region node scratch state (see emit_region). */
 		this.region_epoch = 0;
-		/** Region-local emission state, indexed by graph node id. */
-		this.scratch = { epoch: [], position: [], uses: [], flags: [], latest: [], name: [] };
 	}
 
 	/**
@@ -774,28 +769,29 @@ class Session {
 		/** Canonical node list; edges carry indices into it, avoiding identity-map lookups. */
 		const nodes_list = this.graph.nodes;
 		const identities = this.graph.identities;
-		const { epoch: epochs, position: positions, uses, flags, latest, name: names } = this.scratch;
 		/** Resolves a recorded edge to its node, or undefined for a primitive edge. @param {{ node: number } | { value: unknown }} reference */
 		const node_of = (reference) => 'node' in reference ? /** @type {GraphNode} */ (nodes_list[reference.node]) : undefined;
 
-		// Region-local analysis state lives in arrays keyed by node id. A fresh epoch
-		// distinguishes this walk without clearing state left by earlier regions.
+		// Region-local analysis state lives in scratch fields on the nodes themselves,
+		// tagged with a fresh epoch, instead of per-region Maps/Sets keyed by node.
+		// `node.epoch === epoch` means "included in this region".
 		const epoch = ++this.region_epoch;
 		/** @type {GraphNode[]} */
 		const order = [];
 		/** @param {GraphNode | undefined} node */
 		const visit = (node) => {
-			if (!node || node.reference || epochs[node.id] === epoch) return;
-			const id = node.id;
-			epochs[id] = epoch;
-			uses[id] = 0;
-			flags[id] = 0;
-			latest[id] = -1;
-			names[id] = '';
+			if (!node || node.reference || node.epoch === epoch) return;
+			node.epoch = epoch;
+			node.uses = 0;
+			node.hoisted = false;
+			node.early = false;
+			node.latest = -1;
+			node.name = '';
+			node.rendering = false;
 			// Post-order: children are declared before parents so declarations can embed
 			// them as literals; only back-edges (cycles) need post-declaration patches.
 			for (const edge of node.edges) visit(node_of(edge));
-			positions[id] = order.push(node) - 1;
+			node.position = order.push(node) - 1;
 		};
 		if (!is_primitive(value)) visit(identities.get(/** @type {object} */ (value)));
 
@@ -838,7 +834,7 @@ class Session {
 		 * @param {number} occurrences
 		 */
 		const bump = (node, occurrences = 1) => {
-			if (node && epochs[node.id] === epoch) uses[node.id] += occurrences;
+			if (node && node.epoch === epoch) node.uses += occurrences;
 		};
 		if (!is_primitive(value)) bump(identities.get(/** @type {object} */ (value)));
 		for (const node of order) {
@@ -852,8 +848,8 @@ class Session {
 		const is_sparse = (node) => node.kind === 'Array' && node.data.entries.length !== node.data.length;
 		let hoisted_count = 0;
 		for (const node of order) {
-			if (uses[node.id] > 1 || node.opaque || node.kind === 'NullObject' || is_sparse(node)) {
-				flags[node.id] |= HOISTED;
+			if (node.uses > 1 || node.opaque || node.kind === 'NullObject' || is_sparse(node)) {
+				node.hoisted = true;
 				hoisted_count++;
 			}
 		}
@@ -869,9 +865,8 @@ class Session {
 		 * @returns {boolean}
 		 */
 		const references_later = (node, limit, seen) => {
-			if (!node || epochs[node.id] !== epoch) return false;
-			const id = node.id;
-			if (flags[id] & HOISTED) return flags[id] & EARLY ? false : positions[id] >= limit;
+			if (!node || node.epoch !== epoch) return false;
+			if (node.hoisted) return node.early ? false : node.position >= limit;
 			if (seen.has(node)) return false;
 			seen.add(node);
 			let found = false;
@@ -887,24 +882,23 @@ class Session {
 		// a direct atomic child is secured recursively (atomics cannot defer anything).
 		/** @param {GraphNode} node */
 		const secure_atomic = (node) => {
-			const limit = positions[node.id];
+			const limit = node.position;
 			each_child(node, (child_node) => {
-				if (!child_node || epochs[child_node.id] !== epoch) return;
-				const id = child_node.id;
-				if (flags[id] & HOISTED) {
-					if (!(flags[id] & EARLY) && positions[id] >= limit) {
-						flags[id] |= EARLY;
+				if (!child_node || child_node.epoch !== epoch) return;
+				if (child_node.hoisted) {
+					if (!child_node.early && child_node.position >= limit) {
+						child_node.early = true;
 					}
 					return;
 				}
 				if (!references_later(child_node, limit, new Set())) return;
 				if (is_atomic(child_node.kind)) secure_atomic(child_node);
-				flags[id] |= HOISTED;
+				child_node.hoisted = true;
 				hoisted_count++;
 			});
 		};
 		for (const node of order) {
-			if (is_atomic(node.kind) && flags[node.id] & HOISTED) secure_atomic(node);
+			if (is_atomic(node.kind) && node.hoisted) secure_atomic(node);
 		}
 
 		// `hoisted` and `early` are final now, so "does this child's expansion reach a
@@ -917,10 +911,9 @@ class Session {
 		 * @returns {number}
 		 */
 		const latest_of = (node) => {
-			if (!node || epochs[node.id] !== epoch) return -1;
-			const id = node.id;
-			if (flags[id] & HOISTED) return flags[id] & EARLY ? -1 : positions[id];
-			return latest[id];
+			if (!node || node.epoch !== epoch) return -1;
+			if (node.hoisted) return node.early ? -1 : node.position;
+			return node.latest;
 		};
 		/**
 		 * @param {{ node: number } | { value: unknown }} reference
@@ -929,18 +922,18 @@ class Session {
 		const latest_of_ref = (reference) => 'value' in reference ? -1 : latest_of(/** @type {GraphNode} */ (nodes_list[reference.node]));
 		if (hoisted_count > 0) {
 			for (const node of order) {
-				if (flags[node.id] & HOISTED) continue;
+				if (node.hoisted) continue;
 				let reach = -1;
 				each_child(node, (child) => {
 					const value = latest_of(child);
 					if (value > reach) reach = value;
 				});
-				latest[node.id] = reach;
+				node.latest = reach;
 			}
 		}
 
 		let name_count = 0;
-		for (const node of order) if (flags[node.id] & HOISTED) names[node.id] = `v${name_count++}`;
+		for (const node of order) if (node.hoisted) node.name = `v${name_count++}`;
 
 		/** @type {string[]} */
 		const fill = [];
@@ -964,7 +957,7 @@ class Session {
 		 * @returns {string}
 		 */
 		const expression_node = (node) => {
-			if (node.reference && epochs[node.id] !== epoch) {
+			if (node.reference && node.epoch !== epoch) {
 				references?.add(node);
 				if (references) {
 					const token = this.placeholder();
@@ -973,14 +966,14 @@ class Session {
 				}
 				return render_reference(node.reference);
 			}
-			if (epochs[node.id] === epoch && names[node.id]) return names[node.id];
+			if (node.epoch === epoch && node.name) return node.name;
 			// `rendering` guards against unexpected re-entry while expanding inline.
-			if (flags[node.id] & RENDERING) throw this.error('Cannot stringify value', node.value);
-			flags[node.id] |= RENDERING;
+			if (node.rendering) throw this.error('Cannot stringify value', node.value);
+			node.rendering = true;
 			try {
 				return inline(node);
 			} finally {
-				flags[node.id] &= ~RENDERING;
+				node.rendering = false;
 			}
 		};
 		/** @param {{ node: number } | { value: unknown }} reference */
@@ -1028,8 +1021,8 @@ class Session {
 		/** @type {string[]} */
 		const declarations = [];
 		for (const node of order) {
-			const name = names[node.id];
-			if (name && flags[node.id] & EARLY) {
+			const name = node.name;
+			if (name && node.early) {
 				// Declared empty ahead of every literal so atomic constructors can reference it.
 				switch (node.kind) {
 					case 'Array':
@@ -1055,7 +1048,7 @@ class Session {
 			} else if (name) {
 				// A child can be embedded in this declaration if its expansion never reaches
 				// a name declared at or after this node; back-edges become fills instead.
-				const limit = positions[node.id];
+				const limit = node.position;
 				/** @param {{ node: number } | { value: unknown }} child */
 				const available = (child) => latest_of_ref(child) < limit;
 				switch (node.kind) {
@@ -1140,7 +1133,7 @@ class Session {
 				if (!node.opaque) continue;
 				const index = this.slot;
 				this.set(this, 'slot', index + 1);
-				slots.push(`s.s[${index}]=${names[node.id]}`);
+				slots.push(`s.s[${index}]=${node.name}`);
 				this.set(node, 'reference', { root: `s.s[${index}]`, segments: [] });
 				this.assign_references(node.value, node.reference, new Map());
 			}
