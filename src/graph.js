@@ -44,7 +44,7 @@ import {
  * The graph sizes at the start of a discovery operation. Rollback removes everything
  * appended after these positions.
  *
- * @typedef {object} Region
+ * @typedef {object} Checkpoint
  * @property {number} nodes Length of `Graph.nodes` when the region began.
  * @property {number} added Length of `Graph.added` when the region began.
  */
@@ -55,7 +55,7 @@ import {
  * @property {unknown} root_value The initial value, retained to provide context in serialization errors.
  * @property {GraphNode[]} nodes Every captured non-primitive value, in discovery order. A node's `id` is its index here.
  * @property {Map<object, GraphNode>} identities Maps each original object to its single graph node, preserving shared references and cycles.
- * @property {(value: unknown, node: GraphNode, graph: Graph) => Classification | false} try_classify Handles stream-specific values before built-in discovery.
+ * @property {(value: unknown, node: GraphNode, graph: Graph) => Classification | false} classify Handles stream-specific values before built-in discovery.
  * @property {unknown[]} keys Raw property, array-index, or map-key segments leading to the value currently being discovered.
  * @property {number[]} key_kinds How each entry in `keys` should be formatted in an error path: array index, property, or map key.
  * @property {object[]} added Identity-map keys added by open regions, in insertion order, so rollback can delete them.
@@ -87,16 +87,16 @@ const MAP_KEY = 2;
  * leaving the graph as it was before the capture began.
  *
  * @param {unknown} root
- * @param {(value: unknown, node: GraphNode, graph: Graph) => Classification | false} try_classify
+ * @param {(value: unknown, node: GraphNode, graph: Graph) => Classification | false} classify
  * @returns {Graph}
  */
-export function create_graph(root, try_classify) {
+export function create_graph(root, classify) {
 	/** @type {Graph} */
 	const graph = {
 		root_value: root,
 		nodes: [],
 		identities: new Map(),
-		try_classify,
+		classify,
 		keys: [],
 		key_kinds: [],
 		added: []
@@ -111,7 +111,7 @@ export function checkpoint(graph) {
 
 /**
  * @param {Graph} graph
- * @param {Region} region
+ * @param {Checkpoint} region
  */
 export function release_checkpoint(graph, region) {
 	graph.added.length = region.added;
@@ -119,7 +119,7 @@ export function release_checkpoint(graph, region) {
 
 /**
  * @param {Graph} graph
- * @param {Region} region
+ * @param {Checkpoint} region
  */
 export function rollback(graph, region) {
 	for (let i = graph.added.length - 1; i >= region.added; i -= 1) {
@@ -166,7 +166,7 @@ export function discover(graph, value) {
 	graph.identities.set(identity, node);
 	graph.added.push(identity);
 
-	const classification = graph.try_classify(value, node, graph);
+	const classification = graph.classify(value, node, graph);
 	if (classification) {
 		node.kind = classification.kind;
 		node.data = classification.data;
