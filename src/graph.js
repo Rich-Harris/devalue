@@ -11,9 +11,14 @@ import {
 } from './utils.js';
 
 /** @typedef {{ node: number } | { value: unknown }} ValueRef */
-/** @typedef {{ kind: string, data: any, edges: ValueRef[] }} Classification */
 /**
- * A source expression for reaching an object created by an earlier streamed region.
+ * A stream-specific reconstruction plan returned instead of built-in discovery.
+ * A custom classifier discovers any children through its `Graph` argument and returns
+ * their direct reconstruction dependencies in `edges`.
+ * @typedef {{ kind: string, data: any, edges: ValueRef[] }} Classification
+ */
+/**
+ * A source expression for reaching a non-primitive value created on the client.
  *
  * @typedef {object} Reference
  * @property {string} root Expression that evaluates to the reference's starting object.
@@ -21,15 +26,15 @@ import {
  */
 /**
  * A captured non-primitive value. Discovery fills `value` through `edges`; streaming
- * emission temporarily fills `epoch` through `rendering` while planning its output.
+ * emission temporarily fills `region_id` through `rendering` while planning its output.
  *
  * @typedef {object} GraphNode
  * @property {number} id Index of this node in `Graph.nodes`; non-primitive `ValueRef`s store this number.
  * @property {any} value The original value represented by this node. Its contents are not read again during emission.
- * @property {string} kind The value type used to choose how it is reconstructed, such as `Array`, `Map`, or `Date`.
- * @property {any} data The captured type-specific data needed to reconstruct the value.
- * @property {ValueRef[]} edges References to every captured value contained by this value.
- * @property {number} epoch Identifies the emission walk for which the following planning fields are valid.
+ * @property {string} kind The reconstruction tag, such as `Array`, `Map`, `Custom`, or `Async`.
+ * @property {any} data Captured reconstruction- or classification-specific data.
+ * @property {ValueRef[]} edges Direct captured dependencies needed to reconstruct this value.
+ * @property {number} region_id Identifies the emitted region for which the following planning fields are valid.
  * @property {number} position This node's position in the current emission's child-before-parent order.
  * @property {number} uses Number of references to this node in the current emission. Multiple uses require a shared temporary variable.
  * @property {boolean} hoisted Whether this node must be assigned to a temporary variable instead of being written inline.
@@ -37,7 +42,7 @@ import {
  * @property {number} latest Furthest declaration position reached by expanding this node inline; used to avoid references to variables not declared yet.
  * @property {string} name Temporary variable name assigned when `hoisted` is true, or an empty string when the node is inlined.
  * @property {boolean} rendering Whether this node is currently being expanded inline; guards against unexpected recursive expansion.
- * @property {Reference} [reference] A reference emitted by an earlier streaming region that can be reused by later regions.
+ * @property {Reference} [reference] The shortest retained client reference currently known for this node.
  * @property {boolean} [opaque] Whether emission must preserve this node as a named value rather than inspect and duplicate it inline.
  */
 /**
@@ -45,8 +50,8 @@ import {
  * appended after these positions.
  *
  * @typedef {object} Checkpoint
- * @property {number} nodes Length of `Graph.nodes` when the region began.
- * @property {number} added Length of `Graph.added` when the region began.
+ * @property {number} nodes Length of `Graph.nodes` when the checkpoint was taken.
+ * @property {number} added Length of `Graph.added` when the checkpoint was taken.
  */
 /**
  * A reusable snapshot of the non-primitive values discovered during one stream session.
@@ -54,11 +59,11 @@ import {
  * @typedef {object} Graph
  * @property {unknown} root_value The initial value, retained to provide context in serialization errors.
  * @property {GraphNode[]} nodes Every captured non-primitive value, in discovery order. A node's `id` is its index here.
- * @property {Map<object, GraphNode>} identities Maps each original object to its single graph node, preserving shared references and cycles.
- * @property {(value: unknown, node: GraphNode, graph: Graph) => Classification | false} classify Handles stream-specific values before built-in discovery.
+ * @property {Map<object, GraphNode>} identities Maps each original non-primitive identity to its canonical node, preserving sharing and cycles.
+ * @property {(value: unknown, node: GraphNode) => Classification} classify Produces a custom or built-in reconstruction plan for a reserved node.
  * @property {unknown[]} keys Raw property, array-index, or map-key segments leading to the value currently being discovered.
  * @property {number[]} key_kinds How each entry in `keys` should be formatted in an error path: array index, property, or map key.
- * @property {object[]} added Identity-map keys added by open regions, in insertion order, so rollback can delete them.
+ * @property {object[]} added Identity-map keys added by open transactions, in insertion order, so rollback can delete them.
  */
 
 const ARRAY_INDEX = 0;
@@ -66,7 +71,7 @@ const OBJECT_KEY = 1;
 const MAP_KEY = 2;
 
 /**
- * Builds a snapshot of a value and everything it contains. Each object gets one node,
+ * Builds a snapshot of a value and everything it contains. Each non-primitive identity gets one node,
  * even when it appears more than once, and each node records the values it refers to.
  * Later code can therefore generate output from this snapshot without reading the
  * original objects again.
@@ -75,28 +80,28 @@ const MAP_KEY = 2;
  * one value, `uneval-stream` walks only the nodes reachable from that value and works
  * out how to reproduce their object identity. A value used once can usually be written
  * inline, while a shared or cyclic value needs a temporary variable so every reference
- * points to the same object. The `epoch` through `rendering` fields on each node hold
- * this per-emission analysis. They are reset for nodes in the current walk; `epoch`
+ * points to the same object. The `region_id` through `rendering` fields on each node hold
+ * this per-emission analysis. They are reset for nodes in the current walk; `region_id`
  * distinguishes those results from values left on nodes by previous walks.
  *
- * Callers group each independently recoverable capture in a region before calling
- * `discover`. That region includes every node added while recursively walking the value.
- * We do not tag each addition; instead, the region records the starting lengths of
- * `nodes` and `added`. Anything appended after those positions belongs to the region.
+ * Callers take a checkpoint for each independently recoverable transaction before
+ * calling `discover`. The transaction includes every node added while recursively
+ * walking the value. We do not tag each addition; instead, the checkpoint records the
+ * starting lengths of `nodes` and `added`. Anything appended afterward is provisional.
  * If capture fails, the caller removes those additions and their identity entries,
  * leaving the graph as it was before the capture began.
  *
  * @param {unknown} root
- * @param {(value: unknown, node: GraphNode, graph: Graph) => Classification | false} classify
+ * @param {(value: unknown, node: GraphNode, graph: Graph) => Classification | false} custom_classify
  * @returns {Graph}
  */
-export function create_graph(root, classify) {
+export function create_graph(root, custom_classify) {
 	/** @type {Graph} */
 	const graph = {
 		root_value: root,
 		nodes: [],
 		identities: new Map(),
-		classify,
+		classify: (value, node) => custom_classify(value, node, graph) || builtin_classify(graph, value),
 		keys: [],
 		key_kinds: [],
 		added: []
@@ -104,29 +109,32 @@ export function create_graph(root, classify) {
 	return graph;
 }
 
-/** @param {Graph} graph */
+/**
+ * @param {Graph} graph
+ * @returns {Checkpoint}
+ */
 export function checkpoint(graph) {
 	return { nodes: graph.nodes.length, added: graph.added.length };
 }
 
 /**
  * @param {Graph} graph
- * @param {Checkpoint} region
+ * @param {Checkpoint} checkpoint
  */
-export function release_checkpoint(graph, region) {
-	graph.added.length = region.added;
+export function release_checkpoint(graph, checkpoint) {
+	graph.added.length = checkpoint.added;
 }
 
 /**
  * @param {Graph} graph
- * @param {Checkpoint} region
+ * @param {Checkpoint} checkpoint
  */
-export function rollback(graph, region) {
-	for (let i = graph.added.length - 1; i >= region.added; i -= 1) {
+export function rollback(graph, checkpoint) {
+	for (let i = graph.added.length - 1; i >= checkpoint.added; i -= 1) {
 		graph.identities.delete(graph.added[i]);
 	}
-	graph.added.length = region.added;
-	graph.nodes.length = region.nodes;
+	graph.added.length = checkpoint.added;
+	graph.nodes.length = checkpoint.nodes;
 }
 
 /**
@@ -153,7 +161,7 @@ export function discover(graph, value) {
 		kind: '',
 		data: undefined,
 		edges: [],
-		epoch: 0,
+		region_id: 0,
 		position: 0,
 		uses: 0,
 		hoisted: false,
@@ -166,32 +174,34 @@ export function discover(graph, value) {
 	graph.identities.set(identity, node);
 	graph.added.push(identity);
 
-	const classification = graph.classify(value, node, graph);
-	if (classification) {
-		node.kind = classification.kind;
-		node.data = classification.data;
-		node.edges = classification.edges;
-		return node;
-	}
+	const classification = graph.classify(value, node);
+	node.kind = classification.kind;
+	node.data = classification.data;
+	node.edges = classification.edges;
+	return node;
+}
 
+/**
+ * Captures the built-in reconstruction plan for a reserved non-primitive value.
+ * @param {Graph} graph
+ * @param {any} value
+ * @returns {Classification}
+ */
+function builtin_classify(graph, value) {
 	if (typeof value === 'function') throw error(graph, 'Cannot stringify a function', value);
 	const type = get_type(value);
-	node.kind = type;
 
 	switch (type) {
 		case 'Number':
 		case 'String':
 		case 'Boolean':
 		case 'BigInt':
-			node.data = { value: value.valueOf() };
-			break;
+			return { kind: type, data: { value: value.valueOf() }, edges: [] };
 		case 'Date':
-			node.data = { time: /** @type {Date} */ (value).getTime() };
-			break;
+			return { kind: type, data: { time: /** @type {Date} */ (value).getTime() }, edges: [] };
 		case 'RegExp': {
 			const regexp = /** @type {RegExp} */ (value);
-			node.data = { source: regexp.source, flags: regexp.flags };
-			break;
+			return { kind: type, data: { source: regexp.source, flags: regexp.flags }, edges: [] };
 		}
 		case 'URL':
 		case 'URLSearchParams':
@@ -203,15 +213,15 @@ export function discover(graph, value) {
 		case 'Temporal.PlainMonthDay':
 		case 'Temporal.PlainYearMonth':
 		case 'Temporal.ZonedDateTime':
-			node.data = { source: String(value) };
-			break;
+			return { kind: type, data: { source: String(value) }, edges: [] };
 		case 'ArrayBuffer':
-			node.data = { bytes: new Uint8Array(/** @type {ArrayBuffer} */ (value)) };
-			break;
+			return { kind: type, data: { bytes: new Uint8Array(/** @type {ArrayBuffer} */ (value)) }, edges: [] };
 		case 'Array': {
 			const array = /** @type {unknown[]} */ (value);
 			/** @type {Array<[keyof unknown[], ValueRef]>} */
 			const entries = [];
+			/** @type {ValueRef[]} */
+			const edges = [];
 			for (const key of valid_array_indices(array)) {
 				graph.keys.push(key);
 				graph.key_kinds.push(ARRAY_INDEX);
@@ -219,16 +229,13 @@ export function discover(graph, value) {
 				graph.keys.pop();
 				graph.key_kinds.pop();
 				entries.push([key, child]);
-				node.edges.push(child);
+				edges.push(child);
 			}
-			node.data = { length: array.length, entries };
-			break;
+			return { kind: type, data: { length: array.length, entries }, edges };
 		}
 		case 'Set': {
 			const values = Array.from(/** @type {Set<unknown>} */ (value), (child) => edge(graph, child));
-			node.data = { values };
-			node.edges = values;
-			break;
+			return { kind: type, data: { values }, edges: values };
 		}
 		case 'Map': {
 			const entries = [];
@@ -239,9 +246,7 @@ export function discover(graph, value) {
 				graph.keys.pop();
 				graph.key_kinds.pop();
 			}
-			node.data = { entries };
-			node.edges = entries.flat();
-			break;
+			return { kind: type, data: { entries }, edges: entries.flat() };
 		}
 		case 'Int8Array':
 		case 'Uint8Array':
@@ -258,14 +263,11 @@ export function discover(graph, value) {
 		case 'DataView': {
 			const view = /** @type {ArrayBufferView & { length?: number }} */ (value);
 			const buffer = edge(graph, view.buffer);
-			node.data = {
-				buffer,
-				byteOffset: view.byteOffset,
-				byteLength: view.byteLength,
-				length: view.length
+			return {
+				kind: type,
+				data: { buffer, byteOffset: view.byteOffset, byteLength: view.byteLength, length: view.length },
+				edges: [buffer]
 			};
-			node.edges = [buffer];
-			break;
 		}
 		default: {
 			const object = /** @type {Record<string | symbol, unknown>} */ (value);
@@ -275,6 +277,8 @@ export function discover(graph, value) {
 			}
 			/** @type {Array<[string, ValueRef]>} */
 			const entries = [];
+			/** @type {ValueRef[]} */
+			const edges = [];
 			for (const key of Object.keys(object)) {
 				if (key === '__proto__') {
 					throw error(graph, 'Cannot stringify objects with __proto__ keys', value);
@@ -285,14 +289,15 @@ export function discover(graph, value) {
 				graph.keys.pop();
 				graph.key_kinds.pop();
 				entries.push([key, child]);
-				node.edges.push(child);
+				edges.push(child);
 			}
-			node.kind = Object.getPrototypeOf(object) === null ? 'NullObject' : 'Object';
-			node.data = { entries };
+			return {
+				kind: Object.getPrototypeOf(object) === null ? 'NullObject' : 'Object',
+				data: { entries },
+				edges
+			};
 		}
 	}
-
-	return node;
 }
 
 /**
