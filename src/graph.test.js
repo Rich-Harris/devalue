@@ -34,6 +34,30 @@ test('captures sparse arrays and container order as canonical edges', () => {
 	assert.equal(graph.identities.get(set)?.data.values.map((edge) => edge.node), [array_node?.id, graph.identities.get(key)?.id]);
 });
 
+test('applies classifications while graph owns recursive discovery', () => {
+	class Box {
+		constructor(value) {
+			this.value = value;
+		}
+	}
+	const child = {};
+	const root = new Box(child);
+	const graph = create_graph(root, (value, _node, graph) => {
+		if (!(value instanceof Box)) return false;
+		const captured = discover(graph, value.value);
+		return {
+			kind: 'Box',
+			data: { child: captured },
+			edges: captured ? [{ node: captured.id }] : [{ value: value.value }]
+		};
+	});
+	const node = discover(graph, root);
+
+	assert.is(node?.kind, 'Box');
+	assert.is(node?.data.child, graph.identities.get(child));
+	assert.equal(node?.edges, [{ node: 1 }]);
+});
+
 test('rolls back appended identities without touching earlier regions', () => {
 	const shared = {};
 	const graph = create_test_graph(shared);
