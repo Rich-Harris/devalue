@@ -1,6 +1,6 @@
 import { suite } from 'uvu';
 import * as assert from 'uvu/assert';
-import { begin_region, create_graph, discover, rollback_region } from './graph.js';
+import { checkpoint, create_graph, discover, rollback } from './graph.js';
 
 const test = suite('shared graph');
 const create_test_graph = (root) => create_graph(root, () => false);
@@ -38,12 +38,12 @@ test('rolls back appended identities without touching earlier regions', () => {
 	const shared = {};
 	const graph = create_test_graph(shared);
 	discover(graph, shared);
-	const region = begin_region(graph);
+	const region = checkpoint(graph);
 	const value = { shared, extra: {} };
 	discover(graph, value);
 	assert.is(graph.nodes.length, 3);
 
-	rollback_region(graph, region);
+	rollback(graph, region);
 	assert.is(graph.nodes.length, 1);
 	assert.is(graph.identities.size, 1);
 	assert.is(graph.identities.has(value), false);
@@ -53,10 +53,10 @@ test('rolls back appended identities without touching earlier regions', () => {
 test('rolls back an entire failed recursive discovery', () => {
 	const root = { child: {}, invalid: () => {} };
 	const graph = create_test_graph(root);
-	const region = begin_region(graph);
+	const region = checkpoint(graph);
 
 	assert.throws(() => discover(graph, root));
-	rollback_region(graph, region);
+	rollback(graph, region);
 
 	assert.is(graph.nodes.length, 0);
 	assert.is(graph.identities.size, 0);

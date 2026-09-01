@@ -7,16 +7,16 @@
  *   UnevalStreamResult,
  *   UnevalStreamTail
  * } from './types.js'
- * @import { GraphNode, Reference } from './graph.js'
+ * @import { Capture, Classification, GraphNode, Reference } from './graph.js'
  */
 
 import { DevalueError, is_primitive, stringify_primitive, stringify_string } from './utils.js';
 import {
-	begin_region,
-	commit_region,
+	checkpoint,
 	create_graph,
 	discover,
-	rollback_region
+	release_checkpoint,
+	rollback
 } from './graph.js';
 
 const promise_then = Promise.prototype.then;
@@ -129,12 +129,7 @@ class Session {
 		/** Approximate maximum bytes of generated source per tail block. */
 		this.budget = options.budget ?? 32768;
 		/** Append-only identity graph shared by every region in this session. */
-		this.graph = create_graph(root, (value, node) => this.classify(value, node));
-		/**
-		 * Walked server identities mapped to protocol plans and client references.
-		 * @type {Map<object, GraphNode>}
-		 */
-		this.nodes = this.graph.identities;
+		this.graph = create_graph(root, (value, node, capture) => this.classify(value, node, capture));
 		/**
 		 * Async descriptor states discovered anywhere in the streamed graph.
 		 * @type {Set<Source>}
@@ -295,14 +290,14 @@ class Session {
 
 	begin_transaction() {
 		this.transaction_depth++;
-		return { session: this.undo.length, graph: begin_region(this.graph) };
+		return { session: this.undo.length, graph: checkpoint(this.graph) };
 	}
 
 	/** @param {{ session: number, graph: import('./graph.js').Region }} marker */
 	commit_transaction(marker) {
 		this.transaction_depth--;
 		if (this.transaction_depth === 0) {
-			commit_region(this.graph, marker.graph);
+			release_checkpoint(this.graph, marker.graph);
 			this.undo.length = marker.session;
 		}
 	}
@@ -311,7 +306,7 @@ class Session {
 	rollback_transaction(marker) {
 		for (let i = this.undo.length - 1; i >= marker.session; i--) this.undo[i]();
 		this.undo.length = marker.session;
-		rollback_region(this.graph, marker.graph);
+		rollback(this.graph, marker.graph);
 		this.transaction_depth--;
 	}
 
@@ -377,14 +372,15 @@ class Session {
 	 *
 	 * @param {unknown} value
 	 * @param {GraphNode} node
-	 * @returns {boolean}
+	 * @param {Capture} capture
+	 * @returns {Classification | false}
 	 */
-	classify(value, node) {
+	classify(value, node, capture) {
 		if (this.replacer) {
 			const tokens = new Map();
 			const result = this.replacer(value, (child) => {
 				if (is_primitive(child)) {
-					this.capture(child);
+					capture.discover(child);
 					return stringify_primitive(child);
 				}
 				const token = this.placeholder();
@@ -398,16 +394,11 @@ class Session {
 						tokens.delete(token);
 						continue;
 					}
-					const captured = this.capture(child);
+					const captured = capture.discover(child);
 					tokens.set(token, captured);
 					edges.push(captured ? { node: captured.id } : { value: child });
-					this.mark_opaque_child(child);
+					if (captured) this.set(captured, 'opaque', true);
 				}
-				// `node` was created inside the current capture transaction, so rollback
-				// discards it wholesale; its own properties need no journaling.
-				node.kind = 'Custom';
-				node.data = { source: result, tokens };
-				node.edges = edges;
 				this.new_custom.push(node);
 				if (this.transaction_depth) {
 					this.undo.push(() => {
@@ -415,7 +406,7 @@ class Session {
 						if (index !== -1) this.new_custom.splice(index, 1);
 					});
 				}
-				return true;
+				return { kind: 'Custom', data: { source: result, tokens }, edges };
 			}
 			if (result !== undefined && result !== null && result !== false) {
 				if (typeof result !== 'object' || !Object.hasOwn(result, 'type')) {
@@ -423,13 +414,11 @@ class Session {
 				}
 				if (result.type === 'async-value') {
 					this.validate_value_descriptor(result);
-					this.add_source(node, result, 'value');
-					return true;
+					return this.add_source(node, result, 'value').classification;
 				}
 				if (result.type === 'async-sequence') {
 					this.validate_sequence_descriptor(result);
-					this.add_source(node, result, 'sequence');
-					return true;
+					return this.add_source(node, result, 'sequence').classification;
 				}
 				throw new TypeError('Invalid unevalStream replacer result');
 			}
@@ -463,35 +452,23 @@ class Session {
 			}
 			if (observer) {
 				const descriptor = native_descriptor(/** @type {Promise<unknown>} */ (value), this);
-				let source;
+				let added;
 				try {
-					source = this.add_source(node, descriptor, 'native');
-					this.set(source, 'observer', observer);
+					added = this.add_source(node, descriptor, 'native');
+					this.set(added.state, 'observer', observer);
 					this.set(this, 'native_pending', this.native_pending + 1);
 				} catch (error) {
 					observer.active = false;
 					throw error;
 				}
-				return true;
+				return added.classification;
 			}
 
 			if (Symbol.asyncIterator in value) {
-				this.add_source(node, native_sequence_descriptor(value, this), 'sequence');
-				return true;
+				return this.add_source(node, native_sequence_descriptor(value, this), 'sequence').classification;
 			}
 		}
 		return false;
-	}
-
-	/**
-	 * Marks a custom replacer's child as requiring a private client slot instead of a target path.
-	 *
-	 * @param {unknown} value
-	 */
-	mark_opaque_child(value) {
-		if (is_primitive(value)) return;
-		const node = this.nodes.get(/** @type {object} */ (value));
-		if (node) this.set(node, 'opaque', true);
 	}
 
 	/**
@@ -500,7 +477,7 @@ class Session {
 	 * @param {GraphNode} node
 	 * @param {any} descriptor
 	 * @param {'value' | 'sequence' | 'native'} type
-	 * @returns {Source}
+	 * @returns {{ state: Source, classification: Classification }}
 	 */
 	add_source(node, descriptor, type) {
 		let captured = false;
@@ -513,12 +490,11 @@ class Session {
 			control().replace('$1', () => needs_parentheses(expression) ? `(${expression})` : expression)
 		);
 		if (typeof source !== 'string') throw new TypeError('Invalid async descriptor construct result');
-		node.kind = 'Async';
 		const pending = this.pending;
 		this.set(this, 'pending', pending + 1);
 		/** @type {Source} */
 		const state = { node, descriptor, type, started: false, terminal: false, cleaned: false, active: true, flushed_pending: 0 };
-		node.data = { source, pending, captured, state };
+		const classification = { kind: 'Async', data: { source, pending, captured, state }, edges: [] };
 		this.sources.add(state);
 		this.unstarted.push(state);
 		if (this.transaction_depth) this.undo.push(() => {
@@ -528,7 +504,7 @@ class Session {
 			if (!this.cancelled) this.sources.delete(state);
 		});
 		if (this.signal?.aborted) throw this.signal.reason;
-		return state;
+		return { state, classification };
 	}
 
 	/**
@@ -539,7 +515,7 @@ class Session {
 	 * @param {unknown} result
 	 */
 	native_event(value, type, result) {
-		const node = this.nodes.get(/** @type {object} */ (value));
+		const node = this.graph.identities.get(/** @type {object} */ (value));
 		if (!node) return;
 		const source = node.kind === 'Async' ? node.data.state : undefined;
 		if (!source?.active) return;
@@ -792,6 +768,7 @@ class Session {
 	emit_region(value, persistent, references) {
 		/** Canonical node list; edges carry indices into it, avoiding identity-map lookups. */
 		const nodes_list = this.graph.nodes;
+		const identities = this.graph.identities;
 		/** Resolves a recorded edge to its node, or undefined for a primitive edge. @param {{ node: number } | { value: unknown }} reference */
 		const node_of = (reference) => 'node' in reference ? /** @type {GraphNode} */ (nodes_list[reference.node]) : undefined;
 
@@ -816,7 +793,7 @@ class Session {
 			for (const edge of node.edges) visit(node_of(edge));
 			node.position = order.push(node) - 1;
 		};
-		if (!is_primitive(value)) visit(this.nodes.get(/** @type {object} */ (value)));
+		if (!is_primitive(value)) visit(identities.get(/** @type {object} */ (value)));
 
 		/**
 		 * Invokes a callback for each represented child node (undefined for primitive
@@ -859,7 +836,7 @@ class Session {
 		const bump = (node, occurrences = 1) => {
 			if (node && node.epoch === epoch) node.uses += occurrences;
 		};
-		if (!is_primitive(value)) bump(this.nodes.get(/** @type {object} */ (value)));
+		if (!is_primitive(value)) bump(identities.get(/** @type {object} */ (value)));
 		for (const node of order) {
 			each_child(node, bump);
 			// Persistent Set/Map sidecars re-reference each retained element, so those
@@ -971,7 +948,7 @@ class Session {
 		 */
 		const expression = (thing) => {
 			if (is_primitive(thing)) return stringify_primitive(thing);
-			const node = this.nodes.get(/** @type {object} */ (thing));
+			const node = identities.get(/** @type {object} */ (thing));
 			if (!node) throw this.error('Cannot stringify value', thing);
 			return expression_node(node);
 		};
@@ -1183,7 +1160,7 @@ class Session {
 	 */
 	reference(value, reference) {
 		if (!is_primitive(value)) {
-			const node = this.nodes.get(/** @type {object} */ (value));
+			const node = this.graph.identities.get(/** @type {object} */ (value));
 			if (node) this.reference_node(node, reference);
 		}
 	}
@@ -1207,7 +1184,7 @@ class Session {
 	 */
 	assign_references(value, reference, seen) {
 		if (is_primitive(value)) return;
-		const node = this.nodes.get(/** @type {object} */ (value));
+		const node = this.graph.identities.get(/** @type {object} */ (value));
 		if (node) this.assign_references_node(node, reference, seen);
 	}
 
