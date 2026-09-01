@@ -11,6 +11,8 @@ import {
 } from './utils.js';
 
 /** @typedef {{ node: number } | { value: unknown }} ValueRef */
+/** @typedef {{ kind: string, data: any, edges: ValueRef[] }} Classification */
+/** @typedef {{ discover: (value: unknown) => GraphNode | undefined, edge: (value: unknown) => ValueRef }} Capture */
 /**
  * A source expression for reaching an object created by an earlier streamed region.
  *
@@ -54,7 +56,8 @@ import {
  * @property {unknown} root_value The initial value, retained to provide context in serialization errors.
  * @property {GraphNode[]} nodes Every captured non-primitive value, in discovery order. A node's `id` is its index here.
  * @property {Map<object, GraphNode>} identities Maps each original object to its single graph node, preserving shared references and cycles.
- * @property {(value: unknown, node: GraphNode) => boolean} try_classify Handles stream-specific values before built-in discovery; returns whether it populated the node.
+ * @property {(value: unknown, node: GraphNode, capture: Capture) => Classification | false} try_classify Handles stream-specific values before built-in discovery.
+ * @property {Capture} capture Stable recursive capture operations exposed to the classifier.
  * @property {unknown[]} keys Raw property, array-index, or map-key segments leading to the value currently being discovered.
  * @property {number[]} key_kinds How each entry in `keys` should be formatted in an error path: array index, property, or map key.
  * @property {object[]} added Identity-map keys added by open regions, in insertion order, so rollback can delete them.
@@ -86,23 +89,30 @@ const MAP_KEY = 2;
  * leaving the graph as it was before the capture began.
  *
  * @param {unknown} root
- * @param {(value: unknown, node: GraphNode) => boolean} try_classify
+ * @param {(value: unknown, node: GraphNode, capture: Capture) => Classification | false} try_classify
  * @returns {Graph}
  */
 export function create_graph(root, try_classify) {
-	return {
+	/** @type {Graph} */
+	const graph = {
 		root_value: root,
 		nodes: [],
 		identities: new Map(),
 		try_classify,
+		capture: /** @type {Capture} */ (undefined),
 		keys: [],
 		key_kinds: [],
 		added: []
 	};
+	graph.capture = {
+		discover: (value) => discover(graph, value),
+		edge: (value) => edge(graph, value)
+	};
+	return graph;
 }
 
 /** @param {Graph} graph */
-export function begin_region(graph) {
+export function checkpoint(graph) {
 	return { nodes: graph.nodes.length, added: graph.added.length };
 }
 
@@ -110,7 +120,7 @@ export function begin_region(graph) {
  * @param {Graph} graph
  * @param {Region} region
  */
-export function commit_region(graph, region) {
+export function release_checkpoint(graph, region) {
 	graph.added.length = region.added;
 }
 
@@ -118,7 +128,7 @@ export function commit_region(graph, region) {
  * @param {Graph} graph
  * @param {Region} region
  */
-export function rollback_region(graph, region) {
+export function rollback(graph, region) {
 	for (let i = graph.added.length - 1; i >= region.added; i -= 1) {
 		graph.identities.delete(graph.added[i]);
 	}
@@ -163,7 +173,13 @@ export function discover(graph, value) {
 	graph.identities.set(identity, node);
 	graph.added.push(identity);
 
-	if (graph.try_classify(value, node)) return node;
+	const classification = graph.try_classify(value, node, graph.capture);
+	if (classification) {
+		node.kind = classification.kind;
+		node.data = classification.data;
+		node.edges = classification.edges;
+		return node;
+	}
 
 	if (typeof value === 'function') throw error(graph, 'Cannot stringify a function', value);
 	const type = get_type(value);
