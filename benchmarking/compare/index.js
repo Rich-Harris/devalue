@@ -1,4 +1,3 @@
-import fs from 'node:fs';
 import path from 'node:path';
 import { execSync, fork } from 'node:child_process';
 
@@ -19,10 +18,6 @@ const checkout = is_jj
 	: (branch) => exec(`git checkout ${branch}`);
 
 const runner = path.resolve(import.meta.filename, '../runner.js');
-const outdir = path.resolve(import.meta.filename, '../.results');
-
-fs.rmSync(outdir, { recursive: true, force: true });
-fs.mkdirSync(outdir);
 
 /** @type {string[]} */
 const branches = [];
@@ -44,28 +39,32 @@ if (branches.length === 1) {
 
 process.on('exit', () => checkout(current_ref));
 
-for (const branch of branches) {
-	console.group(`Benchmarking ${branch}`);
+const runs = Number(process.env.BENCHMARK_RUNS ?? 3);
+if (!Number.isInteger(runs) || runs < 1) throw new Error('BENCHMARK_RUNS must be a positive integer');
+/** @type {Array<Array<Array<{ benchmark: string, time: number, gc_time: number }>>>} */
+const samples = branches.map(() => []);
 
-	checkout(branch);
-
-	await new Promise((fulfil, reject) => {
-		const child = fork(runner);
-
-		child.on('message', (results) => {
-			fs.writeFileSync(`${outdir}/${branch}.json`, JSON.stringify(results, null, '  '));
-			fulfil(undefined);
-		});
-
-		child.on('error', reject);
-	});
-
-	console.groupEnd();
+for (let run = 0; run < runs; run++) {
+	const order = branches.map((_, index) => index);
+	if (run % 2 === 1) order.reverse();
+	for (const index of order) {
+		const branch = branches[index];
+		console.group(`Benchmarking ${branch} (${run + 1}/${runs})`);
+		checkout(branch);
+		samples[index].push(await new Promise((fulfil, reject) => {
+			const child = fork(runner);
+			child.on('message', fulfil);
+			child.on('error', reject);
+		}));
+		console.groupEnd();
+	}
 }
 
-const results = branches.map((branch) => {
-	return JSON.parse(fs.readFileSync(`${outdir}/${branch}.json`, 'utf-8'));
-});
+const results = samples.map((runs) => runs[0].map((benchmark, index) => ({
+	benchmark: benchmark.benchmark,
+	time: median(runs.map((run) => run[index].time)),
+	gc_time: median(runs.map((run) => run[index].gc_time))
+})));
 
 for (let i = 0; i < results[0].length; i += 1) {
 	console.group(`${results[0][i].benchmark}`);
@@ -106,4 +105,10 @@ for (let i = 0; i < results[0].length; i += 1) {
 
 function char(i) {
 	return String.fromCharCode(97 + i);
+}
+
+/** @param {number[]} values */
+function median(values) {
+	values.sort((a, b) => a - b);
+	return values[Math.floor(values.length / 2)];
 }
