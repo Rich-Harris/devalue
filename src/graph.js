@@ -21,7 +21,7 @@ import {
  */
 /**
  * A captured non-primitive value. Discovery fills `value` through `edges`; streaming
- * metadata is attached only when it must survive between emitted regions.
+ * emission temporarily fills `epoch` through `rendering` while planning its output.
  *
  * @typedef {object} GraphNode
  * @property {number} id Index of this node in `Graph.nodes`; non-primitive `ValueRef`s store this number.
@@ -29,6 +29,14 @@ import {
  * @property {string} kind The value type used to choose how it is reconstructed, such as `Array`, `Map`, or `Date`.
  * @property {any} data The captured type-specific data needed to reconstruct the value.
  * @property {ValueRef[]} edges References to every captured value contained by this value.
+ * @property {number} epoch Identifies the emission walk for which the following planning fields are valid.
+ * @property {number} position This node's position in the current emission's child-before-parent order.
+ * @property {number} uses Number of references to this node in the current emission. Multiple uses require a shared temporary variable.
+ * @property {boolean} hoisted Whether this node must be assigned to a temporary variable instead of being written inline.
+ * @property {boolean} early Whether an empty container must be created before normal declarations so an earlier constructor can refer to it.
+ * @property {number} latest Furthest declaration position reached by expanding this node inline; used to avoid references to variables not declared yet.
+ * @property {string} name Temporary variable name assigned when `hoisted` is true, or an empty string when the node is inlined.
+ * @property {boolean} rendering Whether this node is currently being expanded inline; guards against unexpected recursive expansion.
  * @property {Reference} [reference] A reference emitted by an earlier streaming region that can be reused by later regions.
  * @property {boolean} [opaque] Whether emission must preserve this node as a named value rather than inspect and duplicate it inline.
  */
@@ -67,8 +75,9 @@ const MAP_KEY = 2;
  * one value, `uneval-stream` walks only the nodes reachable from that value and works
  * out how to reproduce their object identity. A value used once can usually be written
  * inline, while a shared or cyclic value needs a temporary variable so every reference
- * points to the same object. `uneval-stream` keeps per-emission analysis in parallel
- * arrays keyed by node id, leaving captured nodes stable between regions.
+ * points to the same object. The `epoch` through `rendering` fields on each node hold
+ * this per-emission analysis. They are reset for nodes in the current walk; `epoch`
+ * distinguishes those results from values left on nodes by previous walks.
  *
  * Callers group each independently recoverable capture in a region before calling
  * `discover`. That region includes every node added while recursively walking the value.
@@ -143,7 +152,15 @@ export function discover(graph, value) {
 		value,
 		kind: '',
 		data: undefined,
-		edges: []
+		edges: [],
+		epoch: 0,
+		position: 0,
+		uses: 0,
+		hoisted: false,
+		early: false,
+		latest: -1,
+		name: '',
+		rendering: false
 	};
 	graph.nodes.push(node);
 	graph.identities.set(identity, node);
