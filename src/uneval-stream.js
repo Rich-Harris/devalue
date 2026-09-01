@@ -7,21 +7,47 @@
  *   UnevalStreamResult,
  *   UnevalStreamTail
  * } from './types.js'
- * @import { GraphNode, Reference } from './graph.js'
  */
 
-import { DevalueError, is_primitive, stringify_primitive, stringify_string } from './utils.js';
 import {
-	begin_region,
-	commit_region,
-	create_graph,
-	discover,
-	rollback_region
-} from './graph.js';
+	DevalueError,
+	enumerable_symbols,
+	get_type,
+	is_plain_object,
+	is_primitive,
+	stringify_key,
+	stringify_primitive,
+	stringify_string,
+	valid_array_indices
+} from './utils.js';
+
+/** @typedef {{ node: number } | { value: unknown }} ValueRef */
+/** @typedef {{ root: string, segments: string[] }} Reference */
+/**
+ * @typedef {object} GraphNode
+ * @property {number} id
+ * @property {any} value
+ * @property {string} kind
+ * @property {any} data
+ * @property {ValueRef[]} edges
+ * @property {number} epoch
+ * @property {number} position
+ * @property {number} uses
+ * @property {boolean} hoisted
+ * @property {boolean} early
+ * @property {number} latest
+ * @property {string} name
+ * @property {boolean} rendering
+ * @property {Reference} [reference]
+ * @property {boolean} [opaque]
+ */
 
 const promise_then = Promise.prototype.then;
 const generic_error = 'new Error("devalue: failed to serialize asynchronous value")';
 const TOKEN_PATTERN = /"\d+"/g;
+const ARRAY_INDEX = 0;
+const OBJECT_KEY = 1;
+const MAP_KEY = 2;
 
 /**
  * Stream executable source while preserving identities across asynchronous regions.
@@ -128,13 +154,21 @@ class Session {
 		this.onerror = options.onerror;
 		/** Approximate maximum bytes of generated source per tail block. */
 		this.budget = options.budget ?? 32768;
-		/** Append-only identity graph shared by every region in this session. */
-		this.graph = create_graph(root, (value, node) => this.classify(value, node));
+		/** Initial value retained to provide context in serialization errors. */
+		this.root_value = root;
+		/** Canonical nodes in discovery order; a node's id is its index here. @type {GraphNode[]} */
+		this.node_list = [];
 		/**
 		 * Walked server identities mapped to protocol plans and client references.
 		 * @type {Map<object, GraphNode>}
 		 */
-		this.nodes = this.graph.identities;
+		this.nodes = new Map();
+		/** Raw segments on the path currently being discovered. @type {unknown[]} */
+		this.path_keys = [];
+		/** Formatting kind for each current path segment. @type {number[]} */
+		this.path_kinds = [];
+		/** Identity keys added by open transactions, retained for rollback. @type {object[]} */
+		this.added = [];
 		/**
 		 * Async descriptor states discovered anywhere in the streamed graph.
 		 * @type {Set<Source>}
@@ -295,21 +329,25 @@ class Session {
 
 	begin_transaction() {
 		this.transaction_depth++;
-		return { session: this.undo.length, graph: begin_region(this.graph) };
+		return { undo: this.undo.length, nodes: this.node_list.length, added: this.added.length };
 	}
 
-	/** @param {{ session: number, graph: import('./graph.js').Region }} marker */
+	/** @param {{ undo: number, nodes: number, added: number }} marker */
 	commit_transaction(marker) {
 		this.transaction_depth--;
-		commit_region(this.graph, marker.graph);
-		if (this.transaction_depth === 0) this.undo.length = marker.session;
+		if (this.transaction_depth === 0) {
+			this.undo.length = marker.undo;
+			this.added.length = marker.added;
+		}
 	}
 
-	/** @param {{ session: number, graph: import('./graph.js').Region }} marker */
+	/** @param {{ undo: number, nodes: number, added: number }} marker */
 	rollback_transaction(marker) {
-		for (let i = this.undo.length - 1; i >= marker.session; i--) this.undo[i]();
-		this.undo.length = marker.session;
-		rollback_region(this.graph, marker.graph);
+		for (let i = this.undo.length - 1; i >= marker.undo; i--) this.undo[i]();
+		this.undo.length = marker.undo;
+		for (let i = this.added.length - 1; i >= marker.added; i--) this.nodes.delete(this.added[i]);
+		this.added.length = marker.added;
+		this.node_list.length = marker.nodes;
 		this.transaction_depth--;
 	}
 
@@ -335,7 +373,7 @@ class Session {
 	capture(value, root = false) {
 		const marker = this.begin_transaction();
 		try {
-			const node = discover(this.graph, value);
+			const node = discover(this, value);
 			if (root) this.set(this, 'root', node);
 			this.commit_transaction(marker);
 			return node;
@@ -789,7 +827,7 @@ class Session {
 	 */
 	emit_region(value, persistent, references) {
 		/** Canonical node list; edges carry indices into it, avoiding identity-map lookups. */
-		const nodes_list = this.graph.nodes;
+		const nodes_list = this.node_list;
 		/** Resolves a recorded edge to its node, or undefined for a primitive edge. @param {{ node: number } | { value: unknown }} reference */
 		const node_of = (reference) => 'node' in reference ? /** @type {GraphNode} */ (nodes_list[reference.node]) : undefined;
 
@@ -1220,7 +1258,7 @@ class Session {
 		const previous = seen.get(node);
 		if (previous !== undefined && previous <= length) return;
 		seen.set(node, length);
-		const nodes_list = this.graph.nodes;
+		const nodes_list = this.node_list;
 		if (node.kind === 'Array') {
 			for (const [key, child] of node.data.entries) {
 				if ('node' in child) this.assign_references_node(nodes_list[child.node], append_reference(reference, `[${key}]`), seen);
@@ -1655,8 +1693,178 @@ class Session {
 	 * @returns {DevalueError}
 	 */
 	error(message, value) {
-		return new DevalueError(message, [], value, this.root?.value);
+		return new DevalueError(message, [], value, this.root_value);
 	}
+}
+
+/**
+ * Discovers a value into a session's canonical node list.
+ * @param {Session} session
+ * @param {unknown} value
+ * @returns {GraphNode | undefined}
+ */
+function discover(session, value) {
+	if (is_primitive(value)) {
+		if (typeof value === 'symbol') throw discovery_error(session, 'Cannot stringify a Symbol primitive', value);
+		return undefined;
+	}
+
+	const identity = /** @type {object} */ (value);
+	const existing = session.nodes.get(identity);
+	if (existing) return existing;
+
+	/** @type {GraphNode} */
+	const node = {
+		id: session.node_list.length,
+		value,
+		kind: '',
+		data: undefined,
+		edges: [],
+		epoch: 0,
+		position: 0,
+		uses: 0,
+		hoisted: false,
+		early: false,
+		latest: -1,
+		name: '',
+		rendering: false
+	};
+	session.node_list.push(node);
+	session.nodes.set(identity, node);
+	session.added.push(identity);
+
+	if (session.classify(value, node)) return node;
+	if (typeof value === 'function') throw discovery_error(session, 'Cannot stringify a function', value);
+	const type = get_type(value);
+	node.kind = type;
+
+	switch (type) {
+		case 'Number':
+		case 'String':
+		case 'Boolean':
+		case 'BigInt':
+			node.data = { value: value.valueOf() };
+			break;
+		case 'Date':
+			node.data = { time: /** @type {Date} */ (value).getTime() };
+			break;
+		case 'RegExp': {
+			const regexp = /** @type {RegExp} */ (value);
+			node.data = { source: regexp.source, flags: regexp.flags };
+			break;
+		}
+		case 'URL':
+		case 'URLSearchParams':
+		case 'Temporal.Duration':
+		case 'Temporal.Instant':
+		case 'Temporal.PlainDate':
+		case 'Temporal.PlainTime':
+		case 'Temporal.PlainDateTime':
+		case 'Temporal.PlainMonthDay':
+		case 'Temporal.PlainYearMonth':
+		case 'Temporal.ZonedDateTime':
+			node.data = { source: String(value) };
+			break;
+		case 'ArrayBuffer':
+			node.data = { bytes: new Uint8Array(/** @type {ArrayBuffer} */ (value)) };
+			break;
+		case 'Array': {
+			const array = /** @type {unknown[]} */ (value);
+			/** @type {Array<[keyof unknown[], ValueRef]>} */
+			const entries = [];
+			for (const key of valid_array_indices(array)) {
+				session.path_keys.push(key);
+				session.path_kinds.push(ARRAY_INDEX);
+				const child = edge(session, array[key]);
+				session.path_keys.pop();
+				session.path_kinds.pop();
+				entries.push([key, child]);
+				node.edges.push(child);
+			}
+			node.data = { length: array.length, entries };
+			break;
+		}
+		case 'Set': {
+			const values = Array.from(/** @type {Set<unknown>} */ (value), (child) => edge(session, child));
+			node.data = { values };
+			node.edges = values;
+			break;
+		}
+		case 'Map': {
+			const entries = [];
+			for (const [key, child] of /** @type {Map<unknown, unknown>} */ (value)) {
+				session.path_keys.push(key);
+				session.path_kinds.push(MAP_KEY);
+				entries.push([edge(session, key), edge(session, child)]);
+				session.path_keys.pop();
+				session.path_kinds.pop();
+			}
+			node.data = { entries };
+			node.edges = entries.flat();
+			break;
+		}
+		case 'Int8Array':
+		case 'Uint8Array':
+		case 'Uint8ClampedArray':
+		case 'Int16Array':
+		case 'Uint16Array':
+		case 'Float16Array':
+		case 'Int32Array':
+		case 'Uint32Array':
+		case 'Float32Array':
+		case 'Float64Array':
+		case 'BigInt64Array':
+		case 'BigUint64Array':
+		case 'DataView': {
+			const view = /** @type {ArrayBufferView & { length?: number }} */ (value);
+			const buffer = edge(session, view.buffer);
+			node.data = { buffer, byteOffset: view.byteOffset, byteLength: view.byteLength, length: view.length };
+			node.edges = [buffer];
+			break;
+		}
+		default: {
+			const object = /** @type {Record<string | symbol, unknown>} */ (value);
+			if (!is_plain_object(object)) throw discovery_error(session, 'Cannot stringify arbitrary non-POJOs', value);
+			if (enumerable_symbols(object).length) {
+				throw discovery_error(session, 'Cannot stringify POJOs with symbolic keys', value);
+			}
+			/** @type {Array<[string, ValueRef]>} */
+			const entries = [];
+			for (const key of Object.keys(object)) {
+				if (key === '__proto__') {
+					throw discovery_error(session, 'Cannot stringify objects with __proto__ keys', value);
+				}
+				session.path_keys.push(key);
+				session.path_kinds.push(OBJECT_KEY);
+				const child = edge(session, object[key]);
+				session.path_keys.pop();
+				session.path_kinds.pop();
+				entries.push([key, child]);
+				node.edges.push(child);
+			}
+			node.kind = Object.getPrototypeOf(object) === null ? 'NullObject' : 'Object';
+			node.data = { entries };
+		}
+	}
+
+	return node;
+}
+
+/** @param {Session} session @param {unknown} value @returns {ValueRef} */
+function edge(session, value) {
+	const node = discover(session, value);
+	return node ? { node: node.id } : { value };
+}
+
+/** @param {Session} session @param {string} message @param {unknown} value */
+function discovery_error(session, message, value) {
+	const keys = session.path_keys.map((key, index) => {
+		const kind = session.path_kinds[index];
+		if (kind === ARRAY_INDEX) return `[${key}]`;
+		if (kind === OBJECT_KEY) return stringify_key(/** @type {string} */ (key));
+		return `.get(${is_primitive(key) ? stringify_primitive(key) : '...'})`;
+	});
+	return new DevalueError(message, keys, value, session.root_value);
 }
 
 /**
