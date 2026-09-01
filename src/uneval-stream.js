@@ -293,7 +293,7 @@ class Session {
 		return { session: this.undo.length, graph: checkpoint(this.graph) };
 	}
 
-	/** @param {{ session: number, graph: import('./graph.js').Region }} marker */
+	/** @param {{ session: number, graph: import('./graph.js').Checkpoint }} marker */
 	commit_transaction(marker) {
 		this.transaction_depth--;
 		if (this.transaction_depth === 0) {
@@ -302,7 +302,7 @@ class Session {
 		}
 	}
 
-	/** @param {{ session: number, graph: import('./graph.js').Region }} marker */
+	/** @param {{ session: number, graph: import('./graph.js').Checkpoint }} marker */
 	rollback_transaction(marker) {
 		for (let i = this.undo.length - 1; i >= marker.session; i--) this.undo[i]();
 		this.undo.length = marker.session;
