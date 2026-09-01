@@ -58,16 +58,16 @@ test('applies classifications while graph owns recursive discovery', () => {
 	assert.equal(node?.edges, [{ node: 1 }]);
 });
 
-test('rolls back appended identities without touching earlier regions', () => {
+test('rolls back appended identities without touching earlier captures', () => {
 	const shared = {};
 	const graph = create_test_graph(shared);
 	discover(graph, shared);
-	const region = checkpoint(graph);
+	const marker = checkpoint(graph);
 	const value = { shared, extra: {} };
 	discover(graph, value);
 	assert.is(graph.nodes.length, 3);
 
-	rollback(graph, region);
+	rollback(graph, marker);
 	assert.is(graph.nodes.length, 1);
 	assert.is(graph.identities.size, 1);
 	assert.is(graph.identities.has(value), false);
@@ -77,10 +77,10 @@ test('rolls back appended identities without touching earlier regions', () => {
 test('rolls back an entire failed recursive discovery', () => {
 	const root = { child: {}, invalid: () => {} };
 	const graph = create_test_graph(root);
-	const region = checkpoint(graph);
+	const marker = checkpoint(graph);
 
 	assert.throws(() => discover(graph, root));
-	rollback(graph, region);
+	rollback(graph, marker);
 
 	assert.is(graph.nodes.length, 0);
 	assert.is(graph.identities.size, 0);

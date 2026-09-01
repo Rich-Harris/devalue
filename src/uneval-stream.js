@@ -37,8 +37,9 @@ export async function unevalStream(value, replacer, options = {}) {
 	const id = options.id ?? create_session_id();
 	const session = new Session(scope, id, value, replacer, options);
 
-	// Capture a snapshot of the complete synchronous graph and register any promises
-	// or async iterables found within it. Nothing has been emitted or observed yet.
+	// Capture the complete synchronous graph and register any promises or async iterables.
+	// Nothing has been emitted and no committed source has started; native Promises may
+	// already have provisional observers retaining early settlements.
 	try {
 		session.capture(value, true);
 		session.commit();
@@ -65,7 +66,7 @@ export async function unevalStream(value, replacer, options = {}) {
 	if (session.failure) throw session.failure;
 
 	try {
-		// Emit the captured root and record how its objects can be reached on the client.
+		// Emit the captured root and record how its non-primitives can be reached on the client.
 		// Later outcome regions use these references to preserve identity across chunks.
 		const head_region = session.emit_region(value, true);
 		session.assign_references(value, { root: 's.a[0]', segments: [] }, new Map());
@@ -94,7 +95,7 @@ export async function unevalStream(value, replacer, options = {}) {
 		}
 
 		// Anything still pending is delivered as executable tail blocks. Each block
-		// updates the client-side objects created by the head.
+		// updates the client-side values created by the head.
 		session.emit_dispatch = true;
 		return { head: session.wrap_head(head_region, operations), tail: session.tail(), id };
 	} catch (error) {
@@ -103,7 +104,7 @@ export async function unevalStream(value, replacer, options = {}) {
 	}
 }
 
-/** Coordinates lightweight initial capture, durable outcome regions, client references, and tail delivery. */
+/** Coordinates transactional graph capture, durable outcome regions, client references, and tail delivery. */
 class Session {
 	/**
 	 * Creates an isolated server-side stream session.
@@ -128,7 +129,7 @@ class Session {
 		this.onerror = options.onerror;
 		/** Approximate maximum bytes of generated source per tail block. */
 		this.budget = options.budget ?? 32768;
-		/** Append-only identity graph shared by every region in this session. */
+		/** Identity graph shared by all regions; failed transactions remove provisional additions. */
 		this.graph = create_graph(root, (value, node, graph) => this.classify(value, node, graph));
 		/**
 		 * Async descriptor states discovered anywhere in the streamed graph.
@@ -193,7 +194,7 @@ class Session {
 		this.abort = () => void this.cancel(signal?.reason);
 		signal?.addEventListener('abort', this.abort, { once: true });
 		/**
-		 * Planned node for the initial graph root, also used as DevalueError context.
+		 * Canonical captured node for the initial graph root, also used as DevalueError context.
 		 * @type {GraphNode | undefined}
 		 */
 		this.root = undefined;
@@ -224,8 +225,8 @@ class Session {
 		 * when a non-empty tail will be returned, so the helper always pays for itself.
 		 */
 		this.emit_dispatch = false;
-		/** Monotonic tag for per-region node scratch state (see emit_region). */
-		this.region_epoch = 0;
+		/** Monotonic identifier for per-region node scratch state (see emit_region). */
+		this.region_id = 0;
 	}
 
 	/**
@@ -290,22 +291,22 @@ class Session {
 
 	begin_transaction() {
 		this.transaction_depth++;
-		return { session: this.undo.length, graph: checkpoint(this.graph) };
+		return { undo: this.undo.length, graph: checkpoint(this.graph) };
 	}
 
-	/** @param {{ session: number, graph: import('./graph.js').Checkpoint }} marker */
+	/** @param {{ undo: number, graph: import('./graph.js').Checkpoint }} marker */
 	commit_transaction(marker) {
 		this.transaction_depth--;
 		if (this.transaction_depth === 0) {
 			release_checkpoint(this.graph, marker.graph);
-			this.undo.length = marker.session;
+			this.undo.length = marker.undo;
 		}
 	}
 
-	/** @param {{ session: number, graph: import('./graph.js').Checkpoint }} marker */
+	/** @param {{ undo: number, graph: import('./graph.js').Checkpoint }} marker */
 	rollback_transaction(marker) {
-		for (let i = this.undo.length - 1; i >= marker.session; i--) this.undo[i]();
-		this.undo.length = marker.session;
+		for (let i = this.undo.length - 1; i >= marker.undo; i--) this.undo[i]();
+		this.undo.length = marker.undo;
 		rollback(this.graph, marker.graph);
 		this.transaction_depth--;
 	}
@@ -368,7 +369,8 @@ class Session {
 	}
 
 	/**
-	 * Classifies a node as a user replacement, native Promise, native AsyncIterable, or built-in.
+	 * Attempts to classify a node as a user replacement, native Promise, or native
+	 * AsyncIterable. Returning false delegates to graph's built-in discovery.
 	 *
 	 * @param {unknown} value
 	 * @param {GraphNode} node
@@ -565,7 +567,7 @@ class Session {
 		this.active = this.sources.size;
 	}
 
-	/** Starts every committed source and attaches session cancellation to the AbortSignal. */
+	/** Starts every committed source unless the constructor's AbortSignal listener has cancelled the session. */
 	start_sources() {
 		this.started = true;
 		if (this.signal?.aborted) {
@@ -725,8 +727,8 @@ class Session {
 	}
 
 	/**
-	 * Marks a batch's events as consumed by the client and resumes sequence pulling for
-	 * sources with no other unconsumed events.
+	 * Marks a batch's events as emitted or dequeued and resumes sequence pulling for
+	 * sources with no other undelivered events.
 	 *
 	 * @param {Batch} batch
 	 */
@@ -766,22 +768,22 @@ class Session {
 	 * @returns {{ source: string, tokens: Map<string, { node: GraphNode, reference: Reference }> }}
 	 */
 	emit_region(value, persistent, references) {
-		/** Canonical node list; edges carry indices into it, avoiding identity-map lookups. */
+		/** Canonical node list; recorded edges resolve through indices rather than identity lookups. */
 		const nodes_list = this.graph.nodes;
 		const identities = this.graph.identities;
 		/** Resolves a recorded edge to its node, or undefined for a primitive edge. @param {{ node: number } | { value: unknown }} reference */
 		const node_of = (reference) => 'node' in reference ? /** @type {GraphNode} */ (nodes_list[reference.node]) : undefined;
 
 		// Region-local analysis state lives in scratch fields on the nodes themselves,
-		// tagged with a fresh epoch, instead of per-region Maps/Sets keyed by node.
-		// `node.epoch === epoch` means "included in this region".
-		const epoch = ++this.region_epoch;
+		// tagged with a fresh id instead of per-region Maps/Sets keyed by node.
+		// `node.region_id === region_id` means "included in this region".
+		const region_id = ++this.region_id;
 		/** @type {GraphNode[]} */
 		const order = [];
 		/** @param {GraphNode | undefined} node */
 		const visit = (node) => {
-			if (!node || node.reference || node.epoch === epoch) return;
-			node.epoch = epoch;
+			if (!node || node.reference || node.region_id === region_id) return;
+			node.region_id = region_id;
 			node.uses = 0;
 			node.hoisted = false;
 			node.early = false;
@@ -834,7 +836,7 @@ class Session {
 		 * @param {number} occurrences
 		 */
 		const bump = (node, occurrences = 1) => {
-			if (node && node.epoch === epoch) node.uses += occurrences;
+			if (node && node.region_id === region_id) node.uses += occurrences;
 		};
 		if (!is_primitive(value)) bump(identities.get(/** @type {object} */ (value)));
 		for (const node of order) {
@@ -865,7 +867,7 @@ class Session {
 		 * @returns {boolean}
 		 */
 		const references_later = (node, limit, seen) => {
-			if (!node || node.epoch !== epoch) return false;
+			if (!node || node.region_id !== region_id) return false;
 			if (node.hoisted) return node.early ? false : node.position >= limit;
 			if (seen.has(node)) return false;
 			seen.add(node);
@@ -884,7 +886,7 @@ class Session {
 		const secure_atomic = (node) => {
 			const limit = node.position;
 			each_child(node, (child_node) => {
-				if (!child_node || child_node.epoch !== epoch) return;
+				if (!child_node || child_node.region_id !== region_id) return;
 				if (child_node.hoisted) {
 					if (!child_node.early && child_node.position >= limit) {
 						child_node.early = true;
@@ -911,7 +913,7 @@ class Session {
 		 * @returns {number}
 		 */
 		const latest_of = (node) => {
-			if (!node || node.epoch !== epoch) return -1;
+			if (!node || node.region_id !== region_id) return -1;
 			if (node.hoisted) return node.early ? -1 : node.position;
 			return node.latest;
 		};
@@ -957,7 +959,7 @@ class Session {
 		 * @returns {string}
 		 */
 		const expression_node = (node) => {
-			if (node.reference && node.epoch !== epoch) {
+			if (node.reference && node.region_id !== region_id) {
 				references?.add(node);
 				if (references) {
 					const token = this.placeholder();
@@ -966,7 +968,7 @@ class Session {
 				}
 				return render_reference(node.reference);
 			}
-			if (node.epoch === epoch && node.name) return node.name;
+			if (node.region_id === region_id && node.name) return node.name;
 			// `rendering` guards against unexpected re-entry while expanding inline.
 			if (node.rendering) throw this.error('Cannot stringify value', node.value);
 			node.rendering = true;
@@ -1381,7 +1383,8 @@ class Session {
 	}
 
 	/**
-	 * Promotes repeatedly used long paths into client slots when doing so shortens this batch.
+	 * Creates persistent client-slot aliases for repeated long paths when profitable in
+	 * this batch, then retains those aliases as the nodes' shortest references.
 	 *
 	 * @param {Array<{ source: string, tokens: Map<string, { node?: GraphNode, reference?: Reference, source?: string }> }>} operations
 	 * @param {Set<GraphNode>} references
@@ -1444,7 +1447,8 @@ class Session {
 	}
 
 	/**
-	 * Creates the one-shot async iterator that generates batches and drives sequence backpressure.
+	 * Creates the one-shot async iterator that renders finalized batches as executable
+	 * blocks and drives sequence backpressure as those batches are dequeued.
 	 *
 	 * @returns {UnevalStreamTail}
 	 */
@@ -1805,7 +1809,7 @@ function reference_length(reference) {
 }
 
 /**
- * Counts non-overlapping appearances of a reference expression in generated source.
+ * Counts non-overlapping appearances of a placeholder token or source fragment.
  *
  * @param {string} source
  * @param {string} value
@@ -1873,8 +1877,8 @@ const SEQUENCE_RUNTIME = '(c)=>{let q=[],w=[],d=0,e,r=(d,v)=>({done:!!d,value:v}
 
 /**
  * Session helper definitions, shipped at most once per session, always in the same block
- * as (and ahead of) their first use. Each helper must pay for itself: `w` only ships once
- * two native promises exist, `r` once three settlements are in play, `v` once six anchors
+ * as (and ahead of) their first use. `w` ships with the first assembled native Promise,
+ * while `r` waits until three settlements are in play and `v` until six anchors
  * have been allocated, and `f` with the first sequence (whose reconstruction is
  * impossible without it).
  */

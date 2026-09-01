@@ -43,7 +43,7 @@ export async function fastest_test(times, fn) {
 }
 
 /**
- * Returns the middle wall-clock sample, retaining its corresponding GC time.
+ * Returns the upper-middle wall-clock sample after sorting, retaining that sample's GC time.
  * This is less sensitive than the fastest sample to scheduler noise in async benchmarks.
  * @param {number} times
  * @param {() => void | Promise<void>} fn
