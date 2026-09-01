@@ -60,6 +60,8 @@ for (let run = 0; run < runs; run++) {
 	}
 }
 
+// Select wall and GC medians independently across fresh runner processes; unlike a
+// single timed sample, the two aggregate metrics need not originate from the same run.
 const results = samples.map((runs) => runs[0].map((benchmark, index) => ({
 	benchmark: benchmark.benchmark,
 	time: median(runs.map((run) => run[index].time)),
@@ -107,7 +109,7 @@ function char(i) {
 	return String.fromCharCode(97 + i);
 }
 
-/** @param {number[]} values */
+/** Selects the upper-middle value from a non-empty sample. @param {number[]} values */
 function median(values) {
 	values.sort((a, b) => a - b);
 	return values[Math.floor(values.length / 2)];
