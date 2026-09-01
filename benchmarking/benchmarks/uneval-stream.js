@@ -130,7 +130,7 @@ function sync_benchmark(label, value, iterations, custom_replacer) {
 	return {
 		label,
 		async fn() {
-			for (let i = 0; i < Math.min(iterations, 20); i++) await run();
+			await run();
 			return median_test(5, run);
 		}
 	};
@@ -158,25 +158,27 @@ const shared = { value: { id: 1, values: [1, 2, 3] } };
 const repeated = Array.from({ length: 1024 }, () => shared.value);
 
 const benchmarks = [
-	sync_benchmark('unevalStream sync/primitive', primitive, 4000),
-	sync_benchmark('unevalStream sync/flat object', flat, 2000),
-	sync_benchmark('unevalStream sync/nested tree', nested, 100),
-	sync_benchmark('unevalStream sync/shared object', { shared, repeated }, 100),
-	sync_benchmark('unevalStream sync/mixed graph', mixed_graph(), 100),
-	sync_benchmark('unevalStream edge/many objects', large_tree(), 5),
-	sync_benchmark('unevalStream edge/wide DAG', wide_dag(), 5),
-	sync_benchmark('unevalStream edge/cyclic graph', cyclic_graph(), 5),
-	sync_benchmark('unevalStream edge/sparse graph', sparse_graph(), 10),
-	sync_benchmark('unevalStream edge/collections', collection_graph(), 5),
-	sync_benchmark('unevalStream custom/nested', custom_graph(), 10, replacer),
-	sync_benchmark('unevalStream custom/atomic cycle', atomic_graph(), 10, replacer),
+	sync_benchmark('unevalStream sync/primitive', primitive, 100_000),
+	sync_benchmark('unevalStream sync/flat object', flat, 40_000),
+	sync_benchmark('unevalStream sync/nested tree', nested, 400),
+	sync_benchmark('unevalStream sync/shared object', { shared, repeated }, 800),
+	sync_benchmark('unevalStream sync/mixed graph', mixed_graph(), 6_000),
+	sync_benchmark('unevalStream edge/many objects', large_tree(), 15),
+	sync_benchmark('unevalStream edge/wide DAG', wide_dag(), 35),
+	sync_benchmark('unevalStream edge/cyclic graph', cyclic_graph(), 125),
+	sync_benchmark('unevalStream edge/sparse graph', sparse_graph(), 300),
+	sync_benchmark('unevalStream edge/collections', collection_graph(), 100),
+	sync_benchmark('unevalStream custom/nested', custom_graph(), 100, replacer),
+	sync_benchmark('unevalStream custom/atomic cycle', atomic_graph(), 150, replacer),
 	{
 		label: 'unevalStream stream/resolved head',
 		async fn() {
 			const run = async () => {
-				const outcome = wide_dag();
-				const promises = Array.from({ length: 128 }, (_, index) => Promise.resolve(index & 1 ? outcome[index] : outcome));
-				await consume(await unevalStream(promises, undefined, { id: 'benchmark' }));
+				for (let iteration = 0; iteration < 3; iteration++) {
+					const outcome = wide_dag();
+					const promises = Array.from({ length: 128 }, (_, index) => Promise.resolve(index & 1 ? outcome[index] : outcome));
+					await consume(await unevalStream(promises, undefined, { id: 'benchmark' }));
+				}
 			};
 			await run();
 			return median_test(5, run);
@@ -187,10 +189,12 @@ const benchmarks = [
 		async fn() {
 			const outcome = large_tree();
 			const run = async () => {
-				const pending = deferred();
-				const result = await unevalStream({ pending: pending.promise }, undefined, { id: 'benchmark' });
-				pending.resolve(outcome);
-				await consume(result);
+				for (let iteration = 0; iteration < 8; iteration++) {
+					const pending = deferred();
+					const result = await unevalStream({ pending: pending.promise }, undefined, { id: 'benchmark' });
+					pending.resolve(outcome);
+					await consume(result);
+				}
 			};
 			await run();
 			return median_test(5, run);
@@ -201,14 +205,16 @@ const benchmarks = [
 		async fn() {
 			const shared = collection_graph();
 			const run = async () => {
-				const pending = Array.from({ length: 64 }, () => deferred());
-				const result = await unevalStream(
-					{ shared, pending: pending.map((item) => item.promise) },
-					undefined,
-					{ id: 'benchmark' }
-				);
-				for (let i = 0; i < pending.length; i++) pending[i].resolve(i & 1 ? shared : Array.from(shared.map.keys())[i]);
-				await consume(result);
+				for (let iteration = 0; iteration < 20; iteration++) {
+					const pending = Array.from({ length: 64 }, () => deferred());
+					const result = await unevalStream(
+						{ shared, pending: pending.map((item) => item.promise) },
+						undefined,
+						{ id: 'benchmark' }
+					);
+					for (let i = 0; i < pending.length; i++) pending[i].resolve(i & 1 ? shared : Array.from(shared.map.keys())[i]);
+					await consume(result);
+				}
 			};
 			await run();
 			return median_test(5, run);
@@ -218,10 +224,12 @@ const benchmarks = [
 		label: 'unevalStream stream/many regions',
 		async fn() {
 			const run = async () => {
-				async function* sequence() {
-					for (let i = 0; i < 16; i++) yield { index: i, value: flat };
+				for (let iteration = 0; iteration < 5; iteration++) {
+					async function* sequence() {
+						for (let i = 0; i < 16; i++) yield { index: i, value: flat };
+					}
+					await consume(await unevalStream(sequence(), undefined, { id: 'benchmark' }));
 				}
-				await consume(await unevalStream(sequence(), undefined, { id: 'benchmark' }));
 			};
 			await run();
 			return median_test(5, run);
