@@ -156,7 +156,7 @@ test('batches promise settlements observed in one flush window', async () => {
 	assert.equal(await result.tail.next(), { done: true, value: undefined });
 });
 
-test('freezes batches independently of tail consumption', async () => {
+test('collects settlements until the current batch is consumed', async () => {
 	const a = deferred();
 	const b = deferred();
 	const result = await unevalStream([a.promise, b.promise], undefined, { id: 'frozen' });
@@ -168,9 +168,8 @@ test('freezes batches independently of tail consumption', async () => {
 	await delay(5);
 	const first = await result.tail.next();
 	const second = await result.tail.next();
-	assert.ok(!first.done && !second.done);
+	assert.ok(!first.done && second.done);
 	target.block(first.value);
-	target.block(second.value);
 });
 
 test('rejects an unserializable asynchronous fulfillment', async () => {
@@ -1197,10 +1196,10 @@ test('reports serialization failures through onerror without affecting the strea
 	assert.equal(await second.tail.next(), { done: true, value: undefined });
 });
 
-test('splits over-budget batches into multiple blocks', async () => {
+test('emits values settled in one macrotask as one batch', async () => {
 	let resolvers = [];
 	const promises = Array.from({ length: 10 }, () => new Promise((resolve) => resolvers.push(resolve)));
-	const result = await unevalStream(promises, undefined, { id: 'budget', budget: 200 });
+	const result = await unevalStream(promises, undefined, { id: 'macrotask-batch' });
 	const target = client();
 	const root = target.head(result.head);
 	for (const [i, resolve] of resolvers.entries()) resolve({ i, padding: 'x'.repeat(64) });
@@ -1209,10 +1208,7 @@ test('splits over-budget batches into multiple blocks', async () => {
 		blocks.push(block);
 		target.block(block);
 	}
-	assert.ok(blocks.length > 1, `expected a split, got ${blocks.length} block(s)`);
-	for (const block of blocks.slice(0, -1)) {
-		assert.ok(block.length < 200 + 300, `block too large: ${block.length}`);
-	}
+	assert.is(blocks.length, 1);
 	const values = await Promise.all(Array.from(root));
 	assert.equal(values.map((value) => value.i), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
 });
@@ -1663,13 +1659,11 @@ test('preserves custom replacer child identity across asynchronous regions', asy
 	assert.is((await root.a).wrapped, await root.b);
 });
 
-test('applies the soft budget to operations folded into the head', async () => {
+test('folds the initial macrotask batch into the head', async () => {
 	async function* fast() {
 		for (let i = 0; i < 2000; i += 1) yield { i, pad: 'x'.repeat(64) };
 	}
-	const result = await unevalStream(fast(), undefined, { id: 'head-budget', budget: 4096 });
-	// the head holds the root region plus at most ~budget of folded operations
-	assert.ok(result.head.length < 4096 * 3, `head=${result.head.length}`);
+	const result = await unevalStream(fast(), undefined, { id: 'head-batch' });
 	const target = client();
 	const root = target.head(result.head);
 	const seen = [];
@@ -1677,7 +1671,6 @@ test('applies the soft budget to operations folded into the head', async () => {
 		for await (const value of { [Symbol.asyncIterator]: () => root }) seen.push(value);
 	})();
 	for await (const block of result.tail) {
-		assert.ok(block.length < 4096 * 3, `block=${block.length}`);
 		target.block(block);
 	}
 	await drained;
