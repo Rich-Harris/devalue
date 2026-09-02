@@ -67,8 +67,6 @@ class Session {
 	#active = 0;
 	/** Whether a batch finalization is currently scheduled. @type {boolean} */
 	#flushing = false;
-	/** Whether async sources have begun observation or iteration. @type {boolean} */
-	#started = false;
 	/** Whether server-side observation and queued delivery have been cancelled. @type {boolean} */
 	#cancelled = false;
 	/** In-flight cleanup shared by repeated cancellation requests. @type {Promise<void> | undefined} */
@@ -588,7 +586,6 @@ class Session {
 
 	/** Starts every committed source unless the constructor's AbortSignal listener has cancelled the session. */
 	#start_sources() {
-		this.#started = true;
 		if (this.#signal?.aborted) {
 			void this.#cancel(this.#signal.reason);
 			return;
@@ -676,11 +673,6 @@ class Session {
 			source.pulled_resolve = undefined;
 		};
 		const next = source.next;
-		if (!next) {
-			finish();
-			this.#event(source, 'error', new TypeError('async iterator next is not callable'));
-			return;
-		}
 		let result;
 		try {
 			result = next.call(source.iterator);
