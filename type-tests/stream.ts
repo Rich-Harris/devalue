@@ -27,6 +27,7 @@ function useReference(reference: ClientReference) {
 function valueDescriptor(js: JavaScriptTag): AsyncValueDescriptor<number> {
 	return {
 		type: 'async-value',
+		id: 'typed-value',
 		source: promise,
 		construct: (capture) => js`new RemoteValue(${config},${capture(js`[${config}]`)})`,
 		resolve: (reference, result) => {
@@ -108,7 +109,7 @@ function incompatibleSequenceDescriptors(js: JavaScriptTag) {
 	return [wrongItemSource, wrongReturnSource];
 }
 
-const options: UnevalStreamOptions = { id: 'typed' };
+const options: UnevalStreamOptions = { id: 'typed', detached: true };
 const result: UnevalStreamResult = await unevalStream(sequence, replacer, options);
 const { head, tail, id }: { head: string; tail: UnevalStreamTail; id: string } = result;
 await tail.return();
