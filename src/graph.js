@@ -69,7 +69,7 @@ import {
  *   | { kind: 'Set' | 'Map', keys: never[], children: Child[], data: undefined }
  *   | { kind: ViewKind, keys: never[], children: [CapturedNode], data: { byteOffset: number, byteLength: number, length: number | undefined } }
  *   | { kind: 'Custom', keys: never[], children: Child[], data: JavaScriptSource }
- *   | { kind: 'Async', keys: never[], children: never[], data: { source: JavaScriptSource, pending: number, captured: boolean, state: Source } }
+ *   | { kind: 'Async', keys: never[], children: never[], data: { source: JavaScriptSource, pending: number, captured: boolean, state: Source, key: string | undefined } }
  *   | { kind: 'Number' | 'String' | 'Boolean' | 'BigInt', keys: never[], children: never[], data: number | string | boolean | bigint }
  *   | { kind: 'Date', keys: never[], children: never[], data: number }
  *   | { kind: 'RegExp', keys: never[], children: never[], data: { source: string, flags: string } }
