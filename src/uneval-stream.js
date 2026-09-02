@@ -36,76 +36,82 @@ export async function unevalStream(value, replacer, options = {}) {
 	const scope = options.scope ?? 'globalThis.__d';
 	const id = options.id ?? create_session_id();
 	const session = new Session(scope, id, value, replacer, options);
-
-	// Capture the complete synchronous graph and register any promises or async iterables.
-	// Nothing has been emitted and no committed source has started; native Promises may
-	// already have provisional observers retaining early settlements.
-	try {
-		session.capture(value, true);
-		session.commit();
-		session.validate_new_custom();
-	} catch (error) {
-		await session.cancel(error);
-		throw session.failure ?? error;
-	}
-	if (session.cancelled) {
-		await session.cancel(session.failure);
-		throw session.failure;
-	}
-
-	if (session.sources.size === 0) {
-		return { head: session.emit_region(value, false).source, tail: empty_tail(), id };
-	}
-
-	// Start observing async sources, then wait until the next ("macro")task. Outcomes
-	// that become available before then can be included in the head instead of a
-	// separate tail block.
-	session.start_sources();
-	await session.initial_window();
-
-	if (session.failure) throw session.failure;
-
-	try {
-		// Emit the captured root and record how its non-primitives can be reached on the client.
-		// Later outcome regions use these references to preserve identity across chunks.
-		const head_region = session.emit_region(value, true);
-		session.assign_references(value, { root: 's.a[0]', segments: [] }, new Map());
-		let operations = '';
-		// Fold available batches into the head until the (soft) budget is spent; an
-		// over-budget batch is split by emit_batch, which requeues the remainder for the tail.
-		while (session.batch_index < session.batches.length && operations.length < session.budget) {
-			const batch = session.batches[session.batch_index++];
-			operations += session.emit_batch(batch, false);
-			for (const event of batch.events) {
-				if (!event.source.needs_close) continue;
-				event.source.needs_close = false;
-				try {
-					await session.close_sequence(event.source);
-				} catch (error) {
-					await session.cancel(error);
-					throw session.failure ?? error;
-				}
-			}
-			session.consume(batch);
-		}
-		session.start_unstarted();
-
-		if (session.active === 0 && session.batch_index === session.batches.length && session.ready.length === 0) {
-			return { head: session.wrap_head(head_region, operations + session.cleanup_source()), tail: empty_tail(), id };
-		}
-
-		// Anything still pending is delivered as executable tail blocks. Each block
-		// updates the client-side values created by the head.
-		session.emit_dispatch = true;
-		return { head: session.wrap_head(head_region, operations), tail: session.tail(), id };
-	} catch (error) {
-		await session.cancel(error);
-		throw session.failure ?? error;
-	}
+	return session.serialize(value);
 }
 
 /** Coordinates transactional graph capture, durable outcome regions, client references, and tail delivery. */
 class Session {
+	/** Trusted assignable source expression that locates the client session table. @type {string} */
+	#scope;
+	/** Unescaped, unique identifier for this stream session. @type {string} */
+	#id;
+	/** User callback that replaces custom values. @type {UnevalStreamReplacer | undefined} */
+	#replacer;
+	/** Signal that cancels server-side observation and sequence pulling. @type {AbortSignal | undefined} */
+	#signal;
+	/** Diagnostic callback for asynchronous outcomes that fail to serialize. @type {UnevalStreamOptions['onerror']} */
+	#onerror;
+	/** Identity graph shared by all emitted regions. @type {Graph} */
+	#graph;
+	/** Async descriptor states discovered anywhere in the streamed graph. @type {Set<Source>} */
+	#sources;
+	/** Events collected during the current scheduled flush window. @type {Event[]} */
+	#batch;
+	/** Whether the current batch has been finalized and is ready to emit. @type {boolean} */
+	#batch_ready;
+	/** Resolvers for tail reads waiting for delivery or a lifecycle change. @type {Array<() => void>} */
+	#waiters;
+	/** Monotonic observation order assigned before events are batched. @type {number} */
+	#sequence;
+	/** Number of async sources whose terminal client operation has not been generated. @type {number} */
+	#active;
+	/** Whether a batch finalization is currently scheduled. @type {boolean} */
+	#flushing;
+	/** Whether async sources have begun observation or iteration. @type {boolean} */
+	#started;
+	/** Whether server-side observation and queued delivery have been cancelled. @type {boolean} */
+	#cancelled;
+	/** In-flight cleanup shared by repeated cancellation requests. @type {Promise<void> | undefined} */
+	#cancelling;
+	/** Fatal generation error, cancellation reason, or first cleanup failure. @type {unknown} */
+	#failure;
+	/** Next client anchor index; index zero is reserved for the head root. @type {number} */
+	#anchor;
+	/** Next client pending index used to store a descriptor's private control. @type {number} */
+	#pending;
+	/** Next client slot index used when no stable path can retain an identity. @type {number} */
+	#slot;
+	/** Next client collection index used for a retained Map or Set sidecar. @type {number} */
+	#collection;
+	/** Next collision-proof placeholder id shared by every replacement phase. @type {number} */
+	#token;
+	/** @type {Map<string, keyof typeof RUNTIMES>} */
+	#runtime_tokens;
+	/** @type {Map<string, number>} */
+	#promise_tokens;
+	/** Stable AbortSignal listener that forwards cancellation. @type {() => void} */
+	#abort;
+	/** Canonical captured node for the initial graph root. @type {GraphNode | undefined} */
+	#root;
+	/** Transaction rollback operations. @type {Array<() => void>} */
+	#undo;
+	/** Number of nested generation transactions. @type {number} */
+	#transaction_depth;
+	/** Committed sources not yet started. @type {Source[]} */
+	#unstarted;
+	/** Session helpers already defined in emitted output. @type {Partial<Record<keyof typeof RUNTIMES, boolean>>} */
+	#runtimes_emitted;
+	/** Native promise sources whose terminal operation has not been emitted. @type {number} */
+	#native_pending;
+	/** Custom nodes captured since the last atomic-cycle validation. @type {GraphNode[]} */
+	#new_custom;
+	/** Custom nodes already proven acyclic. @type {Set<GraphNode>} */
+	#validated;
+	/** Whether the head must define the block dispatch helper. @type {boolean} */
+	#emit_dispatch;
+	/** Monotonic identifier for per-region node scratch state. @type {number} */
+	#region_id;
+
 	/**
 	 * Creates an isolated server-side stream session.
 	 *
@@ -117,116 +123,100 @@ class Session {
 	 */
 	constructor(scope, id, root, replacer, options) {
 		const signal = options.signal;
-		/** Trusted assignable source expression that locates the client session table. */
-		this.scope = scope;
-		/** Unescaped key that identifies this stream inside the private table. */
-		this.id = id;
-		/** User callback that classifies custom synchronous and asynchronous values. */
-		this.replacer = replacer;
-		/** Signal that cancels server-side observation and sequence pulling. */
-		this.signal = signal;
-		/** Diagnostic callback for asynchronous outcomes that fail to serialize. */
-		this.onerror = options.onerror;
-		/** Approximate maximum bytes of generated source per tail block. */
-		this.budget = options.budget ?? 32768;
-		/** Identity graph shared by all regions; failed transactions remove provisional additions. */
-		this.graph = create_graph(root, (value, node, graph) => this.classify(value, node, graph));
-		/**
-		 * Async descriptor states discovered anywhere in the streamed graph.
-		 * @type {Set<Source>}
-		 */
-		this.sources = new Set();
-		/**
-		 * Observed events waiting for the current scheduled flush window to close.
-		 * @type {Event[]}
-		 */
-		this.ready = [];
-		/**
-		 * Finalized event batches whose boundaries no longer depend on tail consumption.
-		 * @type {Batch[]}
-		 */
-		this.batches = [];
-		/** Index of the next finalized batch that `tail.next()` will consume. */
-		this.batch_index = 0;
-		/**
-		 * Resolvers for tail reads waiting for a batch, completion, failure, or cancellation.
-		 * @type {Array<() => void>}
-		 */
-		this.waiters = [];
-		/** Monotonic observation order assigned to events before they are batched. */
-		this.sequence = 0;
-		/** Number of async sources whose terminal client operation has not yet been generated. */
-		this.active = 0;
-		/** Whether a zero-delay callback is currently scheduled to finalize ready events. */
-		this.flushing = false;
-		/** Whether committed async sources have begun observation or iteration. */
-		this.started = false;
-		/** Whether server-side observation and queued delivery have been cancelled. */
-		this.cancelled = false;
-		/**
-		 * In-flight cleanup shared by repeated cancellation requests.
-		 * @type {Promise<void> | undefined}
-		 */
-		this.cancelling = undefined;
-		/**
-		 * Fatal generation error, cancellation reason, or first cleanup failure.
-		 * @type {unknown}
-		 */
-		this.failure = undefined;
-		/** Next client anchor index; index zero is reserved for the reconstructed head root. */
-		this.anchor = 1;
-		/** Next client `pending` index used to store a descriptor's private control. */
-		this.pending = 0;
-		/** Next client `slots` index used when no stable path can retain an identity. */
-		this.slot = 0;
-		/** Next client `collections` index used for a retained Map or Set sidecar. */
-		this.collection = 0;
-		/** Next collision-proof placeholder id shared by every replacement phase. */
-		this.token = 0;
-		/** @type {Map<string, keyof typeof RUNTIMES>} */
-		this.runtime_tokens = new Map();
-		/** @type {Map<string, number>} */
-		this.promise_tokens = new Map();
-		/**
-		 * Stable AbortSignal listener that forwards the signal reason into session cancellation.
-		 * @type {() => void}
-		 */
-		this.abort = () => void this.cancel(signal?.reason);
-		signal?.addEventListener('abort', this.abort, { once: true });
-		/**
-		 * Canonical captured node for the initial graph root, also used as DevalueError context.
-		 * @type {GraphNode | undefined}
-		 */
-		this.root = undefined;
-		/** @type {Array<() => void>} */
-		this.undo = [];
-		this.transaction_depth = 0;
-		/** @type {Source[]} */
-		this.unstarted = [];
-		/**
-		 * Session helpers already defined in emitted output, keyed by runtime name.
-		 * @type {Record<string, boolean>}
-		 */
-		this.runtimes_emitted = {};
-		/** Count of native promise sources whose terminal operation has not been emitted. */
-		this.native_pending = 0;
-		/**
-		 * Custom nodes captured since the last atomic-cycle validation.
-		 * @type {GraphNode[]}
-		 */
-		this.new_custom = [];
-		/**
-		 * Custom nodes already proven acyclic.
-		 * @type {Set<GraphNode>}
-		 */
-		this.validated = new Set();
-		/**
-		 * Whether the head must define the block dispatch helper (`s.b`). Set exactly
-		 * when a non-empty tail will be returned, so the helper always pays for itself.
-		 */
-		this.emit_dispatch = false;
-		/** Monotonic identifier for per-region node scratch state (see emit_region). */
-		this.region_id = 0;
+		this.#scope = scope;
+		this.#id = id;
+		this.#replacer = replacer;
+		this.#signal = signal;
+		this.#onerror = options.onerror;
+		this.#graph = create_graph(root, (value, node, graph) => this.#classify(value, node, graph));
+		this.#sources = new Set();
+		this.#batch = [];
+		this.#batch_ready = false;
+		this.#waiters = [];
+		this.#sequence = 0;
+		this.#active = 0;
+		this.#flushing = false;
+		this.#started = false;
+		this.#cancelled = false;
+		this.#cancelling = undefined;
+		this.#failure = undefined;
+		this.#anchor = 1;
+		this.#pending = 0;
+		this.#slot = 0;
+		this.#collection = 0;
+		this.#token = 0;
+		this.#runtime_tokens = new Map();
+		this.#promise_tokens = new Map();
+		this.#abort = () => void this.#cancel(signal?.reason);
+		signal?.addEventListener('abort', this.#abort, { once: true });
+		this.#root = undefined;
+		this.#undo = [];
+		this.#transaction_depth = 0;
+		this.#unstarted = [];
+		this.#runtimes_emitted = {};
+		this.#native_pending = 0;
+		this.#new_custom = [];
+		this.#validated = new Set();
+		this.#emit_dispatch = false;
+		this.#region_id = 0;
+	}
+
+	/** @param {unknown} value @returns {Promise<UnevalStreamResult>} */
+	async serialize(value) {
+		try {
+			this.#capture(value, true);
+			this.#commit();
+			this.#validate_new_custom();
+		} catch (error) {
+			await this.#cancel(error);
+			throw this.#failure ?? error;
+		}
+		if (this.#cancelled) {
+			await this.#cancel(this.#failure);
+			throw this.#failure;
+		}
+
+		if (this.#sources.size === 0) {
+			return { head: this.#emit_region(value, false).source, tail: empty_tail(), id: this.#id };
+		}
+
+		this.#start_sources();
+		await this.#initial_window();
+		if (this.#failure) throw this.#failure;
+
+		try {
+			const head_region = this.#emit_region(value, true);
+			this.#assign_references(value, { root: 's.a[0]', segments: [] }, new Map());
+			let operations = '';
+			if (this.#batch_ready) {
+				const batch = { events: this.#batch };
+				operations += this.#emit_batch(batch, false);
+				this.#batch = [];
+				this.#batch_ready = false;
+				for (const event of batch.events) {
+					if (!event.source.needs_close) continue;
+					event.source.needs_close = false;
+					try {
+						await this.#close_sequence(event.source);
+					} catch (error) {
+						await this.#cancel(error);
+						throw this.#failure ?? error;
+					}
+				}
+				this.#consume(batch);
+			}
+			this.#start_unstarted();
+
+			if (this.#active === 0 && this.#batch.length === 0) {
+				return { head: this.#wrap_head(head_region, operations + this.#cleanup_source()), tail: empty_tail(), id: this.#id };
+			}
+
+			this.#emit_dispatch = true;
+			return { head: this.#wrap_head(head_region, operations), tail: this.#tail(), id: this.#id };
+		} catch (error) {
+			await this.#cancel(error);
+			throw this.#failure ?? error;
+		}
 	}
 
 	/**
@@ -238,9 +228,9 @@ class Session {
 	 * @param {keyof typeof RUNTIMES} key
 	 * @returns {string}
 	 */
-	runtime_token(key) {
-		const token = this.placeholder();
-		this.runtime_tokens.set(token, key);
+	#runtime_token(key) {
+		const token = this.#placeholder();
+		this.#runtime_tokens.set(token, key);
 		return token;
 	}
 
@@ -251,9 +241,9 @@ class Session {
 	 * @param {number} pending
 	 * @returns {string}
 	 */
-	promise_token(pending) {
-		const token = this.placeholder();
-		this.promise_tokens.set(token, pending);
+	#promise_token(pending) {
+		const token = this.#placeholder();
+		this.#promise_tokens.set(token, pending);
 		return token;
 	}
 
@@ -265,23 +255,23 @@ class Session {
 	 * @param {string} source
 	 * @returns {{ defs: string[], source: string }}
 	 */
-	resolve_runtime_declarations(source) {
+	#resolve_runtime_declarations(source) {
 		/** @type {string[]} */
 		const defs = [];
-		if (this.runtime_tokens.size === 0 && this.promise_tokens.size === 0) return { defs, source };
+		if (this.#runtime_tokens.size === 0 && this.#promise_tokens.size === 0) return { defs, source };
 		/** @param {keyof typeof RUNTIMES} key */
 		const define = (key) => {
-			if (this.runtimes_emitted[key]) return;
-			this.set(this.runtimes_emitted, key, true);
+			if (this.#runtimes_emitted[key]) return;
+			this.#set(this.#runtimes_emitted, key, true);
 			defs.push(`s.${key}=${RUNTIMES[key]}`);
 		};
 		const resolved = source.replace(TOKEN_PATTERN, (token) => {
-			const pending = this.promise_tokens.get(token);
+			const pending = this.#promise_tokens.get(token);
 			if (pending !== undefined) {
 				define('w');
 				return `s.w(${pending})`;
 			}
-			const key = this.runtime_tokens.get(token);
+			const key = this.#runtime_tokens.get(token);
 			if (!key) return token;
 			define(key);
 			return `s.${key}`;
@@ -289,26 +279,26 @@ class Session {
 		return { defs, source: resolved };
 	}
 
-	begin_transaction() {
-		this.transaction_depth++;
-		return { undo: this.undo.length, graph: checkpoint(this.graph) };
+	#begin_transaction() {
+		this.#transaction_depth++;
+		return { undo: this.#undo.length, graph: checkpoint(this.#graph) };
 	}
 
 	/** @param {{ undo: number, graph: import('./graph.js').Checkpoint }} marker */
-	commit_transaction(marker) {
-		this.transaction_depth--;
-		if (this.transaction_depth === 0) {
-			release_checkpoint(this.graph, marker.graph);
-			this.undo.length = marker.undo;
+	#commit_transaction(marker) {
+		this.#transaction_depth--;
+		if (this.#transaction_depth === 0) {
+			release_checkpoint(this.#graph, marker.graph);
+			this.#undo.length = marker.undo;
 		}
 	}
 
 	/** @param {{ undo: number, graph: import('./graph.js').Checkpoint }} marker */
-	rollback_transaction(marker) {
-		for (let i = this.undo.length - 1; i >= marker.undo; i--) this.undo[i]();
-		this.undo.length = marker.undo;
-		rollback(this.graph, marker.graph);
-		this.transaction_depth--;
+	#rollback_transaction(marker) {
+		for (let i = this.#undo.length - 1; i >= marker.undo; i--) this.#undo[i]();
+		this.#undo.length = marker.undo;
+		rollback(this.#graph, marker.graph);
+		this.#transaction_depth--;
 	}
 
 	/**
@@ -316,11 +306,31 @@ class Session {
 	 * @param {string} key
 	 * @param {any} value
 	 */
-	set(target, key, value) {
+	#set(target, key, value) {
 		const had = Object.hasOwn(target, key);
 		const previous = target[key];
-		if (this.transaction_depth) this.undo.push(() => had ? target[key] = previous : delete target[key]);
+		if (this.#transaction_depth) this.#undo.push(() => had ? target[key] = previous : delete target[key]);
 		target[key] = value;
+	}
+
+	#set_private(key, value) {
+		let previous;
+		const transactional = this.#transaction_depth > 0;
+		switch (key) {
+			case 'root': previous = this.#root; this.#root = value; break;
+			case 'native_pending': previous = this.#native_pending; this.#native_pending = value; break;
+			case 'pending': previous = this.#pending; this.#pending = value; break;
+			case 'collection': previous = this.#collection; this.#collection = value; break;
+			case 'slot': previous = this.#slot; this.#slot = value; break;
+			case 'anchor': previous = this.#anchor; this.#anchor = value; break;
+			case 'active': previous = this.#active; this.#active = value; break;
+		}
+		if (transactional) this.#undo.push(() => {
+			const depth = this.#transaction_depth;
+			this.#transaction_depth = 0;
+			this.#set_private(key, previous);
+			this.#transaction_depth = depth;
+		});
 	}
 
 	/**
@@ -330,15 +340,15 @@ class Session {
 	 * @param {boolean} root
 	 * @returns {GraphNode | undefined}
 	 */
-	capture(value, root = false) {
-		const marker = this.begin_transaction();
+	#capture(value, root = false) {
+		const marker = this.#begin_transaction();
 		try {
-			const node = discover(this.graph, value);
-			if (root) this.set(this, 'root', node);
-			this.commit_transaction(marker);
+			const node = discover(this.#graph, value);
+			if (root) this.#set_private('root', node);
+			this.#commit_transaction(marker);
 			return node;
 		} catch (error) {
-			this.rollback_transaction(marker);
+			this.#rollback_transaction(marker);
 			throw error;
 		}
 	}
@@ -348,22 +358,22 @@ class Session {
 	 * nodes discovered since the previous validation. Edges are immutable once captured,
 	 * so a new cycle always passes through a newly captured node.
 	 */
-	validate_new_custom() {
-		if (this.new_custom.length === 0) return;
-		const pending = this.new_custom;
-		this.new_custom = [];
+	#validate_new_custom() {
+		if (this.#new_custom.length === 0) return;
+		const pending = this.#new_custom;
+		this.#new_custom = [];
 		/** @type {Set<GraphNode>} */
 		const validating = new Set();
 		/** @param {GraphNode} node */
 		const validate = (node) => {
-			if (this.validated.has(node)) return;
-			if (validating.has(node)) throw this.error('Cannot stringify an atomic custom cycle', node.value);
+			if (this.#validated.has(node)) return;
+			if (validating.has(node)) throw this.#error('Cannot stringify an atomic custom cycle', node.value);
 			validating.add(node);
 			for (const child of node.data.tokens.values()) {
 				if (child.kind === 'Custom') validate(child);
 			}
 			validating.delete(node);
-			this.validated.add(node);
+			this.#validated.add(node);
 		};
 		for (const node of pending) validate(node);
 	}
@@ -377,15 +387,15 @@ class Session {
 	 * @param {Graph} graph
 	 * @returns {Classification | false}
 	 */
-	classify(value, node, graph) {
-		if (this.replacer) {
+	#classify(value, node, graph) {
+		if (this.#replacer) {
 			const tokens = new Map();
-			const result = this.replacer(value, (child) => {
+			const result = this.#replacer(value, (child) => {
 				if (is_primitive(child)) {
 					discover(graph, child);
 					return stringify_primitive(child);
 				}
-				const token = this.placeholder();
+				const token = this.#placeholder();
 				tokens.set(token, child);
 				return token;
 			});
@@ -399,13 +409,13 @@ class Session {
 					const captured = discover(graph, child);
 					tokens.set(token, captured);
 					edges.push(captured ? { node: captured.id } : { value: child });
-					if (captured) this.set(captured, 'opaque', true);
+					if (captured) this.#set(captured, 'opaque', true);
 				}
-				this.new_custom.push(node);
-				if (this.transaction_depth) {
-					this.undo.push(() => {
-						const index = this.new_custom.lastIndexOf(node);
-						if (index !== -1) this.new_custom.splice(index, 1);
+				this.#new_custom.push(node);
+				if (this.#transaction_depth) {
+					this.#undo.push(() => {
+						const index = this.#new_custom.lastIndexOf(node);
+						if (index !== -1) this.#new_custom.splice(index, 1);
 					});
 				}
 				return { kind: 'Custom', data: { source: result, tokens }, edges };
@@ -415,12 +425,12 @@ class Session {
 					throw new TypeError('Invalid unevalStream replacer result');
 				}
 				if (result.type === 'async-value') {
-					this.validate_value_descriptor(result);
-					return this.add_source(node, result, 'value').classification;
+					this.#validate_value_descriptor(result);
+					return this.#add_source(node, result, 'value').classification;
 				}
 				if (result.type === 'async-sequence') {
-					this.validate_sequence_descriptor(result);
-					return this.add_source(node, result, 'sequence').classification;
+					this.#validate_sequence_descriptor(result);
+					return this.#add_source(node, result, 'sequence').classification;
 				}
 				throw new TypeError('Invalid unevalStream replacer result');
 			}
@@ -436,13 +446,13 @@ class Session {
 				 *
 				 * @param {unknown} result
 				 */
-				const resolve = (result) => current.active && this.native_event(value, 'resolve', result);
+				const resolve = (result) => current.active && this.#native_event(value, 'resolve', result);
 				/**
 				 * Forwards a native Promise rejection while its provisional observer is active.
 				 *
 				 * @param {unknown} reason
 				 */
-				const reject = (reason) => current.active && this.native_event(value, 'reject', reason);
+				const reject = (reason) => current.active && this.#native_event(value, 'reject', reason);
 				const observed = promise_then.call(
 					value,
 					resolve,
@@ -453,12 +463,12 @@ class Session {
 				observer = undefined;
 			}
 			if (observer) {
-				const descriptor = native_descriptor(/** @type {Promise<unknown>} */ (value), this);
+				const descriptor = this.#native_descriptor(/** @type {Promise<unknown>} */ (value));
 				let added;
 				try {
-					added = this.add_source(node, descriptor, 'native');
-					this.set(added.state, 'observer', observer);
-					this.set(this, 'native_pending', this.native_pending + 1);
+					added = this.#add_source(node, descriptor, 'native');
+					this.#set(added.state, 'observer', observer);
+					this.#set_private('native_pending', this.#native_pending + 1);
 				} catch (error) {
 					observer.active = false;
 					throw error;
@@ -467,7 +477,7 @@ class Session {
 			}
 
 			if (Symbol.asyncIterator in value) {
-				return this.add_source(node, native_sequence_descriptor(value, this), 'sequence').classification;
+				return this.#add_source(node, this.#native_sequence_descriptor(value), 'sequence').classification;
 			}
 		}
 		return false;
@@ -481,31 +491,31 @@ class Session {
 	 * @param {'value' | 'sequence' | 'native'} type
 	 * @returns {{ state: Source, classification: Classification }}
 	 */
-	add_source(node, descriptor, type) {
+	#add_source(node, descriptor, type) {
 		let captured = false;
 		const control = () => {
 			if (captured) throw new TypeError('devalue: capture may only be called once');
 			captured = true;
-			return `s.p[${this.pending}]=$1`;
+			return `s.p[${this.#pending}]=$1`;
 		};
 		const source = descriptor.construct((/** @type {string} */ expression) =>
 			control().replace('$1', () => needs_parentheses(expression) ? `(${expression})` : expression)
 		);
 		if (typeof source !== 'string') throw new TypeError('Invalid async descriptor construct result');
-		const pending = this.pending;
-		this.set(this, 'pending', pending + 1);
+		const pending = this.#pending;
+		this.#set_private('pending', pending + 1);
 		/** @type {Source} */
 		const state = { node, descriptor, type, started: false, terminal: false, cleaned: false, active: true, flushed_pending: 0 };
 		const classification = { kind: 'Async', data: { source, pending, captured, state }, edges: [] };
-		this.sources.add(state);
-		this.unstarted.push(state);
-		if (this.transaction_depth) this.undo.push(() => {
+		this.#sources.add(state);
+		this.#unstarted.push(state);
+		if (this.#transaction_depth) this.#undo.push(() => {
 			state.active = false;
 			if (state.observer) state.observer.active = false;
-			this.unstarted.splice(this.unstarted.lastIndexOf(state), 1);
-			if (!this.cancelled) this.sources.delete(state);
+			this.#unstarted.splice(this.#unstarted.lastIndexOf(state), 1);
+			if (!this.#cancelled) this.#sources.delete(state);
 		});
-		if (this.signal?.aborted) throw this.signal.reason;
+		if (this.#signal?.aborted) throw this.#signal.reason;
 		return { state, classification };
 	}
 
@@ -516,13 +526,50 @@ class Session {
 	 * @param {'resolve' | 'reject'} type
 	 * @param {unknown} result
 	 */
-	native_event(value, type, result) {
-		const node = this.graph.identities.get(/** @type {object} */ (value));
+	#native_event(value, type, result) {
+		const node = this.#graph.identities.get(/** @type {object} */ (value));
 		if (!node) return;
 		const source = node.kind === 'Async' ? node.data.state : undefined;
 		if (!source?.active) return;
-		if (source?.started) this.event(source, type, result);
+		if (source?.started) this.#event(source, type, result);
 		else if (source) source.early = [type, result];
+	}
+
+	/** @param {Promise<unknown>} promise @returns {AsyncValueDescriptor & { manages_pending: true }} */
+	#native_descriptor(promise) {
+		let pending = -1;
+		const settle = (reference, which, value) => {
+			const remaining = this.#native_pending;
+			this.#set_private('native_pending', remaining - 1);
+			if (this.#runtimes_emitted.r || remaining >= 3) {
+				return `${this.#runtime_token('r')}(${pending},${which},${value})`;
+			}
+			return `${reference.control}[${which}](${value});delete ${reference.control}`;
+		};
+		return {
+			type: 'async-value',
+			source: promise,
+			manages_pending: true,
+			construct: (capture) => {
+				capture('[a,b]');
+				pending = this.#pending;
+				return this.#promise_token(pending);
+			},
+			resolve: (reference, value) => settle(reference, 0, value),
+			reject: (reference, reason) => settle(reference, 1, reason)
+		};
+	}
+
+	/** @param {object} source @returns {AsyncSequenceDescriptor} */
+	#native_sequence_descriptor(source) {
+		return {
+			type: 'async-sequence',
+			source: /** @type {AsyncIterable<unknown, unknown, unknown>} */ (source),
+			construct: (capture) => `${this.#runtime_token('f')}(g=>{${capture('g')}})`,
+			next: ({ control }, value) => `${control}(0,${value})`,
+			complete: ({ control }, value) => `${control}(1,${value})`,
+			error: ({ control }, reason) => `${control}(2,${reason})`
+		};
 	}
 
 	/**
@@ -530,7 +577,7 @@ class Session {
 	 *
 	 * @param {any} descriptor
 	 */
-	validate_value_descriptor(descriptor) {
+	#validate_value_descriptor(descriptor) {
 		if ((typeof descriptor.source !== 'object' || descriptor.source === null) && typeof descriptor.source !== 'function') {
 			throw new TypeError('Invalid async-value source');
 		}
@@ -547,7 +594,7 @@ class Session {
 	 *
 	 * @param {any} descriptor
 	 */
-	validate_sequence_descriptor(descriptor) {
+	#validate_sequence_descriptor(descriptor) {
 		if ((typeof descriptor.source !== 'object' || descriptor.source === null) && typeof descriptor.source !== 'function') {
 			throw new TypeError('Invalid async-sequence source');
 		}
@@ -563,24 +610,24 @@ class Session {
 	 * Commits initial capture and initializes the count of client values awaiting termination.
 	 *
 	 */
-	commit() {
-		this.active = this.sources.size;
+	#commit() {
+		this.#active = this.#sources.size;
 	}
 
 	/** Starts every committed source unless the constructor's AbortSignal listener has cancelled the session. */
-	start_sources() {
-		this.started = true;
-		if (this.signal?.aborted) {
-			void this.cancel(this.signal.reason);
+	#start_sources() {
+		this.#started = true;
+		if (this.#signal?.aborted) {
+			void this.#cancel(this.#signal.reason);
 			return;
 		}
-		this.start_unstarted();
+		this.#start_unstarted();
 	}
 
-	start_unstarted() {
-		const sources = this.unstarted;
-		this.unstarted = [];
-		for (const source of sources) this.start(source);
+	#start_unstarted() {
+		const sources = this.#unstarted;
+		this.#unstarted = [];
+		for (const source of sources) this.#start(source);
 	}
 
 	/**
@@ -588,15 +635,15 @@ class Session {
 	 *
 	 * @param {Source} source
 	 */
-	start(source) {
-		if (source.started || this.cancelled) return;
+	#start(source) {
+		if (source.started || this.#cancelled) return;
 		source.started = true;
 		if (source.type === 'sequence') {
-			this.start_sequence(source);
+			this.#start_sequence(source);
 			return;
 		}
 		if (source.type === 'native') {
-			if (source.early) this.event(source, source.early[0], source.early[1]);
+			if (source.early) this.#event(source, source.early[0], source.early[1]);
 			return;
 		}
 		try {
@@ -609,11 +656,11 @@ class Session {
 					reject(error);
 				}
 			}).then(
-				(value) => this.event(source, 'resolve', value),
-				(reason) => this.event(source, 'reject', reason)
+				(value) => this.#event(source, 'resolve', value),
+				(reason) => this.#event(source, 'reject', reason)
 			);
 		} catch (error) {
-			this.event(source, 'reject', error);
+			this.#event(source, 'reject', error);
 		}
 	}
 
@@ -622,7 +669,7 @@ class Session {
 	 *
 	 * @param {Source} source
 	 */
-	start_sequence(source) {
+	#start_sequence(source) {
 		try {
 			const method = source.descriptor.source[Symbol.asyncIterator];
 			if (typeof method !== 'function') throw new TypeError('async iterator is not callable');
@@ -634,9 +681,9 @@ class Session {
 			if (typeof next !== 'function') throw new TypeError('async iterator next is not callable');
 			source.iterator = iterator;
 			source.next = next;
-			this.pull(source);
+			this.#pull(source);
 		} catch (error) {
-			this.event(source, 'error', error);
+			this.#event(source, 'error', error);
 		}
 	}
 
@@ -645,8 +692,8 @@ class Session {
 	 *
 	 * @param {Source} source
 	 */
-	pull(source) {
-		if (source.terminal || source.pulling || this.cancelled) return;
+	#pull(source) {
+		if (source.terminal || source.pulling || this.#cancelled) return;
 		source.pulling = true;
 		source.pulled = new Promise((resolve) => {
 			source.pulled_resolve = resolve;
@@ -659,7 +706,7 @@ class Session {
 		const next = source.next;
 		if (!next) {
 			finish();
-			this.event(source, 'error', new TypeError('async iterator next is not callable'));
+			this.#event(source, 'error', new TypeError('async iterator next is not callable'));
 			return;
 		}
 		let result;
@@ -667,27 +714,27 @@ class Session {
 			result = next.call(source.iterator);
 		} catch (error) {
 			finish();
-			this.event(source, 'error', error);
+			this.#event(source, 'error', error);
 			return;
 		}
 		Promise.resolve(result).then(
 			(result) => {
 				finish();
-				if (source.terminal || this.cancelled) return;
+				if (source.terminal || this.#cancelled) return;
 				try {
 					if ((typeof result !== 'object' || result === null) && typeof result !== 'function') {
 						throw new TypeError('async iterator result is not an object');
 					}
 					const done = result.done;
 					const value = result.value;
-					this.event(source, done ? 'complete' : 'next', value);
+					this.#event(source, done ? 'complete' : 'next', value);
 				} catch (error) {
-					this.event(source, 'error', error);
+					this.#event(source, 'error', error);
 				}
 			},
 			(error) => {
 				finish();
-				this.event(source, 'error', error);
+				this.#event(source, 'error', error);
 			}
 		);
 	}
@@ -699,27 +746,27 @@ class Session {
 	 * @param {Event['type']} type
 	 * @param {unknown} value
 	 */
-	event(source, type, value) {
-		if (source.terminal || this.cancelled) return;
+	#event(source, type, value) {
+		if (source.terminal || this.#cancelled) return;
 		if (type !== 'next') {
 			source.terminal = true;
 		}
-		const event = { source, type, value, sequence: this.sequence++, invalid: false };
-		const source_count = this.sources.size;
+		const event = { source, type, value, sequence: this.#sequence++, invalid: false };
+		const source_count = this.#sources.size;
 		try {
-			this.capture(value);
-			this.validate_new_custom();
-			this.active += this.sources.size - source_count;
+			this.#capture(value);
+			this.#validate_new_custom();
+			this.#active += this.#sources.size - source_count;
 		} catch (error) {
-			this.report(error, value);
+			this.#report(error, value);
 			event.type = source.type === 'sequence' ? 'error' : 'reject';
 			event.value = undefined;
 			event.invalid = true;
 		}
-		this.ready.push(event);
-		if (!this.flushing) {
-			this.flushing = true;
-			setTimeout(() => this.flush(), 0);
+		this.#batch.push(event);
+		if (!this.#flushing) {
+			this.#flushing = true;
+			setTimeout(() => this.#flush(), 0);
 		}
 		// Iterators contribute at most one item to each batch. The next pull starts when
 		// this batch is consumed, preventing an immediately-ready iterator from starving
@@ -732,29 +779,27 @@ class Session {
 	 *
 	 * @param {Batch} batch
 	 */
-	consume(batch) {
+	#consume(batch) {
 		for (const event of batch.events) event.source.flushed_pending--;
 		for (const event of batch.events) {
-			if (event.type === 'next' && event.source.flushed_pending === 0) this.pull(event.source);
+			if (event.type === 'next' && event.source.flushed_pending === 0) this.#pull(event.source);
 		}
 	}
 
-	/** Finalizes the current ready events as one ordered batch and wakes waiting tail reads. */
-	flush() {
-		this.flushing = false;
-		if (this.cancelled || this.ready.length === 0) return;
-		const events = this.ready;
-		this.ready = [];
-		events.sort((a, b) => a.sequence - b.sequence);
-		for (const event of events) event.source.flushed_pending++;
-		this.batches.push({ events });
-		this.notify();
+	/** Finalizes the current events as one ordered batch and wakes waiting tail reads. */
+	#flush() {
+		this.#flushing = false;
+		if (this.#cancelled || this.#batch.length === 0) return;
+		this.#batch.sort((a, b) => a.sequence - b.sequence);
+		for (const event of this.#batch) event.source.flushed_pending++;
+		this.#batch_ready = true;
+		this.#notify();
 	}
 
 	/** Waits for the same scheduled flush window used by tail batches before freezing the head. */
-	initial_window() {
+	#initial_window() {
 		return new Promise(/** @param {(value?: void | PromiseLike<void>) => void} resolve */ (resolve) => {
-			const settle = () => setTimeout(() => this.flushing ? settle() : resolve(), 0);
+			const settle = () => setTimeout(() => this.#flushing ? settle() : resolve(), 0);
 			settle();
 		});
 	}
@@ -767,17 +812,17 @@ class Session {
 	 * @param {Set<GraphNode>} [references]
 	 * @returns {{ source: string, tokens: Map<string, { node: GraphNode, reference: Reference }> }}
 	 */
-	emit_region(value, persistent, references) {
+	#emit_region(value, persistent, references) {
 		/** Canonical node list; recorded edges resolve through indices rather than identity lookups. */
-		const nodes_list = this.graph.nodes;
-		const identities = this.graph.identities;
+		const nodes_list = this.#graph.nodes;
+		const identities = this.#graph.identities;
 		/** Resolves a recorded edge to its node, or undefined for a primitive edge. @param {{ node: number } | { value: unknown }} reference */
 		const node_of = (reference) => 'node' in reference ? /** @type {GraphNode} */ (nodes_list[reference.node]) : undefined;
 
 		// Region-local analysis state lives in scratch fields on the nodes themselves,
 		// tagged with a fresh id instead of per-region Maps/Sets keyed by node.
 		// `node.region_id === region_id` means "included in this region".
-		const region_id = ++this.region_id;
+		const region_id = ++this.#region_id;
 		/** @type {GraphNode[]} */
 		const order = [];
 		/** @param {GraphNode | undefined} node */
@@ -951,7 +996,7 @@ class Session {
 		const expression = (thing) => {
 			if (is_primitive(thing)) return stringify_primitive(thing);
 			const node = identities.get(/** @type {object} */ (thing));
-			if (!node) throw this.error('Cannot stringify value', thing);
+			if (!node) throw this.#error('Cannot stringify value', thing);
 			return expression_node(node);
 		};
 		/**
@@ -962,7 +1007,7 @@ class Session {
 			if (node.reference && node.region_id !== region_id) {
 				references?.add(node);
 				if (references) {
-					const token = this.placeholder();
+					const token = this.#placeholder();
 					tokens.set(token, { node, reference: node.reference });
 					return token;
 				}
@@ -970,7 +1015,7 @@ class Session {
 			}
 			if (node.region_id === region_id && node.name) return node.name;
 			// `rendering` guards against unexpected re-entry while expanding inline.
-			if (node.rendering) throw this.error('Cannot stringify value', node.value);
+			if (node.rendering) throw this.#error('Cannot stringify value', node.value);
 			node.rendering = true;
 			try {
 				return inline(node);
@@ -1045,7 +1090,7 @@ class Session {
 						for (const [key, child] of node.data.entries) fill.push(`${name}.set(${expression_ref(key)},${expression_ref(child)})`);
 						break;
 					default:
-						throw this.error('Cannot stringify value', node.value);
+						throw this.#error('Cannot stringify value', node.value);
 				}
 			} else if (name) {
 				// A child can be embedded in this declaration if its expansion never reaches
@@ -1118,12 +1163,12 @@ class Session {
 				const elements = (node.kind === 'Set' ? node.data.values : node.data.entries.flat())
 					.filter((/** @type {{ node: number } | { value: unknown }} */ child) => 'node' in child);
 				if (elements.length) {
-					const index = this.collection;
-					this.set(this, 'collection', index + 1);
+					const index = this.#collection;
+					this.#set_private('collection', index + 1);
 					sidecars.push(`s.c[${index}]=[${elements.map(expression_ref).join(',')}]`);
 					for (let i = 0; i < elements.length; i++) {
 						const child = elements[i];
-						this.reference_node(/** @type {GraphNode} */ (nodes_list[child.node]), { root: `s.c[${index}]`, segments: [`[${i}]`] });
+						this.#reference_node(/** @type {GraphNode} */ (nodes_list[child.node]), { root: `s.c[${index}]`, segments: [`[${i}]`] });
 					}
 				}
 			}
@@ -1133,11 +1178,11 @@ class Session {
 		if (persistent) {
 			for (const node of order) {
 				if (!node.opaque) continue;
-				const index = this.slot;
-				this.set(this, 'slot', index + 1);
+				const index = this.#slot;
+				this.#set_private('slot', index + 1);
 				slots.push(`s.s[${index}]=${node.name}`);
-				this.set(node, 'reference', { root: `s.s[${index}]`, segments: [] });
-				this.assign_references(node.value, node.reference, new Map());
+				this.#set(node, 'reference', { root: `s.s[${index}]`, segments: [] });
+				this.#assign_references(node.value, node.reference, new Map());
 			}
 		}
 		const all_declarations = early_declarations.concat(declarations);
@@ -1160,10 +1205,10 @@ class Session {
 	 * @param {unknown} value
 	 * @param {Reference} reference
 	 */
-	reference(value, reference) {
+	#reference(value, reference) {
 		if (!is_primitive(value)) {
-			const node = this.graph.identities.get(/** @type {object} */ (value));
-			if (node) this.reference_node(node, reference);
+			const node = this.#graph.identities.get(/** @type {object} */ (value));
+			if (node) this.#reference_node(node, reference);
 		}
 	}
 
@@ -1171,9 +1216,9 @@ class Session {
 	 * @param {GraphNode} node
 	 * @param {Reference} reference
 	 */
-	reference_node(node, reference) {
+	#reference_node(node, reference) {
 		if (!node.reference || reference_length(reference) < reference_length(node.reference)) {
-			this.set(node, 'reference', reference);
+			this.#set(node, 'reference', reference);
 		}
 	}
 
@@ -1184,10 +1229,10 @@ class Session {
 	 * @param {Reference} reference
 	 * @param {Map<GraphNode, number>} seen
 	 */
-	assign_references(value, reference, seen) {
+	#assign_references(value, reference, seen) {
 		if (is_primitive(value)) return;
-		const node = this.graph.identities.get(/** @type {object} */ (value));
-		if (node) this.assign_references_node(node, reference, seen);
+		const node = this.#graph.identities.get(/** @type {object} */ (value));
+		if (node) this.#assign_references_node(node, reference, seen);
 	}
 
 	/**
@@ -1195,24 +1240,24 @@ class Session {
 	 * @param {Reference} reference
 	 * @param {Map<GraphNode, number>} seen
 	 */
-	assign_references_node(node, reference, seen) {
-		this.reference_node(node, reference);
+	#assign_references_node(node, reference, seen) {
+		this.#reference_node(node, reference);
 		const length = reference_length(reference);
 		const previous = seen.get(node);
 		if (previous !== undefined && previous <= length) return;
 		seen.set(node, length);
-		const nodes_list = this.graph.nodes;
+		const nodes_list = this.#graph.nodes;
 		if (node.kind === 'Array') {
 			for (const [key, child] of node.data.entries) {
-				if ('node' in child) this.assign_references_node(nodes_list[child.node], append_reference(reference, `[${key}]`), seen);
+				if ('node' in child) this.#assign_references_node(nodes_list[child.node], append_reference(reference, `[${key}]`), seen);
 			}
 		} else if (node.kind === 'Object' || node.kind === 'NullObject') {
 			for (const [key, child] of node.data.entries) {
-				if ('node' in child) this.assign_references_node(nodes_list[child.node], append_reference(reference, prop(key)), seen);
+				if ('node' in child) this.#assign_references_node(nodes_list[child.node], append_reference(reference, prop(key)), seen);
 			}
 		} else if (is_view(node.kind)) {
 			const buffer = node.data.buffer;
-			if ('node' in buffer) this.assign_references_node(nodes_list[buffer.node], append_reference(reference, '.buffer'), seen);
+			if ('node' in buffer) this.#assign_references_node(nodes_list[buffer.node], append_reference(reference, '.buffer'), seen);
 		}
 	}
 
@@ -1224,16 +1269,16 @@ class Session {
 	 * @param {string} [operations]
 	 * @returns {string}
 	 */
-	wrap_head(region, operations = '') {
-		const scope = this.scope;
-		const id = stringify_string(this.id);
+	#wrap_head(region, operations = '') {
+		const scope = this.#scope;
+		const id = stringify_string(this.#id);
 		// The dispatch helper is only defined when a tail exists; every tail block calls
 		// it to receive `s`/`n`, replacing a longer per-block lookup preamble.
-		const dispatch = this.emit_dispatch ? ';s.b=f=>f(s,n)' : '';
+		const dispatch = this.#emit_dispatch ? ';s.b=f=>f(s,n)' : '';
 		const table = `let n=${scope}||(${scope}={__proto__:null}),s=n[${id}]={a:[],s:[],c:[],p:[]}${dispatch}`;
 		// Resolve in evaluation order: the root region runs before folded operations.
-		const resolved_region = this.resolve_runtime_declarations(region.source);
-		const resolved_operations = this.resolve_runtime_declarations(operations);
+		const resolved_region = this.#resolve_runtime_declarations(region.source);
+		const resolved_operations = this.#resolve_runtime_declarations(operations);
 		const defs = resolved_region.defs.concat(resolved_operations.defs);
 		const prelude = defs.length ? `;${defs.join(';')}` : '';
 		operations = resolved_operations.source;
@@ -1247,8 +1292,8 @@ class Session {
 	 *
 	 * @returns {string}
 	 */
-	cleanup_source() {
-		const id = stringify_string(this.id);
+	#cleanup_source() {
+		const id = stringify_string(this.#id);
 		return `delete n[${id}]`;
 	}
 
@@ -1259,28 +1304,20 @@ class Session {
 	 * @param {boolean} block
 	 * @returns {string}
 	 */
-	emit_batch(batch, block = true) {
-		const prefix = block ? `;${this.scope}[${stringify_string(this.id)}].b((s,n)=>{` : '';
-		const marker = this.begin_transaction();
+	#emit_batch(batch, block = true) {
+		const prefix = block ? `;${this.#scope}[${stringify_string(this.#id)}].b((s,n)=>{` : '';
+		const marker = this.#begin_transaction();
 		const operations = [];
 		/** @type {Set<GraphNode>} */
 		const references = new Set();
-		let cost = 0;
 		try {
-		for (const [index, event] of batch.events.entries()) {
-			// Split an over-budget batch: emit what fits, requeue the rest as the next batch.
-			// A single oversized operation still ships whole, so blocks may exceed the budget.
-			if (index > 0 && cost >= this.budget) {
-				this.batches.splice(this.batch_index, 0, { events: batch.events.slice(index) });
-				batch.events = batch.events.slice(0, index);
-				break;
-			}
+		for (const event of batch.events) {
 			const source = event.source;
 			const node = source.node;
 			const operations_before = operations.length;
 			references.add(node);
-			const target_token = this.placeholder();
-			const control_token = node.data.captured ? this.placeholder() : undefined;
+			const target_token = this.#placeholder();
+			const control_token = node.data.captured ? this.#placeholder() : undefined;
 			const reference = {
 				target: target_token,
 				control: control_token
@@ -1291,27 +1328,27 @@ class Session {
 			if (!event.invalid) {
 				// Persistent: async outcomes must retain Map/Set element and opaque custom
 				// child identities for future regions, exactly like the head region.
-				const region = this.emit_region(event.value, true, references);
+				const region = this.#emit_region(event.value, true, references);
 				value_source = region.source;
 				if (!is_primitive(event.value)) {
-					const index = this.anchor;
-					this.set(this, 'anchor', index + 1);
-					this.assign_references(event.value, { root: `s.a[${index}]`, segments: [] }, new Map());
+					const index = this.#anchor;
+					this.#set_private('anchor', index + 1);
+					this.#assign_references(event.value, { root: `s.a[${index}]`, segments: [] }, new Map());
 					const name = `s.a[${index}]`;
 					// Implicit anchoring: anchor indices are allocated monotonically and every
 					// allocated index is written exactly once in allocation order, so once the
 					// push helper pays for itself the client can derive the index positionally
 					// (`s.a.push`) instead of receiving it as an explicit assignment. Explicit
 					// writes before the switch keep `s.a` dense, so mixing both forms is safe.
-					const use_helper = this.runtimes_emitted.v || index > 5;
+					const use_helper = this.#runtimes_emitted.v || index > 5;
 					const write = use_helper
-						? `${this.runtime_token('v')}(${region.source})`
+						? `${this.#runtime_token('v')}(${region.source})`
 						: `${name}=${region.source}`;
 					// Defer the anchor write: when the operation uses the value exactly
 					// once, the write is folded into that use site. A helper call is a
 					// primary expression; only the assignment form needs parentheses.
 					anchor = { name, write, folded: use_helper ? write : `(${write})`, tokens: region.tokens };
-					value_source = this.placeholder();
+					value_source = this.#placeholder();
 				}
 			} else {
 				value_source = generic_error;
@@ -1338,7 +1375,7 @@ class Session {
 				operations.push({ source: operation, tokens });
 			} catch (error) {
 				if (event.type === 'resolve' || event.type === 'next' || event.type === 'complete') {
-					this.report(error, event.value);
+					this.#report(error, event.value);
 					// The outcome's identities were assigned anchor references, so the anchor
 					// must still ship even though the operation falls back to a generic error.
 					if (anchor) operations.push({ source: anchor.write, tokens: anchor.tokens });
@@ -1347,7 +1384,7 @@ class Session {
 						: source.descriptor.reject(reference, generic_error);
 					if (typeof fallback !== 'string') throw new TypeError('Invalid async descriptor operation');
 					operations.push({ source: fallback, tokens: operation_tokens(node, target_token, control_token) });
-					this.set(event, 'type', source.type === 'sequence' ? 'error' : 'reject');
+					this.#set(event, 'type', source.type === 'sequence' ? 'error' : 'reject');
 				} else {
 					throw error;
 				}
@@ -1356,28 +1393,27 @@ class Session {
 				operations.push({ source: `delete s.p[${node.data.pending}]`, tokens: new Map() });
 			}
 			if (event.type !== 'next') {
-				this.set(this, 'active', this.active - 1);
-				if (source.type === 'sequence' && event.type === 'error') this.set(source, 'needs_close', true);
+				this.#set_private('active', this.#active - 1);
+				if (source.type === 'sequence' && event.type === 'error') this.#set(source, 'needs_close', true);
 			}
-			for (let i = operations_before; i < operations.length; i++) cost += operations[i].source.length + 1;
 		}
-		const rendered = this.render_operations(operations, references);
-		if (block && this.active === 0 && this.ready.length === 0 && this.batch_index === this.batches.length) {
-			rendered.push(this.cleanup_source());
+		const rendered = this.#render_operations(operations, references);
+		if (block && this.#active === 0 && this.#batch.length === 0) {
+			rendered.push(this.#cleanup_source());
 		}
 		let body = rendered.join(';');
 		if (block) {
 			// Standalone blocks are final output; resolve helper placeholders here so every
 			// definition is evaluated in the same block as (and before) its first use.
 			// Head-folded operations are resolved later by wrap_head instead.
-			const resolved = this.resolve_runtime_declarations(body);
+			const resolved = this.#resolve_runtime_declarations(body);
 			body = resolved.defs.length ? `${resolved.defs.join(';')};${resolved.source}` : resolved.source;
 		}
 		const result = prefix + body + (block ? '})' : rendered.length ? ';' : '');
-		this.commit_transaction(marker);
+		this.#commit_transaction(marker);
 		return result;
 		} catch (error) {
-			this.rollback_transaction(marker);
+			this.#rollback_transaction(marker);
 			throw error;
 		}
 	}
@@ -1389,7 +1425,7 @@ class Session {
 	 * @param {Array<{ source: string, tokens: Map<string, { node?: GraphNode, reference?: Reference, source?: string }> }>} operations
 	 * @param {Set<GraphNode>} references
 	 */
-	render_operations(operations, references) {
+	#render_operations(operations, references) {
 		const uses = new Map();
 		const imported_references = new Map();
 		const pattern = TOKEN_PATTERN;
@@ -1416,12 +1452,12 @@ class Session {
 		const aliases = new Map();
 		const prefix = [];
 		for (const { node, path, uses } of candidates) {
-			const slot = `s.s[${this.slot}]`;
+			const slot = `s.s[${this.#slot}]`;
 			if (`${slot}=${path};`.length + slot.length * uses >= path.length * uses) continue;
-			this.set(this, 'slot', this.slot + 1);
+			this.#set_private('slot', this.#slot + 1);
 			prefix.push(`${slot}=${path}`);
 			aliases.set(node, slot);
-			this.set(node, 'reference', { root: slot, segments: [] });
+			this.#set(node, 'reference', { root: slot, segments: [] });
 		}
 		return prefix.concat(operations.map((operation) => {
 			if (operation.tokens.size === 0) return operation.source;
@@ -1442,17 +1478,17 @@ class Session {
 	 *
 	 * @returns {string}
 	 */
-	placeholder() {
-		return `"${this.token++}"`;
+	#placeholder() {
+		return `"${this.#token++}"`;
 	}
 
 	/**
 	 * Creates the one-shot async iterator that renders finalized batches as executable
-	 * blocks and drives sequence backpressure as those batches are dequeued.
+	 * blocks and drives sequence backpressure as each batch is dequeued.
 	 *
 	 * @returns {UnevalStreamTail}
 	 */
-	tail() {
+	#tail() {
 		const session = this;
 		let pending = false;
 		/** @type {Promise<IteratorResult<string, void>> | undefined} */
@@ -1471,14 +1507,14 @@ class Session {
 			async return() {
 				if (done) return { done: true, value: undefined };
 				done = true;
-				const cancelling = session.cancel();
+				const cancelling = session.#cancel();
 				if (advancing) {
 					try {
 						await advancing;
 					} catch {}
 				}
 				await cancelling;
-				if (session.failure) throw session.failure;
+				if (session.#failure) throw session.#failure;
 				return { done: true, value: undefined };
 			}
 		};
@@ -1486,50 +1522,48 @@ class Session {
 		/** @returns {Promise<IteratorResult<string, void>>} */
 		async function advance() {
 				if (done) {
-					if (session.failure) throw session.failure;
+					if (session.#failure) throw session.#failure;
 					return { done: true, value: undefined };
 				}
 				pending = true;
 				try {
-		while (session.batch_index === session.batches.length && session.active > 0 && !session.failure && !session.cancelled) {
-						await new Promise(/** @param {(value?: void | PromiseLike<void>) => void} resolve */ (resolve) => session.waiters.push(resolve));
+					while (!session.#batch_ready && session.#active > 0 && !session.#failure && !session.#cancelled) {
+						await new Promise(/** @param {(value?: void | PromiseLike<void>) => void} resolve */ (resolve) => session.#waiters.push(resolve));
 					}
-					if (session.failure) throw session.failure;
-					if (session.cancelled) {
-						await session.cancelling;
+					if (session.#failure) throw session.#failure;
+					if (session.#cancelled) {
+						await session.#cancelling;
 						done = true;
-						if (session.failure) throw session.failure;
+						if (session.#failure) throw session.#failure;
 						return { done: true, value: undefined };
 					}
-					const batch = session.batches[session.batch_index++];
-					if (!batch) {
+					if (!session.#batch_ready) {
 						done = true;
 						return { done: true, value: undefined };
 					}
+					const batch = { events: session.#batch };
+					session.#batch = [];
+					session.#batch_ready = false;
 					let block;
 					try {
-						block = session.emit_batch(batch);
+						block = session.#emit_batch(batch);
 					} catch (error) {
-						await session.cancel(error);
-						throw session.failure ?? error;
-					}
-					if (session.batch_index > 1024 && session.batch_index * 2 >= session.batches.length) {
-						session.batches = session.batches.slice(session.batch_index);
-						session.batch_index = 0;
+						await session.#cancel(error);
+						throw session.#failure ?? error;
 					}
 					let close_failure;
 					for (const event of batch.events) {
 						if (!event.source.needs_close) continue;
 						event.source.needs_close = false;
 						try {
-							await session.close_sequence(event.source);
+							await session.#close_sequence(event.source);
 						} catch (error) {
 							close_failure ??= error;
 						}
 					}
-					session.start_unstarted();
-					session.consume(batch);
-					if (close_failure) session.fail(close_failure);
+					session.#start_unstarted();
+					session.#consume(batch);
+					if (close_failure) session.#fail(close_failure);
 					return { done: false, value: block };
 				} finally {
 					pending = false;
@@ -1538,9 +1572,9 @@ class Session {
 	}
 
 	/** Wakes every tail read currently waiting for delivery or lifecycle state to change. */
-	notify() {
-		const waiters = this.waiters;
-		this.waiters = [];
+	#notify() {
+		const waiters = this.#waiters;
+		this.#waiters = [];
 		for (const resolve of waiters) resolve();
 	}
 
@@ -1550,12 +1584,12 @@ class Session {
 	 * @param {unknown} [reason]
 	 * @returns {Promise<void>}
 	 */
-	async cancel(reason) {
-		if (this.cancelling) return this.cancelling;
-		this.cancelled = true;
-		this.notify();
-		this.cancelling = this.cleanup(reason);
-		return this.cancelling;
+	async #cancel(reason) {
+		if (this.#cancelling) return this.#cancelling;
+		this.#cancelled = true;
+		this.#notify();
+		this.#cancelling = this.#cleanup(reason);
+		return this.#cancelling;
 	}
 
 	/**
@@ -1563,16 +1597,16 @@ class Session {
 	 *
 	 * @param {unknown} reason
 	 */
-	async cleanup(reason) {
-		this.signal?.removeEventListener('abort', this.abort);
+	async #cleanup(reason) {
+		this.#signal?.removeEventListener('abort', this.#abort);
 		let failure;
-		for (const source of this.sources) {
+		for (const source of this.#sources) {
 			if (source.cleaned) continue;
 			source.cleaned = true;
 			source.active = false;
 			if (source.observer) source.observer.active = false;
 			try {
-				await this.close_sequence(source);
+				await this.#close_sequence(source);
 			} catch (error) {
 				failure ??= error;
 			}
@@ -1582,11 +1616,10 @@ class Session {
 				failure ??= error;
 			}
 		}
-		this.ready = [];
-		this.batches = [];
-		this.batch_index = 0;
-		this.failure ??= failure ?? reason;
-		this.notify();
+		this.#batch = [];
+		this.#batch_ready = false;
+		this.#failure ??= failure ?? reason;
+		this.#notify();
 	}
 
 	/**
@@ -1594,7 +1627,7 @@ class Session {
 	 *
 	 * @param {Source} source
 	 */
-	async close_sequence(source) {
+	async #close_sequence(source) {
 		if (source.iterator_closed || !source.iterator) return;
 		source.iterator_closed = true;
 		const method = source.iterator.return;
@@ -1614,9 +1647,9 @@ class Session {
 	 * @param {unknown} error
 	 * @param {unknown} value
 	 */
-	report(error, value) {
+	#report(error, value) {
 		try {
-			this.onerror?.(error, value);
+			this.#onerror?.(error, value);
 		} catch {}
 	}
 
@@ -1625,9 +1658,9 @@ class Session {
 	 *
 	 * @param {unknown} error
 	 */
-	fail(error) {
-		this.failure = error;
-		void this.cancel(error);
+	#fail(error) {
+		this.#failure = error;
+		void this.#cancel(error);
 	}
 
 	/**
@@ -1637,8 +1670,8 @@ class Session {
 	 * @param {unknown} value
 	 * @returns {DevalueError}
 	 */
-	error(message, value) {
-		return new DevalueError(message, [], value, this.root?.value);
+	#error(message, value) {
+		return new DevalueError(message, [], value, this.#root?.value);
 	}
 }
 
@@ -1826,50 +1859,6 @@ function count_occurrences(source, value) {
 }
 
 /**
- * Adapts a native Promise to the private one-shot descriptor protocol.
- *
- * @param {Promise<unknown>} promise
- * @param {Session} session
- * @returns {AsyncValueDescriptor & { manages_pending: true }}
- */
-function native_descriptor(promise, session) {
-	/** Pending slot index, fixed when `construct` runs during `add_source`. */
-	let pending = -1;
-	/**
-	 * Emits a settlement at generation time, using the shared `s.r` helper once it is
-	 * (or becomes) profitable and the direct pending-slot protocol otherwise.
-	 *
-	 * @param {{ control?: string }} reference
-	 * @param {0 | 1} which
-	 * @param {string} value
-	 */
-	const settle = ({ control }, which, value) => {
-		const remaining = session.native_pending;
-		session.set(session, 'native_pending', remaining - 1);
-		if (session.runtimes_emitted.r || remaining >= 3) {
-			return `${session.runtime_token('r')}(${pending},${which},${value})`;
-		}
-		return `${control}[${which}](${value});delete ${control}`;
-	};
-	return {
-		type: 'async-value',
-		source: promise,
-		// Every native settlement deletes its own pending slot, so the generic
-		// post-operation `delete s.p[n]` must not be emitted for this descriptor.
-		manages_pending: true,
-		construct: (capture) => {
-			// The client stores `[resolve, reject]` in the pending slot whichever form the
-			// placeholder resolves to; capture is invoked purely to mark the slot as taken.
-			capture('[a,b]');
-			pending = session.pending;
-			return session.promise_token(pending);
-		},
-		resolve: (reference, value) => settle(reference, 0, value),
-		reject: (reference, reason) => settle(reference, 1, reason)
-	};
-}
-
-/**
  * The shared client queue runtime backing every reconstructed native AsyncIterable.
  * A session ships this text once; later sequences reference `s.f` directly.
  */
@@ -1892,24 +1881,6 @@ const RUNTIMES = {
 	/** Anchors a value at the next positional index (mirrors the server's counter). */
 	v: 'v=>(s.a.push(v),v)'
 };
-
-/**
- * Adapts an AsyncIterable to a buffered client AsyncIterableIterator descriptor.
- *
- * @param {object} source
- * @param {Session} session
- * @returns {AsyncSequenceDescriptor}
- */
-function native_sequence_descriptor(source, session) {
-	return {
-		type: 'async-sequence',
-		source: /** @type {AsyncIterable<unknown, unknown, unknown>} */ (source),
-		construct: (capture) => `${session.runtime_token('f')}(g=>{${capture('g')}})`,
-		next: ({ control }, value) => `${control}(0,${value})`,
-		complete: ({ control }, value) => `${control}(1,${value})`,
-		error: ({ control }, reason) => `${control}(2,${reason})`
-	};
-}
 
 const ID_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 

@@ -247,12 +247,6 @@ export interface UnevalStreamOptions {
 	 * continues either way.
 	 */
 	onerror?: (error: unknown, value: unknown) => void;
-	/**
-	 * Approximate maximum bytes of generated source per tail block, `32768` by default.
-	 * When a batch exceeds the budget it is split; a single oversized operation still ships
-	 * whole, so blocks may exceed the budget.
-	 */
-	budget?: number;
 }
 
 /** A one-shot iterator of executable statement blocks. Evaluate every block in yield order. */
