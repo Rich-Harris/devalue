@@ -54,63 +54,63 @@ class Session {
 	/** Identity graph shared by all emitted regions. @type {Graph} */
 	#graph;
 	/** Async descriptor states discovered anywhere in the streamed graph. @type {Set<Source>} */
-	#sources;
+	#sources = new Set();
 	/** Events collected during the current scheduled flush window. @type {Event[]} */
-	#batch;
+	#batch = [];
 	/** Whether the current batch has been finalized and is ready to emit. @type {boolean} */
-	#batch_ready;
+	#batch_ready = false;
 	/** Resolvers for tail reads waiting for delivery or a lifecycle change. @type {Array<() => void>} */
-	#waiters;
+	#waiters = [];
 	/** Monotonic observation order assigned before events are batched. @type {number} */
-	#sequence;
+	#sequence = 0;
 	/** Number of async sources whose terminal client operation has not been generated. @type {number} */
-	#active;
+	#active = 0;
 	/** Whether a batch finalization is currently scheduled. @type {boolean} */
-	#flushing;
+	#flushing = false;
 	/** Whether async sources have begun observation or iteration. @type {boolean} */
-	#started;
+	#started = false;
 	/** Whether server-side observation and queued delivery have been cancelled. @type {boolean} */
-	#cancelled;
+	#cancelled = false;
 	/** In-flight cleanup shared by repeated cancellation requests. @type {Promise<void> | undefined} */
 	#cancelling;
 	/** Fatal generation error, cancellation reason, or first cleanup failure. @type {unknown} */
 	#failure;
 	/** Next client anchor index; index zero is reserved for the head root. @type {number} */
-	#anchor;
+	#anchor = 1;
 	/** Next client pending index used to store a descriptor's private control. @type {number} */
-	#pending;
+	#pending = 0;
 	/** Next client slot index used when no stable path can retain an identity. @type {number} */
-	#slot;
+	#slot = 0;
 	/** Next client collection index used for a retained Map or Set sidecar. @type {number} */
-	#collection;
+	#collection = 0;
 	/** Next collision-proof placeholder id shared by every replacement phase. @type {number} */
-	#token;
+	#token = 0;
 	/** @type {Map<string, keyof typeof RUNTIMES>} */
-	#runtime_tokens;
+	#runtime_tokens = new Map();
 	/** @type {Map<string, number>} */
-	#promise_tokens;
+	#promise_tokens = new Map();
 	/** Stable AbortSignal listener that forwards cancellation. @type {() => void} */
 	#abort;
 	/** Canonical captured node for the initial graph root. @type {GraphNode | undefined} */
 	#root;
 	/** Transaction rollback operations. @type {Array<() => void>} */
-	#undo;
+	#undo = [];
 	/** Number of nested generation transactions. @type {number} */
-	#transaction_depth;
+	#transaction_depth = 0;
 	/** Committed sources not yet started. @type {Source[]} */
-	#unstarted;
+	#unstarted = [];
 	/** Session helpers already defined in emitted output. @type {Partial<Record<keyof typeof RUNTIMES, boolean>>} */
-	#runtimes_emitted;
+	#runtimes_emitted = {};
 	/** Native promise sources whose terminal operation has not been emitted. @type {number} */
-	#native_pending;
+	#native_pending = 0;
 	/** Custom nodes captured since the last atomic-cycle validation. @type {GraphNode[]} */
-	#new_custom;
+	#new_custom = [];
 	/** Custom nodes already proven acyclic. @type {Set<GraphNode>} */
-	#validated;
+	#validated = new Set();
 	/** Whether the head must define the block dispatch helper. @type {boolean} */
-	#emit_dispatch;
+	#emit_dispatch = false;
 	/** Monotonic identifier for per-region node scratch state. @type {number} */
-	#region_id;
+	#region_id = 0;
 
 	/**
 	 * Creates an isolated server-side stream session.
@@ -129,36 +129,8 @@ class Session {
 		this.#signal = signal;
 		this.#onerror = options.onerror;
 		this.#graph = create_graph(root, (value, node, graph) => this.#classify(value, node, graph));
-		this.#sources = new Set();
-		this.#batch = [];
-		this.#batch_ready = false;
-		this.#waiters = [];
-		this.#sequence = 0;
-		this.#active = 0;
-		this.#flushing = false;
-		this.#started = false;
-		this.#cancelled = false;
-		this.#cancelling = undefined;
-		this.#failure = undefined;
-		this.#anchor = 1;
-		this.#pending = 0;
-		this.#slot = 0;
-		this.#collection = 0;
-		this.#token = 0;
-		this.#runtime_tokens = new Map();
-		this.#promise_tokens = new Map();
 		this.#abort = () => void this.#cancel(signal?.reason);
 		signal?.addEventListener('abort', this.#abort, { once: true });
-		this.#root = undefined;
-		this.#undo = [];
-		this.#transaction_depth = 0;
-		this.#unstarted = [];
-		this.#runtimes_emitted = {};
-		this.#native_pending = 0;
-		this.#new_custom = [];
-		this.#validated = new Set();
-		this.#emit_dispatch = false;
-		this.#region_id = 0;
 	}
 
 	/** @param {unknown} value @returns {Promise<UnevalStreamResult>} */
