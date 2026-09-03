@@ -119,13 +119,13 @@ class Deferred {
 		this.source = source;
 	}
 }
-const keyed_replacer = (value) => value instanceof Deferred && ({
+const keyed_replacer = (value, js) => value instanceof Deferred && ({
 	type: 'async-value',
 	id: value.key,
 	source: value.source,
-	construct: (capture) => `new Promise((a,b)=>{${capture('[a,b]')}})`,
-	resolve: ({ control }, result) => `${control}[0](${result})`,
-	reject: ({ control }, reason) => `${control}[1](${reason})`
+	construct: (capture) => js`new Promise((a,b)=>{${capture(js`[a,b]`)}})`,
+	resolve: ({ control }, result) => js`${control}[0](${result})`,
+	reject: ({ control }, reason) => js`${control}[1](${reason})`
 });
 
 test('settles keyed values through the registry within one stream', async () => {

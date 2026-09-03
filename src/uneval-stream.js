@@ -241,6 +241,26 @@ class Session {
 		return { defs, source: resolved };
 	}
 
+	/** Severs tail blocks from positional state created by the head. */
+	#detach() {
+		for (const source of this.#sources) {
+			if (!source.terminal && source.node.data.key === undefined) {
+				throw this.#error('Cannot detach an unkeyed asynchronous value', source.node.value);
+			}
+		}
+		this.#references = new Map();
+		for (const node of this.#graph.nodes) {
+			if (node.kind === 'Async' && node.data.key !== undefined && !node.data.state.terminal) {
+				this.#references.set(node, { root: `s.k[${stringify_string(node.data.key)}][0]`, segments: [] });
+			}
+		}
+		this.#runtimes_emitted = {};
+		this.#anchor = 1;
+		this.#slot = 0;
+		this.#collection = 0;
+		this.#detached_tail = true;
+	}
+
 	/**
 	 * Atomically walks a value's devalue-visible graph and discovers async sources.
 	 *
@@ -1112,7 +1132,7 @@ class Session {
 
 		const root = expression(value);
 		for (const node of order) {
-			if (!is_keyed(node)) continue;
+			if (node.kind !== 'Async' || node.data.key === undefined) continue;
 			// Register `[target, control]` so settlements from any session can address it by key.
 			const control = node.data.captured ? `,s.p[${node.data.pending}]` : '';
 			sidecars.push(`(s.k||(s.k={__proto__:null}))[${stringify_string(node.data.key)}]=[${node.name}${control}]`);
@@ -1251,7 +1271,15 @@ class Session {
 	 * @returns {{ source: string, close: Source[] }}
 	 */
 	#emit_batch(events, block = true) {
-		const prefix = block ? `;${this.#scope}[${stringify_string(this.#id)}].b((s,n)=>{` : '';
+		let prefix = '';
+		if (block && this.#detached) {
+			prefix = `;(()=>{let n=${this.#scope},s=n?.[${stringify_string(this.#id)}];`;
+			if (!this.#detached_started) prefix += `if(!s)throw new Error(${stringify_string(`devalue: missing session ${this.#id}`)});s.a=[];s.s=[];s.c=[];s.p=[];`;
+			this.#detached_started = true;
+		} else if (block) {
+			prefix = `;${this.#scope}[${stringify_string(this.#id)}].b((s,n)=>{`;
+		}
+		const suffix = !block ? '' : this.#detached ? '})()' : '})';
 		/** @type {JavaScriptSource[]} */
 		const operations = [];
 		/** @type {Set<CapturedNode>} */
@@ -1262,8 +1290,10 @@ class Session {
 			const source = event.source;
 			const node = source.node;
 			references.add(node);
-			const target = source_reference(node, this.#references.get(node));
-			const control = node.data.captured ? raw_source(`s.p[${node.data.pending}]`) : undefined;
+			const entry = node.data.key === undefined ? undefined : `s.k[${stringify_string(node.data.key)}]`;
+			const guard = node.data.key === undefined ? '' : `if(!s.k?.[${stringify_string(node.data.key)}])throw new Error(${stringify_string(`devalue: missing asynchronous value ${node.data.key}`)});`;
+			const target = entry ? raw_source(`${entry}[0]`) : source_reference(node, this.#references.get(node));
+			const control = entry ? raw_source(`${entry}[1]`) : node.data.captured ? raw_source(`s.p[${node.data.pending}]`) : undefined;
 			const reference = {
 				target,
 				control
@@ -1323,7 +1353,7 @@ class Session {
 						anchor.source.render = anchor.source.anchored;
 					}
 				}
-				operations.push(operation);
+				operations.push(guard ? create_source([guard, ''], [operation]) : operation);
 			} catch (error) {
 				if (event.type === 'resolve' || event.type === 'next' || event.type === 'complete') {
 					this.#report(error, event.value);
@@ -1360,7 +1390,7 @@ class Session {
 			const resolved = this.#resolve_runtime_declarations(body);
 			body = resolved.defs.length ? `${resolved.defs.join(';')};${resolved.source}` : resolved.source;
 		}
-		return { source: prefix + body + (block ? '})' : rendered.length ? ';' : ''), close };
+		return { source: prefix + body + (block ? suffix : rendered.length ? ';' : ''), close };
 	}
 
 	/**
