@@ -148,9 +148,20 @@ function run(async, value, reducers, options) {
 				);
 			}
 
+			// the callback runs after the synchronous walk has unwound `keys`,
+			// so the path to the thenable has to be captured and reinstated
+			const path = keys.slice();
+
 			str = ops.toPromise(thing).then((value) => {
-				const i = flatten(value, index);
-				if (i < 0) stringified[index] = i;
+				const depth = keys.length;
+				for (const key of path) keys.push(key);
+
+				try {
+					const i = flatten(value, index);
+					if (i < 0) stringified[index] = i;
+				} finally {
+					keys.length = depth;
+				}
 			});
 		} else {
 			const tag = ops.tagOf(thing);
