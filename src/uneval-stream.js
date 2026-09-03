@@ -7,11 +7,11 @@
  *   UnevalStreamResult,
  *   UnevalStreamTail
  * } from './types.js'
- * @import { CapturedGraph, CapturedNode, Classification, ClientPath } from './graph.js'
+ * @import { CapturedGraph, CapturedNode, Child, ClientPath } from './graph.js'
  */
 
 import { DevalueError, is_primitive, stringify_primitive, stringify_string } from './utils.js';
-import { create_captured_graph, discover, rollback } from './graph.js';
+import { child, create_captured_graph, discover, is_node, rollback } from './graph.js';
 
 const promise_then = Promise.prototype.then;
 const TOKEN_PATTERN = /"\d+"/g;
@@ -295,8 +295,10 @@ class Session {
 			}
 			this.#sources.length = sources;
 			for (let i = this.#new_custom.length - 1; i >= custom; i--) {
-				for (const child of this.#new_custom[i].data.values) {
-					if (child) child.opaque--;
+				const children = this.#new_custom[i].children;
+				for (let j = 0; j < children.length; j++) {
+					const child = children[j];
+					if (is_node(child)) child.opaque--;
 				}
 			}
 			this.#new_custom.length = custom;
@@ -322,8 +324,8 @@ class Session {
 			if (this.#validated.has(node) || validated.has(node)) return;
 			if (validating.has(node)) throw this.#error('Cannot stringify an atomic custom cycle', node.value);
 			validating.add(node);
-			for (const child of node.data.values) {
-				if (child?.kind === 'Custom') validate(child);
+			for (const child of node.children) {
+				if (is_node(child) && child.kind === 'Custom') validate(child);
 			}
 			validating.delete(node);
 			validated.add(node);
@@ -335,28 +337,30 @@ class Session {
 
 	/**
 	 * Attempts to classify a node as a user replacement, native Promise, or native
-	 * AsyncIterable. Returning false delegates to graph's built-in discovery.
+	 * AsyncIterable, filling the node in place. Returning false delegates to graph's
+	 * built-in discovery.
 	 *
 	 * @param {unknown} value
 	 * @param {CapturedNode} node
 	 * @param {CapturedGraph} graph
-	 * @returns {Classification | false}
+	 * @returns {boolean}
 	 */
 	#classify(value, node, graph) {
 		if (this.#replacer) {
 			const result = this.#replacer(value, js);
 			if (is_source(result)) {
 				const values = source_values(result);
-				const dependencies = [];
-				const edges = [];
-				for (const child of values) {
-					const child_node = discover(graph, child);
-					dependencies.push(child_node);
-					edges.push(child_node ? { node: child_node.id } : { value: child });
-					if (child_node) child_node.opaque++;
+				const children = new Array(values.length);
+				for (let i = 0; i < values.length; i++) {
+					const captured = child(graph, values[i]);
+					children[i] = captured;
+					if (is_node(captured)) captured.opaque++;
 				}
+				node.kind = 'Custom';
+				node.children = children;
+				node.data = result;
 				this.#new_custom.push(node);
-				return { kind: 'Custom', data: { source: result, values: dependencies }, edges };
+				return true;
 			}
 			if (result !== undefined && result !== null && result !== false) {
 				if (typeof result !== 'object' || !Object.hasOwn(result, 'type')) {
@@ -364,11 +368,13 @@ class Session {
 				}
 				if (result.type === 'async-value') {
 					this.#validate_value_descriptor(result);
-					return this.#add_source(node, result, 'value').classification;
+					this.#add_source(node, result, 'value');
+					return true;
 				}
 				if (result.type === 'async-sequence') {
 					this.#validate_sequence_descriptor(result);
-					return this.#add_source(node, result, 'sequence').classification;
+					this.#add_source(node, result, 'sequence');
+					return true;
 				}
 				throw new TypeError('Invalid unevalStream replacer result');
 			}
@@ -402,32 +408,32 @@ class Session {
 			}
 			if (observer) {
 				const descriptor = this.#native_descriptor(/** @type {Promise<unknown>} */ (value));
-				let added;
 				try {
-					added = this.#add_source(node, descriptor, 'native');
-					added.state.observer = observer;
+					this.#add_source(node, descriptor, 'native').observer = observer;
 					this.#native_pending++;
 				} catch (error) {
 					observer.active = false;
 					throw error;
 				}
-				return added.classification;
+				return true;
 			}
 
 			if (Symbol.asyncIterator in value) {
-				return this.#add_source(node, this.#native_sequence_descriptor(value), 'sequence').classification;
+				this.#add_source(node, this.#native_sequence_descriptor(value), 'sequence');
+				return true;
 			}
 		}
 		return false;
 	}
 
 	/**
-	 * Constructs an async descriptor target once and stages its server source state.
+	 * Constructs an async descriptor target once, fills the node as `Async`, and stages
+	 * its server source state.
 	 *
 	 * @param {CapturedNode} node
 	 * @param {any} descriptor
 	 * @param {'value' | 'sequence' | 'native'} type
-	 * @returns {{ state: Source, classification: Classification }}
+	 * @returns {Source}
 	 */
 	#add_source(node, descriptor, type) {
 		let captured = false;
@@ -443,10 +449,11 @@ class Session {
 		this.#pending = pending + 1;
 		/** @type {Source} */
 		const state = { node, descriptor, type, started: false, terminal: false, cleaned: false, active: true, flushed_pending: 0 };
-		const classification = { kind: 'Async', data: { source, pending, captured, state }, edges: [] };
+		node.kind = 'Async';
+		node.data = { source, pending, captured, state };
 		this.#sources.push(state);
 		if (this.#signal?.aborted) throw this.#signal.reason;
-		return { state, classification };
+		return state;
 	}
 
 	/**
@@ -730,18 +737,13 @@ class Session {
 	 */
 	#emit_region(value, persistent, references) {
 		const retained_references = this.#references;
-		/** Canonical node list; recorded edges resolve through indices rather than identity lookups. */
-		const nodes_list = this.#graph.nodes;
 		const identities = this.#graph.identities;
-		/** Resolves a recorded edge to its node, or undefined for a primitive edge. @param {{ node: number } | { value: unknown }} reference */
-		const node_of = (reference) => 'node' in reference ? /** @type {CapturedNode} */ (nodes_list[reference.node]) : undefined;
-
 		const region_id = ++this.#region_id;
 		/** @type {CapturedNode[]} */
 		const order = [];
-		/** @param {CapturedNode | undefined} node */
+		/** @param {CapturedNode} node */
 		const visit = (node) => {
-			if (!node || retained_references.has(node) || node.region_id === region_id) return;
+			if (retained_references.has(node) || node.region_id === region_id) return;
 			node.region_id = region_id;
 			node.uses = 0;
 			node.hoisted = false;
@@ -751,63 +753,34 @@ class Session {
 			node.rendering = false;
 			// Post-order: children are declared before parents so declarations can embed
 			// them as literals; only back-edges (cycles) need post-declaration patches.
-			for (const edge of node.edges) visit(node_of(edge));
+			const children = node.children;
+			for (let i = 0; i < children.length; i++) {
+				const child = children[i];
+				if (is_node(child)) visit(child);
+			}
 			node.position = order.push(node) - 1;
 		};
-		if (!is_primitive(value)) visit(identities.get(/** @type {object} */ (value)));
-
-		/**
-		 * Invokes a callback for each represented child node (undefined for primitive
-		 * children) with its in-region occurrence count.
-		 *
-		 * @param {CapturedNode} node
-		 * @param {(child: CapturedNode | undefined, occurrences: number) => void} callback
-		 */
-		const each_child = (node, callback) => {
-			switch (node.kind) {
-				case 'Array':
-				case 'Object':
-				case 'NullObject':
-					for (const entry of node.data.entries) callback(node_of(entry[1]), 1);
-					break;
-				case 'Set':
-					for (const member of node.data.values) callback(node_of(member), 1);
-					break;
-				case 'Map':
-					for (const entry of node.data.entries) {
-						callback(node_of(entry[0]), 1);
-						callback(node_of(entry[1]), 1);
-					}
-					break;
-				case 'Custom':
-					for (const child of node.data.values) callback(child, 1);
-					break;
-				default:
-					if (is_view(node.kind)) callback(node_of(node.data.buffer), 1);
-			}
-		};
+		const root_node = is_primitive(value) ? undefined : identities.get(/** @type {object} */ (value));
+		if (root_node) visit(root_node);
 
 		// In-region use counts; a node used once can be inlined at its single use site.
-		/**
-		 * @param {CapturedNode | undefined} node
-		 * @param {number} occurrences
-		 */
-		const bump = (node, occurrences = 1) => {
-			if (node?.region_id === region_id) node.uses += occurrences;
-		};
-		if (!is_primitive(value)) bump(identities.get(/** @type {object} */ (value)));
+		// Persistent Set/Map sidecars re-reference each retained element, so those
+		// elements must be hoisted names rather than duplicated inline literals.
+		if (root_node?.region_id === region_id) root_node.uses++;
 		for (const node of order) {
-			each_child(node, bump);
-			// Persistent Set/Map sidecars re-reference each retained element, so those
-			// elements must be hoisted names rather than duplicated inline literals.
-			if (persistent && (node.kind === 'Set' || node.kind === 'Map')) each_child(node, bump);
+			const weight = persistent && (node.kind === 'Set' || node.kind === 'Map') ? 2 : 1;
+			const children = node.children;
+			for (let i = 0; i < children.length; i++) {
+				const child = children[i];
+				if (is_node(child) && child.region_id === region_id) child.uses += weight;
+			}
 		}
 
 		/** @param {CapturedNode} node */
-		const is_sparse = (node) => node.kind === 'Array' && node.data.entries.length !== node.data.length;
+		const is_sparse = (node) => node.kind === 'Array' && node.keys.length !== node.data;
 		let hoisted_count = 0;
 		for (const node of order) {
-			if (node.uses > 1 || node.opaque || node.kind === 'NullObject' || is_sparse(node)) {
+			if (node.uses > 1 || node.opaque > 0 || node.kind === 'NullObject' || is_sparse(node)) {
 				node.hoisted = true;
 				hoisted_count++;
 			}
@@ -818,21 +791,22 @@ class Session {
 		/**
 		 * Reports whether a child's expansion reaches a name declared at or after `limit`.
 		 *
-		 * @param {CapturedNode | undefined} node
+		 * @param {CapturedNode} node
 		 * @param {number} limit
 		 * @param {Set<CapturedNode>} seen
 		 * @returns {boolean}
 		 */
 		const references_later = (node, limit, seen) => {
-			if (!node || node.region_id !== region_id) return false;
+			if (node.region_id !== region_id) return false;
 			if (node.hoisted) return node.early ? false : node.position >= limit;
 			if (seen.has(node)) return false;
 			seen.add(node);
-			let found = false;
-			each_child(node, (child) => {
-				if (!found && references_later(child, limit, seen)) found = true;
-			});
-			return found;
+			const children = node.children;
+			for (let i = 0; i < children.length; i++) {
+				const child = children[i];
+				if (is_node(child) && references_later(child, limit, seen)) return true;
+			}
+			return false;
 		};
 		// Atomic nodes (customs, views) embed child expressions in their declaration and
 		// cannot defer them to fills. A direct container child whose expansion reaches a name
@@ -842,22 +816,22 @@ class Session {
 		/** @param {CapturedNode} node */
 		const secure_atomic = (node) => {
 			const limit = node.position;
-			each_child(node, (child_node) => {
-				if (!child_node || child_node.region_id !== region_id) return;
-				if (child_node.hoisted) {
-					if (!child_node.early && child_node.position >= limit) {
-						child_node.early = true;
-					}
-					return;
+			const children = node.children;
+			for (let i = 0; i < children.length; i++) {
+				const child = children[i];
+				if (!is_node(child) || child.region_id !== region_id) continue;
+				if (child.hoisted) {
+					if (!child.early && child.position >= limit) child.early = true;
+					continue;
 				}
-				if (!references_later(child_node, limit, new Set())) return;
-				if (is_atomic(child_node.kind)) secure_atomic(child_node);
-				child_node.hoisted = true;
+				if (!references_later(child, limit, new Set())) continue;
+				if (is_atomic(child.kind)) secure_atomic(child);
+				child.hoisted = true;
 				hoisted_count++;
-			});
+			}
 		};
 		for (const node of order) {
-			if (is_atomic(node.kind) && node.hoisted) secure_atomic(node);
+			if (node.hoisted && is_atomic(node.kind)) secure_atomic(node);
 		}
 
 		// `hoisted` and `early` are final now, so "does this child's expansion reach a
@@ -866,27 +840,23 @@ class Session {
 		// precede parents in post-order, and any back-edge target is necessarily hoisted
 		// (a cycle entry always has two or more uses), so one bottom-up pass suffices.
 		/**
-		 * @param {CapturedNode | undefined} node
+		 * @param {Child} child
 		 * @returns {number}
 		 */
-		const latest_of = (node) => {
-			if (!node || node.region_id !== region_id) return -1;
-			if (node.hoisted) return node.early ? -1 : node.position;
-			return node.latest;
+		const latest_of = (child) => {
+			if (!is_node(child) || child.region_id !== region_id) return -1;
+			if (child.hoisted) return child.early ? -1 : child.position;
+			return child.latest;
 		};
-		/**
-		 * @param {{ node: number } | { value: unknown }} reference
-		 * @returns {number}
-		 */
-		const latest_of_ref = (reference) => 'value' in reference ? -1 : latest_of(/** @type {CapturedNode} */ (nodes_list[reference.node]));
 		if (hoisted_count > 0) {
 			for (const node of order) {
 				if (node.hoisted) continue;
 				let reach = -1;
-				each_child(node, (child) => {
-					const value = latest_of(child);
+				const children = node.children;
+				for (let i = 0; i < children.length; i++) {
+					const value = latest_of(children[i]);
 					if (value > reach) reach = value;
-				});
+				}
 				node.latest = reach;
 			}
 		}
@@ -902,6 +872,8 @@ class Session {
 		const slots = [];
 		const tokens = new Map();
 		/**
+		 * Renders a raw value interpolated by a custom replacer template.
+		 *
 		 * @param {unknown} thing
 		 * @returns {string}
 		 */
@@ -918,8 +890,8 @@ class Session {
 		const expression_node = (node) => {
 			const retained = retained_references.get(node);
 			if (retained && node.region_id !== region_id) {
-				references?.add(node);
 				if (references) {
+					references.add(node);
 					const token = this.#placeholder();
 					tokens.set(token, { node, reference: retained });
 					return token;
@@ -936,9 +908,21 @@ class Session {
 				node.rendering = false;
 			}
 		};
-		/** @param {{ node: number } | { value: unknown }} reference */
-		const expression_ref = (reference) =>
-			'value' in reference ? stringify_primitive(reference.value) : expression_node(/** @type {CapturedNode} */ (nodes_list[reference.node]));
+		/** @param {Child} child */
+		const expression_child = (child) => is_node(child) ? expression_node(child) : stringify_primitive(child);
+
+		/** @param {Child[]} children */
+		const set_literal = (children) => children.length ? `new Set([${children.map(expression_child).join(',')}])` : 'new Set';
+		/** @param {Child[]} children */
+		const map_literal = (children) => {
+			if (children.length === 0) return 'new Map';
+			let result = 'new Map([';
+			for (let i = 0; i < children.length; i += 2) {
+				if (i) result += ',';
+				result += `[${expression_child(children[i])},${expression_child(children[i + 1])}]`;
+			}
+			return result + '])';
+		};
 
 		/**
 		 * Emits the full construction of a single-use node at its use site.
@@ -947,28 +931,29 @@ class Session {
 		 * @returns {string}
 		 */
 		const inline = (node) => {
+			const children = node.children;
 			switch (node.kind) {
 				case 'Array':
-					return `[${node.data.entries.map((/** @type {[string, any]} */ entry) => expression_ref(entry[1])).join(',')}]`;
-				case 'Object':
-					return `{${node.data.entries.map((/** @type {[string, any]} */ entry) => `${literal_key(entry[0])}:${expression_ref(entry[1])}`).join(',')}}`;
-				case 'Set': {
-					const members = node.data.values;
-					return members.length ? `new Set([${members.map(expression_ref).join(',')}])` : 'new Set';
+					return `[${children.map(expression_child).join(',')}]`;
+				case 'Object': {
+					const keys = node.keys;
+					let result = '{';
+					for (let i = 0; i < keys.length; i++) {
+						if (i) result += ',';
+						result += `${literal_key(keys[i])}:${expression_child(children[i])}`;
+					}
+					return result + '}';
 				}
-				case 'Map': {
-					const entries = node.data.entries;
-					return entries.length
-						? `new Map([${entries.map((/** @type {[any, any]} */ entry) => `[${expression_ref(entry[0])},${expression_ref(entry[1])}]`).join(',')}])`
-						: 'new Map';
-				}
+				case 'Set':
+					return set_literal(children);
+				case 'Map':
+					return map_literal(children);
 				case 'Async':
 					return render_descriptor_source(node.data.source);
-				case 'Custom': {
-					return render_source(node.data.source, expression);
-				}
+				case 'Custom':
+					return render_source(node.data, expression);
 				default:
-					return scalar(node, expression_ref);
+					return scalar(node, expression_child);
 			}
 		};
 
@@ -978,25 +963,27 @@ class Session {
 		const declarations = [];
 		for (const node of order) {
 			const name = node.name;
+			const children = node.children;
+			const keys = node.keys;
 			if (name && node.early) {
 				// Declared empty ahead of every literal so atomic constructors can reference it.
 				switch (node.kind) {
 					case 'Array':
-						early_declarations.push(`${name}=Array(${node.data.length})`);
-						for (const [key, child] of node.data.entries) fill.push(`${name}[${key}]=${expression_ref(child)}`);
+						early_declarations.push(`${name}=Array(${node.data})`);
+						for (let i = 0; i < keys.length; i++) fill.push(`${name}[${keys[i]}]=${expression_child(children[i])}`);
 						break;
 					case 'Object':
 					case 'NullObject':
 						early_declarations.push(`${name}=${node.kind === 'NullObject' ? 'Object.create(null)' : '{}'}`);
-						for (const [key, child] of node.data.entries) fill.push(`${name}${prop(key)}=${expression_ref(child)}`);
+						for (let i = 0; i < keys.length; i++) fill.push(`${name}${prop(keys[i])}=${expression_child(children[i])}`);
 						break;
 					case 'Set':
 						early_declarations.push(`${name}=new Set`);
-						for (const child of node.data.values) fill.push(`${name}.add(${expression_ref(child)})`);
+						for (let i = 0; i < children.length; i++) fill.push(`${name}.add(${expression_child(children[i])})`);
 						break;
 					case 'Map':
 						early_declarations.push(`${name}=new Map`);
-						for (const [key, child] of node.data.entries) fill.push(`${name}.set(${expression_ref(key)},${expression_ref(child)})`);
+						for (let i = 0; i < children.length; i += 2) fill.push(`${name}.set(${expression_child(children[i])},${expression_child(children[i + 1])})`);
 						break;
 					default:
 						throw this.#error('Cannot stringify value', node.value);
@@ -1005,21 +992,22 @@ class Session {
 				// A child can be embedded in this declaration if its expansion never reaches
 				// a name declared at or after this node; back-edges become fills instead.
 				const limit = node.position;
-				/** @param {{ node: number } | { value: unknown }} child */
-				const available = (child) => latest_of_ref(child) < limit;
+				/** @param {Child} child */
+				const available = (child) => latest_of(child) < limit;
 				switch (node.kind) {
 					case 'Array': {
 						if (is_sparse(node)) {
-							declarations.push(`${name}=Array(${node.data.length})`);
-							for (const [key, child] of node.data.entries) fill.push(`${name}[${key}]=${expression_ref(child)}`);
+							declarations.push(`${name}=Array(${node.data})`);
+							for (let i = 0; i < keys.length; i++) fill.push(`${name}[${keys[i]}]=${expression_child(children[i])}`);
 							break;
 						}
 						const parts = [];
-						for (const [key, child] of node.data.entries) {
-							if (available(child)) parts.push(expression_ref(child));
+						for (let i = 0; i < children.length; i++) {
+							const child = children[i];
+							if (available(child)) parts.push(expression_child(child));
 							else {
 								parts.push('');
-								fill.push(`${name}[${key}]=${expression_ref(child)}`);
+								fill.push(`${name}[${keys[i]}]=${expression_child(child)}`);
 							}
 						}
 						// A trailing elision needs one extra comma to preserve length.
@@ -1028,36 +1016,35 @@ class Session {
 					}
 					case 'Object': {
 						const embedded = [];
-						for (const [key, child] of node.data.entries) {
-							if (available(child)) embedded.push(`${literal_key(key)}:${expression_ref(child)}`);
-							else fill.push(`${name}${prop(key)}=${expression_ref(child)}`);
+						for (let i = 0; i < children.length; i++) {
+							const child = children[i];
+							if (available(child)) embedded.push(`${literal_key(keys[i])}:${expression_child(child)}`);
+							else fill.push(`${name}${prop(keys[i])}=${expression_child(child)}`);
 						}
 						declarations.push(`${name}={${embedded.join(',')}}`);
 						break;
 					}
 					case 'NullObject': {
 						declarations.push(`${name}=Object.create(null)`);
-						for (const [key, child] of node.data.entries) fill.push(`${name}${prop(key)}=${expression_ref(child)}`);
+						for (let i = 0; i < keys.length; i++) fill.push(`${name}${prop(keys[i])}=${expression_child(children[i])}`);
 						break;
 					}
 					case 'Set': {
 						// Insertion order is observable, so embed only when every member is ready.
-						const members = node.data.values;
-						if (members.every(available)) {
-							declarations.push(`${name}=${members.length ? `new Set([${members.map(expression_ref).join(',')}])` : 'new Set'}`);
+						if (children.every(available)) {
+							declarations.push(`${name}=${set_literal(children)}`);
 						} else {
 							declarations.push(`${name}=new Set`);
-							for (const child of members) fill.push(`${name}.add(${expression_ref(child)})`);
+							for (let i = 0; i < children.length; i++) fill.push(`${name}.add(${expression_child(children[i])})`);
 						}
 						break;
 					}
 					case 'Map': {
-						const entries = node.data.entries;
-						if (entries.every((/** @type {[any, any]} */ [key, child]) => available(key) && available(child))) {
-							declarations.push(`${name}=${entries.length ? `new Map([${entries.map((/** @type {[any, any]} */ [key, child]) => `[${expression_ref(key)},${expression_ref(child)}]`).join(',')}])` : 'new Map'}`);
+						if (children.every(available)) {
+							declarations.push(`${name}=${map_literal(children)}`);
 						} else {
 							declarations.push(`${name}=new Map`);
-							for (const [key, child] of entries) fill.push(`${name}.set(${expression_ref(key)},${expression_ref(child)})`);
+							for (let i = 0; i < children.length; i += 2) fill.push(`${name}.set(${expression_child(children[i])},${expression_child(children[i + 1])})`);
 						}
 						break;
 					}
@@ -1068,15 +1055,17 @@ class Session {
 			if (persistent && (node.kind === 'Set' || node.kind === 'Map')) {
 				// Retain only non-primitive elements in a flat sidecar so future regions can
 				// reference identities that Set/Map containers do not expose through paths.
-				/** @type {Array<{ node: number }>} */
-				const elements = (node.kind === 'Set' ? node.data.values : node.data.entries.flat())
-					.filter((/** @type {{ node: number } | { value: unknown }} */ child) => 'node' in child);
+				/** @type {CapturedNode[]} */
+				const elements = [];
+				for (let i = 0; i < children.length; i++) {
+					const child = children[i];
+					if (is_node(child)) elements.push(child);
+				}
 				if (elements.length) {
 					const index = this.#collection++;
-					sidecars.push(`s.c[${index}]=[${elements.map(expression_ref).join(',')}]`);
+					sidecars.push(`s.c[${index}]=[${elements.map(expression_node).join(',')}]`);
 					for (let i = 0; i < elements.length; i++) {
-						const child = elements[i];
-						this.#reference_node(/** @type {CapturedNode} */ (nodes_list[child.node]), { root: `s.c[${index}]`, segments: [`[${i}]`] });
+						this.#reference_node(elements[i], { root: `s.c[${index}]`, segments: [`[${i}]`] });
 					}
 				}
 			}
@@ -1085,7 +1074,7 @@ class Session {
 		const root = expression(value);
 		if (persistent) {
 			for (const node of order) {
-				if (!node.opaque) continue;
+				if (node.opaque === 0) continue;
 				const index = this.#slot++;
 				slots.push(`s.s[${index}]=${node.name}`);
 				const reference = { root: `s.s[${index}]`, segments: [] };
@@ -1141,18 +1130,19 @@ class Session {
 		const previous = seen.get(node);
 		if (previous !== undefined && previous <= length) return;
 		seen.set(node, length);
-		const nodes_list = this.#graph.nodes;
+		const children = node.children;
 		if (node.kind === 'Array') {
-			for (const [key, child] of node.data.entries) {
-				if ('node' in child) this.#assign_references_node(nodes_list[child.node], append_reference(reference, `[${key}]`), seen);
+			for (let i = 0; i < children.length; i++) {
+				const child = children[i];
+				if (is_node(child)) this.#assign_references_node(child, append_reference(reference, `[${node.keys[i]}]`), seen);
 			}
 		} else if (node.kind === 'Object' || node.kind === 'NullObject') {
-			for (const [key, child] of node.data.entries) {
-				if ('node' in child) this.#assign_references_node(nodes_list[child.node], append_reference(reference, prop(key)), seen);
+			for (let i = 0; i < children.length; i++) {
+				const child = children[i];
+				if (is_node(child)) this.#assign_references_node(child, append_reference(reference, prop(node.keys[i])), seen);
 			}
 		} else if (is_view(node.kind)) {
-			const buffer = node.data.buffer;
-			if ('node' in buffer) this.#assign_references_node(nodes_list[buffer.node], append_reference(reference, '.buffer'), seen);
+			this.#assign_references_node(/** @type {CapturedNode} */ (children[0]), append_reference(reference, '.buffer'), seen);
 		}
 	}
 
@@ -1567,7 +1557,7 @@ class Session {
  * Emits a constructor expression for a captured non-container built-in.
  *
  * @param {CapturedNode} node
- * @param {(value: unknown) => string} expression
+ * @param {(child: Child) => string} expression
  * @returns {string}
  */
 function scalar(node, expression) {
@@ -1576,9 +1566,9 @@ function scalar(node, expression) {
 		case 'String':
 		case 'Boolean':
 		case 'BigInt':
-			return `Object(${stringify_primitive(node.data.value)})`;
+			return `Object(${stringify_primitive(node.data)})`;
 		case 'Date':
-			return `new Date(${node.data.time})`;
+			return `new Date(${node.data})`;
 		case 'RegExp': {
 			return node.data.flags
 				? `new RegExp(${stringify_string(node.data.source)},${stringify_string(node.data.flags)})`
@@ -1586,12 +1576,12 @@ function scalar(node, expression) {
 		}
 		case 'URL':
 		case 'URLSearchParams':
-			return `new ${node.kind}(${stringify_string(node.data.source)})`;
+			return `new ${node.kind}(${stringify_string(node.data)})`;
 		case 'ArrayBuffer':
 			// Native TypedArray join; avoids materializing a JS number array first.
-			return `new Uint8Array([${node.data.bytes.toString()}]).buffer`;
+			return `new Uint8Array([${node.data.toString()}]).buffer`;
 		case 'DataView': {
-			return `new DataView(${expression(node.data.buffer)},${node.data.byteOffset},${node.data.byteLength})`;
+			return `new DataView(${expression(node.children[0])},${node.data.byteOffset},${node.data.byteLength})`;
 		}
 		case 'Temporal.Duration':
 		case 'Temporal.Instant':
@@ -1601,10 +1591,10 @@ function scalar(node, expression) {
 		case 'Temporal.PlainMonthDay':
 		case 'Temporal.PlainYearMonth':
 		case 'Temporal.ZonedDateTime':
-			return `${node.kind}.from(${stringify_string(node.data.source)})`;
+			return `${node.kind}.from(${stringify_string(node.data)})`;
 		default:
 			if (is_view(node.kind)) {
-				return `new ${node.kind}(${expression(node.data.buffer)},${node.data.byteOffset},${node.data.length})`;
+				return `new ${node.kind}(${expression(node.children[0])},${node.data.byteOffset},${node.data.length})`;
 			}
 			throw new Error(`Unknown stream node ${node.kind}`);
 	}
