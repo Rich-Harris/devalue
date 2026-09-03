@@ -127,8 +127,6 @@ class Session {
 	#references = new Map();
 	/** Existing opaque values changed by the active capture. @type {Map<CapturedNode, boolean> | undefined} */
 	#capture_opaque;
-	/** Draft used by synchronous descriptor and runtime-helper callbacks during emission. @type {EmissionContext | undefined} */
-	#emitting;
 	/** Monotonic owner tag for reusable node planning scratch. */
 	#region_id = 0;
 
@@ -176,10 +174,8 @@ class Session {
 		if (this.#failure) throw this.#failure;
 
 		try {
-			const head_context = this.#emission_context();
-			const head_region = this.#emit_region(value, true, undefined, head_context);
-			this.#assign_references(head_context, value, { root: 's.a[0]', segments: [] }, new Map());
-			this.#commit_emission(head_context);
+			const head_region = this.#emit_region(value, true);
+			this.#assign_references(value, { root: 's.a[0]', segments: [] }, new Map());
 			let operations = '';
 			if (this.#batch_ready) {
 				const batch = { events: this.#batch };
@@ -253,7 +249,7 @@ class Session {
 		if (this.#runtime_tokens.size === 0 && this.#promise_tokens.size === 0) return { defs, source };
 		/** @param {keyof typeof RUNTIMES} key */
 		const define = (key) => {
-			const emitted = this.#emitting?.runtimes_emitted ?? this.#runtimes_emitted;
+			const emitted = this.#runtimes_emitted;
 			if (emitted[key]) return;
 			emitted[key] = true;
 			defs.push(`s.${key}=${RUNTIMES[key]}`);
@@ -482,11 +478,8 @@ class Session {
 	#native_descriptor(promise) {
 		let pending = -1;
 		const settle = (reference, which, value) => {
-			const context = this.#emitting;
-			const remaining = context?.native_pending ?? this.#native_pending;
-			if (context) context.native_pending = remaining - 1;
-			else this.#native_pending = remaining - 1;
-			if ((context?.runtimes_emitted ?? this.#runtimes_emitted).r || remaining >= 3) {
+			const remaining = this.#native_pending--;
+			if (this.#runtimes_emitted.r || remaining >= 3) {
 				return js`${raw_source(this.#runtime_token('r'))}(${pending},${which},${value})`;
 			}
 			return js`${reference.control}[${which}](${value});delete ${reference.control}`;
@@ -750,7 +743,8 @@ class Session {
 	 * @param {Set<CapturedNode>} [references]
 	 * @returns {{ source: string, tokens: Map<string, { node: CapturedNode, reference: ClientPath }> }}
 	 */
-	#emit_region(value, persistent, references, context = this.#emission_context()) {
+	#emit_region(value, persistent, references) {
+		const retained_references = this.#references;
 		/** Canonical node list; recorded edges resolve through indices rather than identity lookups. */
 		const nodes_list = this.#graph.nodes;
 		const identities = this.#graph.identities;
@@ -762,7 +756,7 @@ class Session {
 		const order = [];
 		/** @param {CapturedNode | undefined} node */
 		const visit = (node) => {
-			if (!node || context.references.has(node) || node.region_id === region_id) return;
+			if (!node || retained_references.has(node) || node.region_id === region_id) return;
 			node.region_id = region_id;
 			node.uses = 0;
 			node.hoisted = false;
@@ -937,7 +931,7 @@ class Session {
 		 * @returns {string}
 		 */
 		const expression_node = (node) => {
-			const retained = context.references.get(node);
+			const retained = retained_references.get(node);
 			if (retained && node.region_id !== region_id) {
 				references?.add(node);
 				if (references) {
@@ -1093,11 +1087,11 @@ class Session {
 				const elements = (node.kind === 'Set' ? node.data.values : node.data.entries.flat())
 					.filter((/** @type {{ node: number } | { value: unknown }} */ child) => 'node' in child);
 				if (elements.length) {
-					const index = context.collection++;
+					const index = this.#collection++;
 					sidecars.push(`s.c[${index}]=[${elements.map(expression_ref).join(',')}]`);
 					for (let i = 0; i < elements.length; i++) {
 						const child = elements[i];
-						this.#reference_node(context, /** @type {CapturedNode} */ (nodes_list[child.node]), { root: `s.c[${index}]`, segments: [`[${i}]`] });
+						this.#reference_node(/** @type {CapturedNode} */ (nodes_list[child.node]), { root: `s.c[${index}]`, segments: [`[${i}]`] });
 					}
 				}
 			}
@@ -1107,11 +1101,11 @@ class Session {
 		if (persistent) {
 			for (const node of order) {
 				if (!node.opaque) continue;
-				const index = context.slot++;
+				const index = this.#slot++;
 				slots.push(`s.s[${index}]=${node.name}`);
 				const reference = { root: `s.s[${index}]`, segments: [] };
-				this.#reference_node(context, node, reference);
-				this.#assign_references(context, node.value, reference, new Map());
+				this.#reference_node(node, reference);
+				this.#assign_references(node.value, reference, new Map());
 			}
 		}
 		const all_declarations = early_declarations.concat(declarations);
@@ -1128,52 +1122,36 @@ class Session {
 	/**
 	 * Records a client reference when it is the shortest known source expression for an identity.
 	 *
-	 * @param {unknown} value
-	 * @param {ClientPath} reference
-	 */
-	#reference(value, reference) {
-		const context = this.#emission_context();
-		if (!is_primitive(value)) {
-			const node = this.#graph.identities.get(/** @type {object} */ (value));
-			if (node) this.#reference_node(context, node, reference);
-		}
-		this.#references = context.references;
-	}
-
-	/**
-	 * @param {EmissionContext} context
 	 * @param {CapturedNode} node
 	 * @param {ClientPath} reference
 	 */
-	#reference_node(context, node, reference) {
-		const previous = context.references.get(node);
+	#reference_node(node, reference) {
+		const previous = this.#references.get(node);
 		if (!previous || reference_length(reference) < reference_length(previous)) {
-			context.references.set(node, reference);
+			this.#references.set(node, reference);
 		}
 	}
 
 	/**
 	 * Walks stable graph edges and assigns the cheapest reachable client reference to each node.
 	 *
-	 * @param {EmissionContext} context
 	 * @param {unknown} value
 	 * @param {ClientPath} reference
 	 * @param {Map<CapturedNode, number>} seen
 	 */
-	#assign_references(context, value, reference, seen) {
+	#assign_references(value, reference, seen) {
 		if (is_primitive(value)) return;
 		const node = this.#graph.identities.get(/** @type {object} */ (value));
-		if (node) this.#assign_references_node(context, node, reference, seen);
+		if (node) this.#assign_references_node(node, reference, seen);
 	}
 
 	/**
-	 * @param {EmissionContext} context
 	 * @param {CapturedNode} node
 	 * @param {ClientPath} reference
 	 * @param {Map<CapturedNode, number>} seen
 	 */
-	#assign_references_node(context, node, reference, seen) {
-		this.#reference_node(context, node, reference);
+	#assign_references_node(node, reference, seen) {
+		this.#reference_node(node, reference);
 		const length = reference_length(reference);
 		const previous = seen.get(node);
 		if (previous !== undefined && previous <= length) return;
@@ -1181,43 +1159,16 @@ class Session {
 		const nodes_list = this.#graph.nodes;
 		if (node.kind === 'Array') {
 			for (const [key, child] of node.data.entries) {
-				if ('node' in child) this.#assign_references_node(context, nodes_list[child.node], append_reference(reference, `[${key}]`), seen);
+				if ('node' in child) this.#assign_references_node(nodes_list[child.node], append_reference(reference, `[${key}]`), seen);
 			}
 		} else if (node.kind === 'Object' || node.kind === 'NullObject') {
 			for (const [key, child] of node.data.entries) {
-				if ('node' in child) this.#assign_references_node(context, nodes_list[child.node], append_reference(reference, prop(key)), seen);
+				if ('node' in child) this.#assign_references_node(nodes_list[child.node], append_reference(reference, prop(key)), seen);
 			}
 		} else if (is_view(node.kind)) {
 			const buffer = node.data.buffer;
-			if ('node' in buffer) this.#assign_references_node(context, nodes_list[buffer.node], append_reference(reference, '.buffer'), seen);
+			if ('node' in buffer) this.#assign_references_node(nodes_list[buffer.node], append_reference(reference, '.buffer'), seen);
 		}
-	}
-
-	/** @returns {EmissionContext} */
-	#emission_context() {
-		return {
-			anchor: this.#anchor,
-			slot: this.#slot,
-			collection: this.#collection,
-			native_pending: this.#native_pending,
-			active: this.#active,
-			references: new Map(this.#references),
-			runtimes_emitted: { ...this.#runtimes_emitted },
-			event_types: new Map(),
-			close: []
-		};
-	}
-
-	/** @param {EmissionContext} context */
-	#commit_emission(context) {
-		this.#anchor = context.anchor;
-		this.#slot = context.slot;
-		this.#collection = context.collection;
-		this.#native_pending = context.native_pending;
-		this.#active = context.active;
-		this.#references = context.references;
-		this.#runtimes_emitted = context.runtimes_emitted;
-		for (const [event, type] of context.event_types) event.type = type;
 	}
 
 	/**
@@ -1257,26 +1208,25 @@ class Session {
 	}
 
 	/**
-	 * Transactionally generates ordered client operations for a finalized event batch.
+	 * Generates ordered client operations for a finalized event batch. Failures here are
+	 * fatal to the session, so emission mutates session state directly.
 	 *
 	 * @param {Batch} batch
 	 * @param {boolean} block
-	 * @returns {string}
+	 * @returns {{ source: string, close: Source[] }}
 	 */
 	#emit_batch(batch, block = true) {
 		const prefix = block ? `;${this.#scope}[${stringify_string(this.#id)}].b((s,n)=>{` : '';
-		const context = this.#emission_context();
 		const operations = [];
 		/** @type {Set<CapturedNode>} */
 		const references = new Set();
-		try {
-		this.#emitting = context;
+		/** @type {Source[]} */
+		const close = [];
 		for (const event of batch.events) {
 			const source = event.source;
 			const node = source.node;
-			const operations_before = operations.length;
 			references.add(node);
-			const target = source_reference(node, context.references.get(node));
+			const target = source_reference(node, this.#references.get(node));
 			const control = node.data.captured ? raw_source(`s.p[${node.data.pending}]`) : undefined;
 			const reference = {
 				target,
@@ -1288,15 +1238,15 @@ class Session {
 			if (!event.invalid) {
 				// Persistent: async outcomes must retain Map/Set element and opaque custom
 				// child identities for future regions, exactly like the head region.
-				const region = this.#emit_region(event.value, true, references, context);
+				const region = this.#emit_region(event.value, true, references);
 				value_source = region_source(region);
 				const rendered_region = render_fragment(value_source, (value) => {
-					if (value?.type === 'reference') return render_reference(value.reference ?? context.references.get(value.node));
+					if (value?.type === 'reference') return render_reference(value.reference ?? this.#references.get(value.node));
 					return render_fragment_hole(value);
 				});
 				if (!is_primitive(event.value)) {
-					const index = context.anchor++;
-					this.#assign_references(context, event.value, { root: `s.a[${index}]`, segments: [] }, new Map());
+					const index = this.#anchor++;
+					this.#assign_references(event.value, { root: `s.a[${index}]`, segments: [] }, new Map());
 					const name = `s.a[${index}]`;
 					// Implicit anchoring: anchor indices are allocated monotonically and every
 					// allocated index is written exactly once in allocation order, so once the
@@ -1345,7 +1295,7 @@ class Session {
 						: source.descriptor.reject(reference, generic_error);
 					if (!is_source(fallback)) throw new TypeError('Invalid async descriptor operation');
 					operations.push(fallback);
-					context.event_types.set(event, source.type === 'sequence' ? 'error' : 'reject');
+					event.type = source.type === 'sequence' ? 'error' : 'reject';
 				} else {
 					throw error;
 				}
@@ -1353,14 +1303,13 @@ class Session {
 			if (event.type !== 'next' && node.data.captured && !source.descriptor.manages_pending) {
 				operations.push(raw_source(`delete s.p[${node.data.pending}]`));
 			}
-			const effective_type = context.event_types.get(event) ?? event.type;
-			if (effective_type !== 'next') {
-				context.active--;
-				if (source.type === 'sequence' && effective_type === 'error') context.close.push(source);
+			if (event.type !== 'next') {
+				this.#active--;
+				if (source.type === 'sequence' && event.type === 'error') close.push(source);
 			}
 		}
-		const rendered = this.#render_operations(operations, references, context);
-		if (block && context.active === 0 && this.#batch.length === 0) {
+		const rendered = this.#render_operations(operations, references);
+		if (block && this.#active === 0 && this.#batch.length === 0) {
 			rendered.push(this.#cleanup_source());
 		}
 		let body = rendered.join(';');
@@ -1371,14 +1320,7 @@ class Session {
 			const resolved = this.#resolve_runtime_declarations(body);
 			body = resolved.defs.length ? `${resolved.defs.join(';')};${resolved.source}` : resolved.source;
 		}
-		const result = prefix + body + (block ? '})' : rendered.length ? ';' : '');
-		this.#commit_emission(context);
-		return { source: result, close: context.close };
-		} catch (error) {
-			throw error;
-		} finally {
-			this.#emitting = undefined;
-		}
+		return { source: prefix + body + (block ? '})' : rendered.length ? ';' : ''), close };
 	}
 
 	/**
@@ -1388,7 +1330,7 @@ class Session {
 	 * @param {Array<{ source: string, tokens: Map<string, { node?: CapturedNode, reference?: ClientPath, source?: string }> }>} operations
 	 * @param {Set<CapturedNode>} references
 	 */
-	#render_operations(operations, references, context) {
+	#render_operations(operations, references) {
 		const uses = new Map();
 		const imported_references = new Map();
 		for (const operation of operations) {
@@ -1402,7 +1344,7 @@ class Session {
 		}
 		const candidates = [];
 		for (const node of references) {
-			const reference = context.references.get(node);
+			const reference = this.#references.get(node);
 			if (!reference || reference.root.startsWith('s.s[')) continue;
 			const path = render_reference(imported_references.get(node) ?? reference);
 			const count = uses.get(node) ?? 0;
@@ -1413,16 +1355,16 @@ class Session {
 		const aliases = new Map();
 		const prefix = [];
 		for (const { node, path, uses } of candidates) {
-			const slot = `s.s[${context.slot}]`;
+			const slot = `s.s[${this.#slot}]`;
 			if (`${slot}=${path};`.length + slot.length * uses >= path.length * uses) continue;
-			context.slot++;
+			this.#slot++;
 			prefix.push(`${slot}=${path}`);
 			aliases.set(node, slot);
-			context.references.set(node, { root: slot, segments: [] });
+			this.#references.set(node, { root: slot, segments: [] });
 		}
 		const render = (value) => {
 			if (value?.type === 'reference') {
-				return aliases.get(value.node) ?? render_reference(value.reference ?? context.references.get(value.node));
+				return aliases.get(value.node) ?? render_reference(value.reference ?? this.#references.get(value.node));
 			}
 			if (value?.type === 'capture') {
 				const source = render_fragment(value.source, render);
@@ -1781,14 +1723,6 @@ function count_source(source, target) {
 	return count;
 }
 
-/** @param {JavaScriptSource} source @param {unknown} target @param {JavaScriptSource} replacement @returns {JavaScriptSource} */
-function replace_source(source, target, replacement) {
-	return create_source(source.strings, source.values.map((value) => {
-		if (value === target) return replacement;
-		return is_source(value) && value !== target ? replace_source(value, target, replacement) : value;
-	}));
-}
-
 /** @param {JavaScriptSource} source @param {(value: any) => string} render */
 function render_fragment(source, render) {
 	let result = source.strings[0];
@@ -1943,7 +1877,6 @@ function empty_tail() {
 	return tail;
 }
 
-/** @typedef {{ anchor: number, slot: number, collection: number, native_pending: number, active: number, references: Map<CapturedNode, ClientPath>, runtimes_emitted: Partial<Record<keyof typeof RUNTIMES, boolean>>, event_types: Map<Event, Event['type']>, close: Source[] }} EmissionContext */
 /** @typedef {{ node: CapturedNode, descriptor: any, type: 'value' | 'sequence' | 'native', started: boolean, terminal: boolean, cleaned: boolean, active: boolean, flushed_pending: number, iterator?: any, iterator_closed?: boolean, next?: Function, pulling?: boolean, pulled?: Promise<void>, pulled_resolve?: () => void, observer?: { active: boolean }, early?: ['resolve' | 'reject', unknown] }} Source */
 /** @typedef {{ source: Source, type: 'resolve' | 'reject' | 'next' | 'complete' | 'error', value: unknown, sequence: number, invalid: boolean }} Event */
 /** @typedef {{ events: Event[] }} Batch */

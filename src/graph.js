@@ -6,7 +6,6 @@ import {
 	is_primitive,
 	stringify_key,
 	stringify_primitive,
-	stringify_string,
 	valid_array_indices
 } from './utils.js';
 
