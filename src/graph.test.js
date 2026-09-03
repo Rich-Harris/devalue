@@ -76,12 +76,57 @@ test('rolls back appended identities without touching earlier captures', () => {
 test('rolls back an entire failed recursive discovery', () => {
 	const root = { child: {}, invalid: () => {} };
 	const graph = create_test_graph(root);
-	assert.throws(() => discover(graph, root));
-	rollback(graph, 0);
+	let error;
+	try {
+		discover(graph, root);
+	} catch (e) {
+		error = e;
+	}
+	rollback(graph, 0, error);
 
 	assert.is(graph.nodes.length, 0);
-	assert.is(graph.path.length, 0);
+	assert.is(graph.unwind.length, 0);
 	assert.is(graph.identities.size, 0);
+	assert.is(error.path, '.invalid');
+});
+
+test('assembles error paths while unwinding', () => {
+	class Whatever {}
+	const root = {
+		ok: [1, 2],
+		foo: { 'string-key': new Map([['key', [null, new Whatever()]]]) }
+	};
+	const graph = create_test_graph(root);
+	let error;
+	try {
+		discover(graph, root);
+	} catch (e) {
+		error = e;
+	}
+	rollback(graph, 0, error);
+
+	assert.is(error.name, 'DevalueError');
+	assert.is(error.message, 'Cannot stringify arbitrary non-POJOs');
+	assert.is(error.path, '.foo["string-key"].get("key")[1]');
+	assert.is(error.root, root);
+	assert.is(graph.nodes.length, 0);
+});
+
+test('reports __proto__ keys at the owning object', () => {
+	const inner = JSON.parse('{"__proto__":1}');
+	const root = { foo: inner };
+	const graph = create_test_graph(root);
+	let error;
+	try {
+		discover(graph, root);
+	} catch (e) {
+		error = e;
+	}
+	rollback(graph, 0, error);
+
+	assert.is(error.message, 'Cannot stringify objects with __proto__ keys');
+	assert.is(error.path, '.foo');
+	assert.is(error.value, inner);
 });
 
 test.run();

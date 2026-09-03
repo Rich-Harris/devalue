@@ -302,7 +302,7 @@ class Session {
 				}
 			}
 			this.#new_custom.length = custom;
-			rollback(graph, nodes);
+			rollback(graph, nodes, error);
 			throw error;
 		}
 	}
