@@ -49,7 +49,7 @@ export { DevalueError, filter_array_indices as filterArrayIndices } from './src/
  * @typedef {AsyncSequenceDescriptorType<T, TReturn>} AsyncSequenceDescriptor
  */
 /**
- * Synchronously replaces values with source strings or asynchronous descriptors.
+ * Synchronously replaces values with tagged JavaScript source or asynchronous descriptors.
  * @typedef {UnevalStreamReplacerType} UnevalStreamReplacer
  */
 /**

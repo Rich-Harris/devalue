@@ -3,6 +3,8 @@ import {
 	type AsyncSequenceDescriptor,
 	type AsyncValueDescriptor,
 	type ClientReference,
+	type JavaScriptSource,
+	type JavaScriptTag,
 	type UnevalStreamOptions,
 	type UnevalStreamReplacer,
 	type UnevalStreamResult,
@@ -12,26 +14,27 @@ import {
 declare const promise: Promise<number>;
 declare const sequence: AsyncIterable<number, string>;
 
-const reference: ClientReference = { target: 'remote', control: 'controller' };
+declare const source: JavaScriptSource;
+const reference: ClientReference = { target: source, control: source };
 
 const value: AsyncValueDescriptor<number> = {
 	type: 'async-value',
 	source: promise,
-	construct: () => 'new Remote()',
-	resolve: ({ target }: ClientReference, source) => `${target}.resolve(${source})`,
-	reject: ({ target }, source) => `${target}.reject(${source})`
+	construct: () => source,
+	resolve: () => source,
+	reject: () => source
 };
 
 const iterable: AsyncSequenceDescriptor<number, string> = {
 	type: 'async-sequence',
 	source: sequence,
-	construct: () => 'new RemoteSequence()',
-	next: ({ target }, source) => `${target}.next(${source})`,
-	complete: ({ target }, source) => `${target}.complete(${source})`,
-	error: ({ target }, source) => `${target}.error(${source})`
+	construct: () => source,
+	next: () => source,
+	complete: () => source,
+	error: () => source
 };
 
-const replacer: UnevalStreamReplacer = () => value;
+const replacer: UnevalStreamReplacer = (_value, js: JavaScriptTag) => js`new Remote(${value})`;
 const options: UnevalStreamOptions = { id: 'typed' };
 const result: UnevalStreamResult = await unevalStream(iterable, replacer, options);
 const { head, tail, id }: { head: string; tail: UnevalStreamTail; id: string } = result;

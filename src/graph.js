@@ -13,14 +13,14 @@ import {
 /** @typedef {{ node: number } | { value: unknown }} ValueRef */
 /**
  * A stream-specific reconstruction plan returned instead of built-in discovery.
- * A custom classifier discovers any children through its `Graph` argument and returns
+ * A custom classifier discovers any children through its `CapturedGraph` argument and returns
  * their direct reconstruction dependencies in `edges`.
  * @typedef {{ kind: string, data: any, edges: ValueRef[] }} Classification
  */
 /**
  * A source expression for reaching a non-primitive value created on the client.
  *
- * @typedef {object} Reference
+ * @typedef {object} ClientPath
  * @property {string} root Expression that evaluates to the reference's starting object.
  * @property {string[]} segments Property-access segments appended to `root`.
  */
@@ -28,42 +28,34 @@ import {
  * A captured non-primitive value. Discovery fills `value` through `edges`; streaming
  * emission temporarily fills `region_id` through `rendering` while planning its output.
  *
- * @typedef {object} GraphNode
- * @property {number} id Index of this node in `Graph.nodes`; non-primitive `ValueRef`s store this number.
+ * @typedef {object} CapturedNode
+ * @property {number} id Index of this node in `CapturedGraph.nodes`; non-primitive `ValueRef`s store this number.
  * @property {any} value The original value represented by this node. Its contents are not read again during emission.
  * @property {string} kind The reconstruction tag, such as `Array`, `Map`, `Custom`, or `Async`.
  * @property {any} data Captured reconstruction- or classification-specific data.
  * @property {ValueRef[]} edges Direct captured dependencies needed to reconstruct this value.
  * @property {number} region_id Identifies the emitted region for which the following planning fields are valid.
  * @property {number} position This node's position in the current emission's child-before-parent order.
- * @property {number} uses Number of references to this node in the current emission. Multiple uses require a shared temporary variable.
- * @property {boolean} hoisted Whether this node must be assigned to a temporary variable instead of being written inline.
- * @property {boolean} early Whether an empty container must be created before normal declarations so an earlier constructor can refer to it.
- * @property {number} latest Furthest declaration position reached by expanding this node inline; used to avoid references to variables not declared yet.
- * @property {string} name Temporary variable name assigned when `hoisted` is true, or an empty string when the node is inlined.
- * @property {boolean} rendering Whether this node is currently being expanded inline; guards against unexpected recursive expansion.
- * @property {Reference} [reference] The shortest retained client reference currently known for this node.
+ * @property {number} uses Number of references to this node in the current emission.
+ * @property {boolean} hoisted Whether this node must be assigned to a temporary variable.
+ * @property {boolean} early Whether an empty container must be created before normal declarations.
+ * @property {number} latest Furthest declaration position reached by expanding this node inline.
+ * @property {string} name Temporary variable name, or an empty string when the node is inlined.
+ * @property {boolean} rendering Whether this node is currently being expanded inline.
  * @property {boolean} [opaque] Whether emission must preserve this node as a named value rather than inspect and duplicate it inline.
- */
-/**
- * The graph sizes at the start of a discovery operation. Rollback removes everything
- * appended after these positions.
- *
- * @typedef {object} Checkpoint
- * @property {number} nodes Length of `Graph.nodes` when the checkpoint was taken.
- * @property {number} added Length of `Graph.added` when the checkpoint was taken.
  */
 /**
  * A reusable snapshot of the non-primitive values discovered during one stream session.
  *
- * @typedef {object} Graph
+ * @typedef {object} CapturedGraph
  * @property {unknown} root_value The initial value, retained to provide context in serialization errors.
- * @property {GraphNode[]} nodes Every captured non-primitive value, in discovery order. A node's `id` is its index here.
- * @property {Map<object, GraphNode>} identities Maps each original non-primitive identity to its canonical node, preserving sharing and cycles.
- * @property {(value: unknown, node: GraphNode) => Classification} classify Produces a custom or built-in reconstruction plan for a reserved node.
+ * @property {CapturedNode[]} nodes Every captured non-primitive value, in discovery order. A node's `id` is its index here.
+ * @property {Map<object, CapturedNode>} identities Maps each original non-primitive identity to its canonical node, preserving sharing and cycles.
+ * @property {(value: unknown, node: CapturedNode) => Classification} classify Produces a custom or built-in reconstruction plan for a reserved node.
  * @property {unknown[]} keys Raw property, array-index, or map-key segments leading to the value currently being discovered.
  * @property {number[]} key_kinds How each entry in `keys` should be formatted in an error path: array index, property, or map key.
- * @property {object[]} added Identity-map keys added by open transactions, in insertion order, so rollback can delete them.
+ * @property {boolean} capturing Whether a synchronous capture is in progress.
+ * @property {object[] | undefined} provisional_identities Identities reserved by the active capture.
  */
 
 const ARRAY_INDEX = 0;
@@ -92,11 +84,11 @@ const MAP_KEY = 2;
  * leaving the graph as it was before the capture began.
  *
  * @param {unknown} root
- * @param {(value: unknown, node: GraphNode, graph: Graph) => Classification | false} custom_classify
- * @returns {Graph}
+ * @param {(value: unknown, node: CapturedNode, graph: CapturedGraph) => Classification | false} custom_classify
+ * @returns {CapturedGraph}
  */
-export function create_graph(root, custom_classify) {
-	/** @type {Graph} */
+export function create_captured_graph(root, custom_classify) {
+	/** @type {CapturedGraph} */
 	const graph = {
 		root_value: root,
 		nodes: [],
@@ -104,47 +96,53 @@ export function create_graph(root, custom_classify) {
 		classify: (value, node) => custom_classify(value, node, graph) || builtin_classify(graph, value),
 		keys: [],
 		key_kinds: [],
-		added: []
+		capturing: false,
+		provisional_identities: undefined
 	};
 	return graph;
 }
 
 /**
- * @param {Graph} graph
- * @returns {Checkpoint}
+ * Atomically discovers a value and all of its dependencies. Recursive calls to
+ * `discover` share this capture; a thrown classification removes every provisional identity.
+ *
+ * @param {CapturedGraph} graph
+ * @param {unknown} value
+ * @param {() => void} [validate]
+ * @returns {CapturedNode | undefined}
  */
-export function checkpoint(graph) {
-	return { nodes: graph.nodes.length, added: graph.added.length };
-}
-
-/**
- * @param {Graph} graph
- * @param {Checkpoint} checkpoint
- */
-export function release_checkpoint(graph, checkpoint) {
-	graph.added.length = checkpoint.added;
-}
-
-/**
- * @param {Graph} graph
- * @param {Checkpoint} checkpoint
- */
-export function rollback(graph, checkpoint) {
-	for (let i = graph.added.length - 1; i >= checkpoint.added; i -= 1) {
-		graph.identities.delete(graph.added[i]);
+export function capture(graph, value, validate) {
+	if (graph.capturing) throw new Error('devalue: capture cannot be re-entered');
+	const nodes = graph.nodes.length;
+	const keys = graph.keys.length;
+	const key_kinds = graph.key_kinds.length;
+	const identities = [];
+	graph.capturing = true;
+	graph.provisional_identities = identities;
+	try {
+		const node = discover(graph, value, identities);
+		validate?.();
+		return node;
+	} catch (error) {
+		for (let i = identities.length - 1; i >= 0; i--) graph.identities.delete(identities[i]);
+		graph.nodes.length = nodes;
+		throw error;
+	} finally {
+		graph.keys.length = keys;
+		graph.key_kinds.length = key_kinds;
+		graph.provisional_identities = undefined;
+		graph.capturing = false;
 	}
-	graph.added.length = checkpoint.added;
-	graph.nodes.length = checkpoint.nodes;
 }
 
 /**
  * Discovers a value into the graph and returns its canonical node, or undefined for primitives.
  *
- * @param {Graph} graph
+ * @param {CapturedGraph} graph
  * @param {unknown} value
- * @returns {GraphNode | undefined}
+ * @returns {CapturedNode | undefined}
  */
-export function discover(graph, value) {
+export function discover(graph, value, identities) {
 	if (is_primitive(value)) {
 		if (typeof value === 'symbol') throw error(graph, 'Cannot stringify a Symbol primitive', value);
 		return undefined;
@@ -154,7 +152,7 @@ export function discover(graph, value) {
 	const existing = graph.identities.get(identity);
 	if (existing) return existing;
 
-	/** @type {GraphNode} */
+	/** @type {CapturedNode} */
 	const node = {
 		id: graph.nodes.length,
 		value,
@@ -168,11 +166,19 @@ export function discover(graph, value) {
 		early: false,
 		latest: -1,
 		name: '',
+		rendering: false,
+		region_id: 0,
+		position: 0,
+		uses: 0,
+		hoisted: false,
+		early: false,
+		latest: -1,
+		name: '',
 		rendering: false
 	};
 	graph.nodes.push(node);
 	graph.identities.set(identity, node);
-	graph.added.push(identity);
+	(identities ?? graph.provisional_identities)?.push(identity);
 
 	const classification = graph.classify(value, node);
 	node.kind = classification.kind;
@@ -183,7 +189,7 @@ export function discover(graph, value) {
 
 /**
  * Captures the built-in reconstruction plan for a reserved non-primitive value.
- * @param {Graph} graph
+ * @param {CapturedGraph} graph
  * @param {any} value
  * @returns {Classification}
  */
@@ -301,7 +307,7 @@ function builtin_classify(graph, value) {
 }
 
 /**
- * @param {Graph} graph
+ * @param {CapturedGraph} graph
  * @param {unknown} value
  * @returns {ValueRef}
  */
@@ -311,7 +317,7 @@ function edge(graph, value) {
 }
 
 /**
- * @param {Graph} graph
+ * @param {CapturedGraph} graph
  * @param {string} message
  * @param {unknown} value
  */
