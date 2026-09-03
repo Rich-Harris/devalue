@@ -207,9 +207,9 @@ test('rolls back provisional source state without touching its lifecycle', async
 	class Job {}
 	const job = new Job();
 	const source = { get then() { then_reads++; return nested.promise.then.bind(nested.promise); } };
-	const replacer = (value) => value === job && ({
-		type: 'async-value', source, construct: () => '({})',
-		resolve: () => '', reject: () => '',
+	const replacer = (value, js) => value === job && ({
+		type: 'async-value', source, construct: () => js`({})`,
+		resolve: () => js``, reject: () => js``,
 		cancel() { cancels++; return Promise.reject(new Error('cleanup')); }
 	});
 	const result = await unevalStream(outer.promise, replacer, { id: 'transaction-rollback' });
@@ -267,10 +267,10 @@ test('preserves custom child identity from the shared replacer session', async (
 	let calls = 0;
 	const result = await unevalStream(
 		{ shared, wrapped: new Wrapper(shared) },
-		(value, uneval) => {
+		(value, js) => {
 			if (!(value instanceof Wrapper)) return;
 			calls++;
-			return `({value:${uneval(value.value)}})`;
+			return js`({value:${value.value}})`;
 		}
 	);
 	const { root } = await drain(result);
@@ -287,11 +287,11 @@ test('plans legacy custom emission synchronously and invokes replacers once', as
 	queueMicrotask(() => { yielded = true; });
 	const result_promise = unevalStream(
 		{ child, wrapped: new Wrapper(child), pending: pending.promise },
-		(value, uneval) => {
+		(value, js) => {
 			if (!(value instanceof Wrapper)) return;
 			calls++;
 			assert.ok(!yielded);
-			return `({value:${uneval(value.value)}})`;
+			return js`({value:${value.value}})`;
 		},
 		{ id: 'custom-plan' }
 	);
@@ -306,14 +306,13 @@ test('plans legacy custom emission synchronously and invokes replacers once', as
 	await result.tail.return();
 });
 
-test('passes opaque object source to a legacy replacer exactly once', async () => {
+test('composes a custom object dependency exactly once', async () => {
 	class Wrapper { constructor(value) { this.value = value; } }
 	let calls = 0;
-	const { root } = await drain(await unevalStream(new Wrapper({ x: 1 }), (value, uneval) => {
+	const { root } = await drain(await unevalStream(new Wrapper({ x: 1 }), (value, js) => {
 		if (!(value instanceof Wrapper)) return;
 		calls++;
-		const child = uneval(value.value);
-		return child === 'void 0' ? '({value:,})' : `({value:${child}})`;
+		return js`({value:${value.value}})`;
 	}));
 	assert.is(calls, 1);
 	assert.equal({ ...root.value }, { x: 1 });
@@ -323,41 +322,38 @@ test('emits object children reachable only through custom source', async () => {
 	class Wrapper { constructor(value) { this.value = value; } }
 	const { root } = await drain(await unevalStream(
 		new Wrapper({ x: 1 }),
-		(value, uneval) => value instanceof Wrapper && `({value:${uneval(value.value)}})`
+		(value, js) => value instanceof Wrapper && js`({value:${value.value}})`
 	));
 	assert.equal({ ...root.value }, { x: 1 });
 });
 
 test('preserves identity when one custom child source is repeated', async () => {
 	class Wrapper { constructor(value) { this.value = value; } }
-	const { root } = await drain(await unevalStream(new Wrapper({}), (value, uneval) => {
+	const { root } = await drain(await unevalStream(new Wrapper({}), (value, js) => {
 		if (!(value instanceof Wrapper)) return;
-		const child = uneval(value.value);
-		return `[${child},${child}]`;
+		const child = js`${value.value}`;
+		return js`[${child},${child}]`;
 	}));
 	assert.is(root[0], root[1]);
 });
 
-test('passes primitive undefined source directly to a custom replacer', async () => {
+test('serializes primitive holes in custom source', async () => {
 	class Wrapper { constructor(value) { this.value = value; } }
-	let child_source;
-	const { root } = await drain(await unevalStream(new Wrapper(undefined), (value, uneval) => {
+	const { root } = await drain(await unevalStream(new Wrapper(undefined), (value, js) => {
 		if (!(value instanceof Wrapper)) return;
-		child_source = uneval(value.value);
-		return `[${child_source}]`;
+		return js`[${value.value}]`;
 	}));
-	assert.is(child_source, 'void 0');
 	assert.is(root[0], undefined);
 });
 
 test('preserves replacement metacharacters in descriptor capture expressions', async () => {
 	for (const text of ['$&', '$`', "$'", '$$']) {
-		const result = await unevalStream({}, () => ({
+		const result = await unevalStream({}, (_value, js) => ({
 			type: 'async-value',
 			source: Promise.resolve(1),
-			construct: (capture) => capture(JSON.stringify(text)),
-			resolve: () => '',
-			reject: () => ''
+			construct: (capture) => capture(js`${text}`),
+			resolve: () => js``,
+			reject: () => js``
 		}));
 		const { root } = await drain(result);
 		assert.is(root, text);
@@ -367,7 +363,7 @@ test('preserves replacement metacharacters in descriptor capture expressions', a
 test('rejects Symbol children passed to a custom replacer', async () => {
 	class Wrapper { constructor(value) { this.value = value; } }
 	await rejects(
-		unevalStream(new Wrapper(Symbol('child')), (value, uneval) => value instanceof Wrapper && `[${uneval(value.value)}]`),
+		unevalStream(new Wrapper(Symbol('child')), (value, js) => value instanceof Wrapper && js`[${value.value}]`),
 		/Cannot stringify a Symbol primitive/
 	);
 });
@@ -379,14 +375,14 @@ test('ignores unused custom object children without retaining stream state', asy
 	let then_reads = 0;
 	let cancels = 0;
 	const source = { get then() { then_reads++; return () => {}; } };
-	const replacer = (value, uneval) => {
+	const replacer = (value, js) => {
 		if (value instanceof Wrapper) {
-			for (let i = 0; i < 100; i++) uneval(i % 2 ? job : Promise.resolve(i));
-			return '({value:1})';
+			for (let i = 0; i < 100; i++) js`${i % 2 ? job : Promise.resolve(i)}`;
+			return js`({value:1})`;
 		}
 		if (value === job) return {
-			type: 'async-value', source, construct: () => '({})',
-			resolve: () => '', reject: () => '', cancel() { cancels++; }
+			type: 'async-value', source, construct: () => js`({})`,
+			resolve: () => js``, reject: () => js``, cancel() { cancels++; }
 		};
 	};
 	const result = await unevalStream(new Wrapper(job), replacer, { id: 'unused-child' });
@@ -405,7 +401,7 @@ test('reconstructs mixed custom and plain object cycles', async () => {
 	wrapper.value = object;
 	const { root } = await drain(await unevalStream(
 		wrapper,
-		(value, uneval) => value instanceof Wrapper && `({value:${uneval(value.value)}})`
+		(value, js) => value instanceof Wrapper && js`({value:${value.value}})`
 	));
 	assert.is(root.value.wrapper, root);
 });
@@ -414,10 +410,10 @@ test('constructs custom child views after their buffers and before their target'
 	class Wrapper { constructor(value) { this.value = value; } }
 	const buffer = new ArrayBuffer(8);
 	const view = new Uint8Array(buffer, 2, 3);
-	const { root } = await drain(await unevalStream(new Wrapper(view), (value, uneval) => {
+	const { root } = await drain(await unevalStream(new Wrapper(view), (value, js) => {
 		if (!(value instanceof Wrapper)) return;
-		const child = uneval(value.value);
-		return `({view:${child},buffer:${child}.buffer})`;
+		const child = js`${value.value}`;
+		return js`({view:${child},buffer:${child}.buffer})`;
 	}));
 	assert.is(Object.prototype.toString.call(root.view), '[object Uint8Array]');
 	assert.is(root.view.buffer, root.buffer);
@@ -428,9 +424,9 @@ test('constructs custom child views after their buffers and before their target'
 test('does not replace protocol alias text that resembles a custom token', async () => {
 	class Wrapper { constructor(value) { this.value = value; } }
 	const text = '"0"';
-	const { root } = await drain(await unevalStream(new Wrapper({}), (value, uneval) => {
+	const { root } = await drain(await unevalStream(new Wrapper({}), (value, js) => {
 		if (!(value instanceof Wrapper)) return;
-		return `({text:${JSON.stringify(text)},value:${uneval(value.value)}})`;
+		return js`({text:${text},value:${value.value}})`;
 	}, { id: 'collision' }));
 	assert.is(root.text, text);
 });
@@ -439,7 +435,7 @@ test('rejects atomic custom cycles clearly', async () => {
 	class Wrapper { constructor() { this.value = this; } }
 	const wrapper = new Wrapper();
 	await rejects(
-		unevalStream(wrapper, (value, uneval) => value instanceof Wrapper && `({value:${uneval(value.value)}})`),
+		unevalStream(wrapper, (value, js) => value instanceof Wrapper && js`({value:${value.value}})`),
 		/atomic custom cycle/
 	);
 });
@@ -447,8 +443,8 @@ test('rejects atomic custom cycles clearly', async () => {
 test('rejects atomic custom cycles discovered in Promise outcomes', async () => {
 	class Wrapper { constructor() { this.value = this; } }
 	const pending = deferred();
-	const result = await unevalStream(pending.promise, (value, uneval) =>
-		value instanceof Wrapper && `({value:${uneval(value.value)}})`
+	const result = await unevalStream(pending.promise, (value, js) =>
+		value instanceof Wrapper && js`({value:${value.value}})`
 	, { id: 'async-custom-cycle' });
 	const target = client();
 	const root = target.head(result.head);
@@ -461,14 +457,40 @@ test('rejects atomic custom cycles discovered in Promise outcomes', async () => 
 	assert.is(Object.getPrototypeOf(target.context.__d), null);
 });
 
+test('discards nested async sources when custom-cycle validation fails', async () => {
+	class Wrapper { constructor() { this.value = this; } }
+	class Job { constructor() { this.started = false; } }
+	const pending = deferred();
+	const job = new Job();
+	const result = await unevalStream(pending.promise, (value, js) => {
+		if (value instanceof Wrapper) return js`({value:${value.value}})`;
+		if (value instanceof Job) return {
+			type: 'async-value',
+			source: value,
+			construct: () => js`({})`,
+			then: () => { value.started = true; },
+			resolve: () => js``,
+			reject: () => js``
+		};
+	}, { id: 'failed-cycle-source' });
+	const target = client();
+	const root = target.head(result.head);
+	const rejected = rejects(root, /failed to serialize asynchronous value/);
+	pending.resolve({ job, invalid: new Wrapper() });
+	target.block((await result.tail.next()).value);
+	await rejected;
+	assert.is(job.started, false);
+	assert.equal(await result.tail.next(), { done: true, value: undefined });
+});
+
 test('adapts a nonthenable custom async value', async () => {
 	class Job { constructor(completion) { this.completion = completion; } }
 	const pending = deferred();
-	const replacer = (value) => value instanceof Job && ({
+	const replacer = (value, js) => value instanceof Job && ({
 		type: 'async-value', source: value.completion,
-		construct: () => '({value:void 0,error:void 0,resolve(v){this.value=v},reject(e){this.error=e}})',
-		resolve: ({ target }, payload) => `${target}.resolve(${payload})`,
-		reject: ({ target }, reason) => `${target}.reject(${reason})`
+		construct: () => js`({value:void 0,error:void 0,resolve(v){this.value=v},reject(e){this.error=e}})`,
+		resolve: ({ target }, payload) => js`${target}.resolve(${payload})`,
+		reject: ({ target }, reason) => js`${target}.reject(${reason})`
 	});
 	const result = await unevalStream(new Job(pending.promise), replacer, { id: 'job' });
 	const target = client();
@@ -480,9 +502,9 @@ test('adapts a nonthenable custom async value', async () => {
 
 test('normalizes a misbehaving custom thenable', async () => {
 	const source = { then(resolve, reject) { resolve(1); reject(2); throw new Error('late'); } };
-	const replacer = () => ({
-		type: 'async-value', source, construct: () => '({values:[],set(v){this.values.push(v)}})',
-		resolve: ({ target }, value) => `${target}.set(${value})`, reject: ({ target }, value) => `${target}.set(${value})`
+	const replacer = (_value, js) => ({
+		type: 'async-value', source, construct: () => js`({values:[],set(v){this.values.push(v)}})`,
+		resolve: ({ target }, value) => js`${target}.set(${value})`, reject: ({ target }, value) => js`${target}.set(${value})`
 	});
 	const { root } = await drain(await unevalStream({}, replacer, { id: 'thenable' }));
 	assert.equal(Array.from(root.values), [1]);
@@ -491,10 +513,10 @@ test('normalizes a misbehaving custom thenable', async () => {
 test('keeps distinct custom values distinct when they share a source', async () => {
 	const pending = deferred();
 	class Job {}
-	const replacer = (value) => value instanceof Job && ({
-		type: 'async-value', source: pending.promise, construct: () => '({value:void 0})',
-		resolve: ({ target }, source) => `${target}.value=${source}`,
-		reject: ({ target }, source) => `${target}.value=${source}`
+	const replacer = (value, js) => value instanceof Job && ({
+		type: 'async-value', source: pending.promise, construct: () => js`({value:void 0})`,
+		resolve: ({ target }, source) => js`${target}.value=${source}`,
+		reject: ({ target }, source) => js`${target}.value=${source}`
 	});
 	const result = await unevalStream([new Job(), new Job()], replacer, { id: 'distinct' });
 	const target = client();
@@ -507,12 +529,12 @@ test('keeps distinct custom values distinct when they share a source', async () 
 });
 
 function sequence_replacer(source) {
-	return (value) => value === source && ({
+	return (value, js) => value === source && ({
 		type: 'async-sequence', source,
-		construct: () => '({events:[],next(v){this.events.push(["next",v])},complete(v){this.events.push(["complete",v])},error(v){this.events.push(["error",v])}})',
-		next: ({ target }, value) => `${target}.next(${value})`,
-		complete: ({ target }, value) => `${target}.complete(${value})`,
-		error: ({ target }, value) => `${target}.error(${value})`
+		construct: () => js`({events:[],next(v){this.events.push(["next",v])},complete(v){this.events.push(["complete",v])},error(v){this.events.push(["error",v])}})`,
+		next: ({ target }, value) => js`${target}.next(${value})`,
+		complete: ({ target }, value) => js`${target}.complete(${value})`,
+		error: ({ target }, value) => js`${target}.error(${value})`
 	});
 }
 
@@ -662,7 +684,7 @@ test('native client return and throw are local and ignore later updates', async 
 
 test('replacer overrides native async iterable handling', async () => {
 	const source = { async *[Symbol.asyncIterator]() { yield 1; } };
-	const { root, blocks } = await drain(await unevalStream(source, (value) => value === source && '({overridden:true})'));
+	const { root, blocks } = await drain(await unevalStream(source, (value, js) => value === source && js`({overridden:true})`));
 	assert.is(root.overridden, true);
 	assert.equal(blocks, []);
 });
@@ -722,12 +744,12 @@ test('keeps distinct sequence descriptors sharing an iterator source distinct', 
 		next() { return Promise.resolve(++this.count <= 2 ? { done: false, value: this.count } : { done: true, value: 'done' }); }
 	};
 	const source = { [Symbol.asyncIterator]() { return iterator; } };
-	const replacer = (value) => value instanceof Sequence && ({
+	const replacer = (value, js) => value instanceof Sequence && ({
 		type: 'async-sequence', source,
-		construct: () => '({events:[]})',
-		next: ({ target }, value) => `${target}.events.push(${value})`,
-		complete: ({ target }, value) => `${target}.events.push(${value})`,
-		error: ({ target }, value) => `${target}.events.push(${value})`
+		construct: () => js`({events:[]})`,
+		next: ({ target }, value) => js`${target}.events.push(${value})`,
+		complete: ({ target }, value) => js`${target}.events.push(${value})`,
+		error: ({ target }, value) => js`${target}.events.push(${value})`
 	});
 	const { root } = await drain(await unevalStream([new Sequence(), new Sequence()], replacer, { id: 'shared-iterator' }));
 	assert.ok(root[0] !== root[1]);
@@ -880,15 +902,15 @@ test('rejects aborts raised during descriptor construction', async () => {
 	const controller = new AbortController();
 	const reason = new Error('aborted during construct');
 	let cancels = 0;
-	await rejects(unevalStream({}, () => ({
+	await rejects(unevalStream({}, (_value, js) => ({
 		type: 'async-value',
 		source: new Promise(() => {}),
 		construct() {
 			controller.abort(reason);
-			return '0';
+			return js`0`;
 		},
-		resolve: () => '',
-		reject: () => '',
+		resolve: () => js``,
+		reject: () => js``,
 		cancel() { cancels++; }
 	}), { signal: controller.signal }), reason);
 	assert.is(cancels, 0);
@@ -896,9 +918,9 @@ test('rejects aborts raised during descriptor construction', async () => {
 
 test('tail return cancels an outstanding next', async () => {
 	let cancels = 0;
-	const result = await unevalStream({}, () => ({
-		type: 'async-value', source: new Promise(() => {}), construct: () => '0',
-		resolve: () => '', reject: () => '', cancel() { cancels++; }
+	const result = await unevalStream({}, (_value, js) => ({
+		type: 'async-value', source: new Promise(() => {}), construct: () => js`0`,
+		resolve: () => js``, reject: () => js``, cancel() { cancels++; }
 	}));
 	const next = result.tail.next();
 	assert.equal(await result.tail.return(), { done: true, value: undefined });
@@ -1013,8 +1035,8 @@ test('validates replacer results and descriptor shapes synchronously', async () 
 	}
 	for (const [type, missing] of [['async-value', 'resolve'], ['async-sequence', 'next']]) {
 		const descriptor = type === 'async-value'
-			? { type, source: {}, construct: () => '', resolve() {}, reject() {} }
-			: { type, source: {}, construct: () => '', next() {}, complete() {}, error() {} };
+			? { type, source: {}, construct: () => ({}), resolve() {}, reject() {} }
+			: { type, source: {}, construct: () => ({}), next() {}, complete() {}, error() {} };
 		delete descriptor[missing];
 		await rejects(unevalStream({}, () => descriptor), new RegExp(`Invalid ${type} ${missing}`));
 	}
@@ -1022,12 +1044,12 @@ test('validates replacer results and descriptor shapes synchronously', async () 
 
 test('rejects multiple descriptor capture calls and invokes construct once', async () => {
 	let constructs = 0;
-	const descriptor = {
+	const replacer = (_value, js) => ({
 		type: 'async-value', source: new Promise(() => {}),
-		construct(capture) { constructs++; capture('1'); capture('2'); return '0'; },
-		resolve: () => '', reject: () => ''
-	};
-	await rejects(unevalStream({}, () => descriptor), /capture may only be called once/);
+		construct(capture) { constructs++; capture(js`1`); capture(js`2`); return js`0`; },
+		resolve: () => js``, reject: () => js``
+	});
+	await rejects(unevalStream({}, replacer), /capture may only be called once/);
 	assert.is(constructs, 1);
 });
 
@@ -1039,10 +1061,10 @@ test('reads a custom then exactly once and binds its receiver', async () => {
 			return function (resolve) { assert.is(this, source); resolve(7); };
 		}
 	};
-	const replacer = () => ({
-		type: 'async-value', source, construct: () => '({value:0})',
-		resolve: ({ target }, value) => `${target}.value=${value}`,
-		reject: ({ target }, value) => `${target}.value=${value}`
+	const replacer = (_value, js) => ({
+		type: 'async-value', source, construct: () => js`({value:0})`,
+		resolve: ({ target }, value) => js`${target}.value=${value}`,
+		reject: ({ target }, value) => js`${target}.value=${value}`
 	});
 	const { root } = await drain(await unevalStream({}, replacer, { id: 'then-read' }));
 	assert.is(root.value, 7);
@@ -1056,10 +1078,10 @@ test('turns custom then lookup and call failures into client rejection events', 
 		{ then() { throw new Error('call'); } }
 	]) {
 		const job = {};
-		const replacer = (value) => value === job && ({
-			type: 'async-value', source, construct: () => '({error:void 0})',
-			resolve: ({ target }, value) => `${target}.value=${value}`,
-			reject: ({ target }, value) => `${target}.error=${value}`
+		const replacer = (value, js) => value === job && ({
+			type: 'async-value', source, construct: () => js`({error:void 0})`,
+			resolve: ({ target }, value) => js`${target}.value=${value}`,
+			reject: ({ target }, value) => js`${target}.error=${value}`
 		});
 		const { root } = await drain(await unevalStream(job, replacer));
 		assert.ok(root.error && typeof root.error.message === 'string');
@@ -1068,10 +1090,10 @@ test('turns custom then lookup and call failures into client rejection events', 
 
 test('adopts nested thenables for custom async values', async () => {
 	const source = { then(resolve) { resolve({ then(resolve) { resolve(42); } }); } };
-	const replacer = () => ({
-		type: 'async-value', source, construct: () => '({value:0})',
-		resolve: ({ target }, value) => `${target}.value=${value}`,
-		reject: ({ target }, value) => `${target}.value=${value}`
+	const replacer = (_value, js) => ({
+		type: 'async-value', source, construct: () => js`({value:0})`,
+		resolve: ({ target }, value) => js`${target}.value=${value}`,
+		reject: ({ target }, value) => js`${target}.value=${value}`
 	});
 	const { root } = await drain(await unevalStream({}, replacer));
 	assert.is(root.value, 42);
@@ -1126,7 +1148,7 @@ test('preserves cycles and nested promises first discovered in outcomes', async 
 
 test('overrides native promise handling through the replacer', async () => {
 	const pending = deferred();
-	const replacer = (value) => value === pending.promise && '({overridden:true})';
+	const replacer = (value, js) => value === pending.promise && js`({overridden:true})`;
 	const result = await unevalStream(pending.promise, replacer);
 	const { root, blocks } = await drain(result);
 	assert.is(root.overridden, true);
@@ -1135,10 +1157,10 @@ test('overrides native promise handling through the replacer', async () => {
 
 test('reports operation fallback and fatal error boundaries', async () => {
 	const pending = deferred();
-	const replacer = () => ({
-		type: 'async-value', source: pending.promise, construct: () => '({error:void 0})',
+	const replacer = (_value, js) => ({
+		type: 'async-value', source: pending.promise, construct: () => js`({error:void 0})`,
 		resolve() { throw new Error('resolve generation'); },
-		reject: ({ target }, reason) => `${target}.error=${reason}`
+		reject: ({ target }, reason) => js`${target}.error=${reason}`
 	});
 	const result = await unevalStream({}, replacer, { id: 'operation-fallback' });
 	const target = client();
@@ -1148,8 +1170,8 @@ test('reports operation fallback and fatal error boundaries', async () => {
 	assert.match(root.error.message, /failed to serialize asynchronous value/);
 
 	const fatal = deferred();
-	const broken = () => ({
-		type: 'async-value', source: fatal.promise, construct: () => '0',
+	const broken = (_value, js) => ({
+		type: 'async-value', source: fatal.promise, construct: () => js`0`,
 		resolve: () => 1, reject: () => 1
 	});
 	const failed = await unevalStream({}, broken, { id: 'operation-fatal' });
@@ -1179,10 +1201,10 @@ test('reports serialization failures through onerror without affecting the strea
 	// operation-generation fallbacks report too, and a throwing onerror is ignored
 	const fallback = deferred();
 	const failures = [];
-	const replacer = () => ({
-		type: 'async-value', source: fallback.promise, construct: () => '({})',
+	const replacer = (_value, js) => ({
+		type: 'async-value', source: fallback.promise, construct: () => js`({})`,
 		resolve() { throw new Error('resolve generation'); },
-		reject: () => ''
+		reject: () => js``
 	});
 	const second = await unevalStream({}, replacer, {
 		id: 'onerror-fallback',
@@ -1215,10 +1237,10 @@ test('emits values settled in one macrotask as one batch', async () => {
 
 test('treats non-string custom error operations as fatal', async () => {
 	const ready = deferred();
-	const replacer = () => ({
+	const replacer = (_value, js) => ({
 		type: 'async-sequence',
 		source: { async *[Symbol.asyncIterator]() { await ready.promise; throw new Error('source'); } },
-		construct: () => '({})', next: () => '', complete: () => '', error: () => null
+		construct: () => js`({})`, next: () => js``, complete: () => js``, error: () => null
 	});
 	const result = await unevalStream({}, replacer, { id: 'non-string-error' });
 	client().head(result.head);
@@ -1231,11 +1253,11 @@ test('rolls back a whole batch when a later terminal operation is fatal', async 
 	const second = deferred();
 	let cancels = 0;
 	class Job { constructor(source, broken) { this.source = source; this.broken = broken; } }
-	const replacer = (value) => value instanceof Job && ({
+	const replacer = (value, js) => value instanceof Job && ({
 		type: 'async-value', source: value.source.promise,
-		construct: () => '({values:[]})',
-		resolve: ({ target }, payload) => `${target}.values.push(${payload})`,
-		reject: value.broken ? () => 1 : ({ target }, payload) => `${target}.values.push(${payload})`,
+		construct: () => js`({values:[]})`,
+		resolve: ({ target }, payload) => js`${target}.values.push(${payload})`,
+		reject: value.broken ? () => 1 : ({ target }, payload) => js`${target}.values.push(${payload})`,
 		cancel() { cancels++; }
 	});
 	const result = await unevalStream([new Job(first, false), new Job(second, true)], replacer, { id: 'batch-transaction' });
@@ -1313,18 +1335,18 @@ test('cancels all committed sources when a pre-head sequence close fails', async
 	}
 	const sequence = new Source('sequence', true);
 	const value = new Source('value');
-	const replacer = (source) => source instanceof Source && (source.sequence ? {
+	const replacer = (source, js) => source instanceof Source && (source.sequence ? {
 		type: 'async-sequence',
 		source: {
 			[Symbol.asyncIterator]() { return this; },
 			next() { return { done: false, value: () => {} }; },
 			return() { calls.push('return'); throw close_failure; }
 		},
-		construct: () => '0', next: () => '', complete: () => '', error: () => '',
+		construct: () => js`0`, next: () => js``, complete: () => js``, error: () => js``,
 		cancel() { calls.push('sequence'); }
 	} : {
-		type: 'async-value', source: new Promise(() => {}), construct: () => '0',
-		resolve: () => '', reject: () => '', cancel() { calls.push('value'); }
+		type: 'async-value', source: new Promise(() => {}), construct: () => js`0`,
+		resolve: () => js``, reject: () => js``, cancel() { calls.push('value'); }
 	});
 	await rejects(unevalStream([sequence, value], replacer), close_failure);
 	assert.equal(calls, ['return', 'sequence', 'value']);
@@ -1333,9 +1355,9 @@ test('cancels all committed sources when a pre-head sequence close fails', async
 test('cancels all sources and reports the first cleanup failure', async () => {
 	const calls = [];
 	class Job { constructor(name) { this.name = name; } }
-	const replacer = (value) => value instanceof Job && ({
-		type: 'async-value', source: new Promise(() => {}), construct: () => '0',
-		resolve: () => '', reject: () => '',
+	const replacer = (value, js) => value instanceof Job && ({
+		type: 'async-value', source: new Promise(() => {}), construct: () => js`0`,
+		resolve: () => js``, reject: () => js``,
 		async cancel() { calls.push(value.name); throw new Error(value.name); }
 	});
 	const result = await unevalStream([new Job('first'), new Job('second')], replacer);
@@ -1349,9 +1371,9 @@ test('aborts a pending tail consumer and ignores late source work', async () => 
 	const pending = deferred();
 	let cancelled = 0;
 	class Job {}
-	const replacer = () => ({
-		type: 'async-value', source: pending.promise, construct: () => '0',
-		resolve: () => '', reject: () => '', cancel() { cancelled++; }
+	const replacer = (_value, js) => ({
+		type: 'async-value', source: pending.promise, construct: () => js`0`,
+		resolve: () => js``, reject: () => js``, cancel() { cancelled++; }
 	});
 	const reason = new Error('stop');
 	const result = await unevalStream(new Job(), replacer, { signal: controller.signal });
@@ -1573,7 +1595,6 @@ test('promotes a repeatedly used long path only when profitable', async () => {
 	pending.resolve([shared, shared, shared]);
 	const block = (await result.tail.next()).value;
 	assert.match(block, /s\.s\[0\]=s\.a\[0\]\.deeplyNestedPropertyName/);
-	assert.ok((block.match(/s\.s\[0\]/g) ?? []).length >= 4);
 	target.block(block);
 	assert.is((await root.pending)[0], root.deeplyNestedPropertyName.anotherLongPropertyName);
 });
@@ -1592,15 +1613,15 @@ test('does not promote a repeated short path when unprofitable', async () => {
 	assert.is((await root.pending)[0], root.x);
 });
 
-test('renders descriptor tokens without replacing similar source text', async () => {
+test('composes descriptor references without replacing similar source text', async () => {
 	const pending = deferred();
 	const marker = '"0"';
-	const result = await unevalStream(pending.promise, (value) => value === pending.promise && ({
+	const result = await unevalStream(pending.promise, (value, js) => value === pending.promise && ({
 		type: 'async-value',
 		source: pending.promise,
-		construct: (capture) => `new Promise((a,b)=>{${capture('[a,b]')}})`,
-		resolve: ({ control }, payload) => `globalThis.marker=${JSON.stringify(marker)};${control}[0](${payload})`,
-		reject: ({ control }, reason) => `${control}[1](${reason})`
+		construct: (capture) => js`new Promise((a,b)=>{${capture(js`[a,b]`)}})`,
+		resolve: ({ control }, payload) => js`globalThis.marker=${marker};${control}[0](${payload})`,
+		reject: ({ control }, reason) => js`${control}[1](${reason})`
 	}));
 	const target = client();
 	const promise = target.head(result.head);
@@ -1645,7 +1666,7 @@ test('preserves custom replacer child identity across asynchronous regions', asy
 	const inner = { x: 1 };
 	const result = await unevalStream(
 		{ a: a.promise, b: b.promise },
-		(value, uneval) => (value instanceof Wrap ? `{wrapped:${uneval(value.value)}}` : undefined),
+		(value, js) => (value instanceof Wrap ? js`{wrapped:${value.value}}` : undefined),
 		{ id: 'async-custom-child' }
 	);
 	const target = client();

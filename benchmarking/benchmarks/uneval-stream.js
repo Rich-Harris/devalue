@@ -17,10 +17,10 @@ class Atomic {
 	}
 }
 
-/** @param {unknown} value @param {(value: unknown) => string} uneval */
-function replacer(value, uneval) {
-	if (value instanceof Wrapper) return `({value:${uneval(value.value)}})`;
-	if (value instanceof Atomic) return `new Atomic(${uneval(value.value)})`;
+/** @param {unknown} value @param {import('../../src/types.js').JavaScriptTag} js */
+function replacer(value, js) {
+	if (value instanceof Wrapper) return js`({value:${value.value}})`;
+	if (value instanceof Atomic) return js`new Atomic(${value.value})`;
 }
 
 /** @param {number} depth @param {number} breadth */
@@ -118,7 +118,7 @@ function atomic_graph() {
  * @param {string} label
  * @param {unknown} value
  * @param {number} iterations
- * @param {((value: unknown, uneval: (value: unknown) => string) => string | void)} [custom_replacer]
+ * @param {import('../../src/types.js').UnevalStreamReplacer} [custom_replacer]
  */
 function sync_benchmark(label, value, iterations, custom_replacer) {
 	const run = async () => {
