@@ -41,7 +41,7 @@ import {
  * @property {number} latest Furthest declaration position reached by expanding this node inline.
  * @property {string} name Temporary variable name, or an empty string when the node is inlined.
  * @property {boolean} rendering Whether this node is currently being expanded inline.
- * @property {boolean} [opaque] Whether emission must preserve this node as a named value rather than inspect and duplicate it inline.
+ * @property {number} opaque Number of custom constructors embedding this node; when positive, emission must preserve it as a named value rather than duplicate it inline.
  */
 /**
  * A reusable snapshot of the non-primitive values discovered during one stream session.
@@ -53,8 +53,6 @@ import {
  * @property {(value: unknown, node: CapturedNode) => Classification} classify Produces a custom or built-in reconstruction plan for a reserved node.
  * @property {unknown[]} keys Raw property, array-index, or map-key segments leading to the value currently being discovered.
  * @property {number[]} key_kinds How each entry in `keys` should be formatted in an error path: array index, property, or map key.
- * @property {boolean} capturing Whether a synchronous capture is in progress.
- * @property {object[] | undefined} provisional_identities Identities reserved by the active capture.
  */
 
 const ARRAY_INDEX = 0;
@@ -75,12 +73,10 @@ const MAP_KEY = 2;
  * this per-emission analysis. They are reset for nodes in the current walk; `region_id`
  * distinguishes those results from values left on nodes by previous walks.
  *
- * Callers take a checkpoint for each independently recoverable transaction before
- * calling `discover`. The transaction includes every node added while recursively
- * walking the value. We do not tag each addition; instead, the checkpoint records the
- * starting lengths of `nodes` and `added`. Anything appended afterward is provisional.
- * If capture fails, the caller removes those additions and their identity entries,
- * leaving the graph as it was before the capture began.
+ * The graph is append-only. A caller that needs atomic discovery records `nodes.length`
+ * before calling `discover` and passes it to `rollback` if discovery throws: every node
+ * appended since is removed along with its identity entry, so no per-addition tagging
+ * is needed and the success path pays nothing.
  *
  * @param {unknown} root
  * @param {(value: unknown, node: CapturedNode, graph: CapturedGraph) => Classification | false} custom_classify
@@ -94,54 +90,37 @@ export function create_captured_graph(root, custom_classify) {
 		identities: new Map(),
 		classify: (value, node) => custom_classify(value, node, graph) || builtin_classify(graph, value),
 		keys: [],
-		key_kinds: [],
-		capturing: false,
-		provisional_identities: undefined
+		key_kinds: []
 	};
 	return graph;
 }
 
 /**
- * Atomically discovers a value and all of its dependencies. Recursive calls to
- * `discover` share this capture; a thrown classification removes every provisional identity.
+ * Removes every node appended since `mark` (a previously observed `nodes.length`) and
+ * clears the error-path stack left behind by an interrupted walk.
  *
  * @param {CapturedGraph} graph
- * @param {unknown} value
- * @param {() => void} [validate]
- * @returns {CapturedNode | undefined}
+ * @param {number} mark
  */
-export function capture(graph, value, validate) {
-	if (graph.capturing) throw new Error('devalue: capture cannot be re-entered');
-	const nodes = graph.nodes.length;
-	const keys = graph.keys.length;
-	const key_kinds = graph.key_kinds.length;
-	const identities = [];
-	graph.capturing = true;
-	graph.provisional_identities = identities;
-	try {
-		const node = discover(graph, value, identities);
-		validate?.();
-		return node;
-	} catch (error) {
-		for (let i = identities.length - 1; i >= 0; i--) graph.identities.delete(identities[i]);
-		graph.nodes.length = nodes;
-		throw error;
-	} finally {
-		graph.keys.length = keys;
-		graph.key_kinds.length = key_kinds;
-		graph.provisional_identities = undefined;
-		graph.capturing = false;
-	}
+export function rollback(graph, mark) {
+	const nodes = graph.nodes;
+	const identities = graph.identities;
+	for (let i = nodes.length - 1; i >= mark; i--) identities.delete(nodes[i].value);
+	nodes.length = mark;
+	graph.keys.length = 0;
+	graph.key_kinds.length = 0;
 }
 
 /**
  * Discovers a value into the graph and returns its canonical node, or undefined for primitives.
+ * Top-level discovery is never re-entered while in progress; nested calls from a custom
+ * classifier share the walk in progress.
  *
  * @param {CapturedGraph} graph
  * @param {unknown} value
  * @returns {CapturedNode | undefined}
  */
-export function discover(graph, value, identities) {
+export function discover(graph, value) {
 	if (is_primitive(value)) {
 		if (typeof value === 'symbol') throw error(graph, 'Cannot stringify a Symbol primitive', value);
 		return undefined;
@@ -158,14 +137,7 @@ export function discover(graph, value, identities) {
 		kind: '',
 		data: undefined,
 		edges: [],
-		region_id: 0,
-		position: 0,
-		uses: 0,
-		hoisted: false,
-		early: false,
-		latest: -1,
-		name: '',
-		rendering: false,
+		opaque: 0,
 		region_id: 0,
 		position: 0,
 		uses: 0,
@@ -177,7 +149,6 @@ export function discover(graph, value, identities) {
 	};
 	graph.nodes.push(node);
 	graph.identities.set(identity, node);
-	(identities ?? graph.provisional_identities)?.push(identity);
 
 	const classification = graph.classify(value, node);
 	node.kind = classification.kind;
