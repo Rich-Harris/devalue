@@ -1,6 +1,6 @@
 import { suite } from 'uvu';
 import * as assert from 'uvu/assert';
-import { create_captured_graph, discover, rollback } from './graph.js';
+import { child, create_captured_graph, discover, rollback } from './graph.js';
 
 const test = suite('shared graph');
 const create_test_graph = (root) => create_captured_graph(root, () => false);
@@ -17,10 +17,11 @@ test('records one node per identity', () => {
 	assert.is(graph.identities.get(shared), graph.nodes[1]);
 });
 
-test('captures sparse arrays and container order as canonical edges', () => {
+test('captures sparse arrays and container order as direct children', () => {
 	const key = {};
 	const array = Array(5);
 	array[3] = key;
+	array[4] = 'primitive';
 	const map = new Map([[key, array]]);
 	const set = new Set([array, key]);
 	const root = { map, set };
@@ -28,10 +29,12 @@ test('captures sparse arrays and container order as canonical edges', () => {
 	discover(graph, root);
 
 	const array_node = graph.identities.get(array);
-	assert.equal(array_node?.data.entries.map((entry) => entry[0]), ['3']);
-	assert.is(array_node?.data.length, 5);
-	assert.equal(graph.identities.get(map)?.data.entries[0][0], { node: graph.identities.get(key)?.id });
-	assert.equal(graph.identities.get(set)?.data.values.map((edge) => edge.node), [array_node?.id, graph.identities.get(key)?.id]);
+	const key_node = graph.identities.get(key);
+	assert.equal(array_node?.keys, ['3', '4']);
+	assert.equal(array_node?.children, [key_node, 'primitive']);
+	assert.is(array_node?.data, 5);
+	assert.equal(graph.identities.get(map)?.children, [key_node, array_node]);
+	assert.equal(graph.identities.get(set)?.children, [array_node, key_node]);
 });
 
 test('applies classifications while graph owns recursive discovery', () => {
@@ -40,22 +43,19 @@ test('applies classifications while graph owns recursive discovery', () => {
 			this.value = value;
 		}
 	}
-	const child = {};
-	const root = new Box(child);
-	const graph = create_captured_graph(root, (value, _node, graph) => {
+	const inner = {};
+	const root = new Box(inner);
+	const graph = create_captured_graph(root, (value, node, graph) => {
 		if (!(value instanceof Box)) return false;
-		const captured = discover(graph, value.value);
-		return {
-			kind: 'Box',
-			data: { child: captured },
-			edges: captured ? [{ node: captured.id }] : [{ value: value.value }]
-		};
+		node.kind = 'Box';
+		node.children = [child(graph, value.value)];
+		return true;
 	});
 	const node = discover(graph, root);
 
 	assert.is(node?.kind, 'Box');
-	assert.is(node?.data.child, graph.identities.get(child));
-	assert.equal(node?.edges, [{ node: 1 }]);
+	assert.is(node?.children[0], graph.identities.get(inner));
+	assert.is(graph.nodes.length, 2);
 });
 
 test('rolls back appended identities without touching earlier captures', () => {
@@ -80,7 +80,7 @@ test('rolls back an entire failed recursive discovery', () => {
 	rollback(graph, 0);
 
 	assert.is(graph.nodes.length, 0);
-	assert.is(graph.keys.length, 0);
+	assert.is(graph.path.length, 0);
 	assert.is(graph.identities.size, 0);
 });
 
