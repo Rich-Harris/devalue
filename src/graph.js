@@ -22,8 +22,8 @@ import {
  * the question "how can I figure out where in the client's memory space this value resides?"
  *
  * @typedef {object} ClientPath
- * @property {'anchor' | 'slot' | 'collection'} kind Session storage containing the root.
- * @property {number} index Index within that storage.
+ * @property {'anchor' | 'slot' | 'collection' | 'key'} kind Session storage containing the root.
+ * @property {number | string} index Index within that storage.
  * @property {string[]} segments Property-access segments appended to the structured root.
  */
 

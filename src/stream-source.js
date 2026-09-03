@@ -1,5 +1,5 @@
 import { SOURCE, create_source, is_source, raw_source } from './javascript-source.js';
-import { is_primitive, stringify_primitive } from './utils.js';
+import { is_primitive, stringify_primitive, stringify_string } from './utils.js';
 
 /** Internal stream instructions are branded with a non-enumerable module-private key. */
 const INSTRUCTION = Symbol('StreamInstruction');
@@ -410,12 +410,14 @@ function visit_sources(source, callback) {
 
 /** @param {ClientPath} reference */
 export function render_reference(reference) {
-	return `s.${reference.kind[0]}[${reference.index}]` + reference.segments.join('');
+	const index = reference.kind === 'key' ? stringify_string(String(reference.index)) : reference.index;
+	return `s.${reference.kind[0]}[${index}]` + reference.segments.join('');
 }
 
 /** @param {ClientPath} reference */
 export function reference_length(reference) {
-	let length = 5 + String(reference.index).length;
+	const index = reference.kind === 'key' ? stringify_string(String(reference.index)) : reference.index;
+	let length = 5 + String(index).length;
 	for (const segment of reference.segments) length += segment.length;
 	return length;
 }

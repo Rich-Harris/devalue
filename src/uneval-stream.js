@@ -225,6 +225,31 @@ class Session {
 		return render_stream_source(source, definitions);
 	}
 
+	/** Severs tail blocks from positional state created by the head. */
+	#detach() {
+		for (const source of this.#sources) {
+			if (!source.terminal && source.node.data.key === undefined) {
+				throw this.#error('Cannot detach an unkeyed asynchronous value', source.node.value);
+			}
+		}
+		this.#references = new Map();
+		for (const node of this.#graph.nodes) {
+			if (node.kind === 'Async' && node.data.key !== undefined && !node.data.state.terminal) {
+				this.#references.set(node, {
+					path: { kind: 'key', index: node.data.key, segments: ['[0]'] },
+					available: 0,
+					previous: undefined
+				});
+			}
+		}
+		this.#runtimes_emitted = {};
+		this.#availability = 0;
+		this.#anchor = 1;
+		this.#slot = 0;
+		this.#collection = 0;
+		this.#detached_tail = true;
+	}
+
 	/**
 	 * Atomically walks a value's devalue-visible graph and discovers async sources.
 	 *
@@ -268,6 +293,7 @@ class Session {
 			slot: this.#slot,
 			collection: this.#collection,
 			local: this.#local,
+			detached_started: this.#detached_started,
 			references: new Map(this.#references)
 		};
 	}
@@ -302,6 +328,7 @@ class Session {
 		this.#slot = checkpoint.slot;
 		this.#collection = checkpoint.collection;
 		this.#local = checkpoint.local;
+		this.#detached_started = checkpoint.detached_started;
 		this.#references = checkpoint.references;
 		roll_back(this.#graph, checkpoint.nodes, error);
 		this.#transaction_depth--;
@@ -1267,7 +1294,7 @@ class Session {
 
 		const root = expression(value);
 		for (const node of order) {
-			if (!is_keyed(node)) continue;
+			if (node.kind !== 'Async' || node.data.key === undefined) continue;
 			// Register `[target, control]` so settlements from any session can address it by key.
 			const control = node.data.captured ? `,s.p[${node.data.pending}]` : '';
 			sidecars.push(`(s.k||(s.k={__proto__:null}))[${stringify_string(node.data.key)}]=[${node.name}${control}]`);
@@ -1435,7 +1462,17 @@ class Session {
 	#emit_batch(events, block = true) {
 		const transaction = this.#begin_transaction();
 		try {
-			const prefix = block ? `;${this.#scope}[${stringify_string(this.#id)}].b((s,n)=>{` : '';
+			let prefix = '';
+			let suffix = '';
+			if (block && this.#detached) {
+				prefix = `;(()=>{let n=${this.#scope},s=n?.[${stringify_string(this.#id)}];`;
+				if (!this.#detached_started) prefix += `if(!s)throw new Error(${stringify_string(`devalue: missing session ${this.#id}`)});s.a=[];s.s=[];s.c=[];s.p=[];`;
+				this.#detached_started = true;
+				suffix = '})()';
+			} else if (block) {
+				prefix = `;${this.#scope}[${stringify_string(this.#id)}].b((s,n)=>{`;
+				suffix = '})';
+			}
 			const block_start = this.#availability;
 			/** @type {Emission[]} */
 			const operations = [];
@@ -1450,8 +1487,10 @@ class Session {
 			const available = this.#availability;
 			const retained_at = ++this.#availability;
 			references.add(node);
-			const target = reference_source(node, this.#reference_at(node, available)?.path);
-			const control = node.data.captured ? raw_source(`s.p[${node.data.pending}]`) : undefined;
+			const entry = node.data.key === undefined ? undefined : `s.k[${stringify_string(node.data.key)}]`;
+			const guard = node.data.key === undefined ? '' : `if(!s.k?.[${stringify_string(node.data.key)}])throw new Error(${stringify_string(`devalue: missing asynchronous value ${node.data.key}`)});`;
+			const target = entry ? raw_source(`${entry}[0]`) : reference_source(node, this.#reference_at(node, available)?.path);
+			const control = entry ? raw_source(`${entry}[1]`) : node.data.captured ? raw_source(`s.p[${node.data.pending}]`) : undefined;
 			const reference = {
 				target,
 				control
@@ -1528,7 +1567,8 @@ class Session {
 				if (!is_source(operation)) throw new TypeError(`Invalid async descriptor operation: ${event.type}() returned ${describe_received(operation)}. It must synchronously return a js tagged template containing client statements; use js\`\` for an empty operation.`);
 				const lowered = this.#lower_descriptor_source(operation, `async descriptor ${event.type}()`, available, retained_at, references);
 				if (materialization) operations.push(materialization);
-				operations.push(...lowered.prerequisites, lowered.source);
+				operations.push(...lowered.prerequisites);
+				operations.push(guard ? join_sources([guard, lowered.source]) : lowered.source);
 				this.#commit_transaction(lowered.checkpoint, false);
 			} catch (error) {
 				if (!this.#is_active()) throw error;
@@ -1577,7 +1617,7 @@ class Session {
 			}
 			const body = join_sources(rendered, ';');
 			const structured = block
-				? join_sources([prefix, definitions_source(), ';', body, '})'])
+				? join_sources([prefix, definitions_source(), ';', body, suffix])
 				: rendered.length ? join_sources([';', body]) : '';
 			const result = { source: structured, close };
 			this.#commit_transaction(transaction, true);
@@ -2143,7 +2183,7 @@ function macrotask() {
 }
 
 /** @typedef {{ path: ClientPath, available: number, previous: RetainedReference | undefined }} RetainedReference */
-/** @typedef {{ nodes: number, sources: number, new_custom: CapturedNode[], validated: Set<CapturedNode>, opaque: number, pending: number, native_pending: number, active: number, availability: number, anchor: number, slot: number, collection: number, local: number, references: Map<CapturedNode, RetainedReference> }} TransactionCheckpoint */
+/** @typedef {{ nodes: number, sources: number, new_custom: CapturedNode[], validated: Set<CapturedNode>, opaque: number, pending: number, native_pending: number, active: number, availability: number, anchor: number, slot: number, collection: number, local: number, detached_started: boolean, references: Map<CapturedNode, RetainedReference> }} TransactionCheckpoint */
 /** @typedef {{ state: 'preparing' | 'streaming' } | { state: 'completed' } | TerminatingLifecycle} Lifecycle */
 /** @typedef {{ state: 'cancelled' | 'failed', has_reason: boolean, reason: unknown, cleanup: Promise<void>, operations: CleanupOperation[] }} TerminatingLifecycle */
 /** @typedef {{ ok: true } | { ok: false, error: unknown }} CleanupResult */
