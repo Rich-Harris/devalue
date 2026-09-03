@@ -60,13 +60,8 @@ import {
  * @property {CapturedNode[]} nodes Every captured non-primitive value, in discovery order.
  * @property {Map<object, CapturedNode>} identities Maps each original non-primitive identity to its canonical node, preserving sharing and cycles.
  * @property {(value: unknown, node: CapturedNode) => void} classify Fills in a reserved node's `kind`, `keys`, `children`, and `data`.
- * @property {unknown[]} path Raw property, array-index, or map-key segments leading to the value currently being discovered.
- * @property {number[]} path_kinds How each entry in `path` should be formatted in an error message: array index, property, or map key.
+ * @property {string[]} unwind Formatted path segments collected innermost-first while a discovery error propagates.
  */
-
-const ARRAY_INDEX = 0;
-const OBJECT_KEY = 1;
-const MAP_KEY = 2;
 
 /** Shared by every node without keys or children; never mutated. @type {never[]} */
 const EMPTY = [];
@@ -113,26 +108,33 @@ export function create_captured_graph(root, custom_classify) {
 		classify: (value, node) => {
 			if (!custom_classify(value, node, graph)) builtin_classify(graph, node, value);
 		},
-		path: [],
-		path_kinds: []
+		unwind: []
 	};
 	return graph;
 }
 
 /**
  * Removes every node appended since `mark` (a previously observed `nodes.length`) and
- * clears the error-path stack left behind by an interrupted walk.
+ * finalizes the path of the `DevalueError` that interrupted the walk, if any.
+ *
+ * Containers do not track their position while descending; instead each container's
+ * catch handler records its segment as the error unwinds, so the happy path performs no
+ * bookkeeping at all. The segments arrive innermost-first and are reversed here.
  *
  * @param {CapturedGraph} graph
  * @param {number} mark
+ * @param {unknown} error
  */
-export function rollback(graph, mark) {
+export function rollback(graph, mark, error) {
 	const nodes = graph.nodes;
 	const identities = graph.identities;
 	for (let i = nodes.length - 1; i >= mark; i--) identities.delete(nodes[i].value);
 	nodes.length = mark;
-	graph.path.length = 0;
-	graph.path_kinds.length = 0;
+	const unwind = graph.unwind;
+	if (unwind.length) {
+		if (error instanceof DevalueError) error.path = unwind.reverse().join('');
+		unwind.length = 0;
+	}
 }
 
 /**
@@ -232,15 +234,14 @@ function builtin_classify(graph, node, value) {
 			const array = /** @type {unknown[]} */ (value);
 			const keys = valid_array_indices(array);
 			const children = new Array(keys.length);
-			const path = graph.path;
-			const path_kinds = graph.path_kinds;
 			for (let i = 0; i < keys.length; i++) {
 				const key = keys[i];
-				path.push(key);
-				path_kinds.push(ARRAY_INDEX);
-				children[i] = child(graph, array[key]);
-				path.pop();
-				path_kinds.pop();
+				try {
+					children[i] = child(graph, array[key]);
+				} catch (e) {
+					graph.unwind.push(`[${key}]`);
+					throw e;
+				}
 			}
 			node.keys = keys;
 			node.children = children;
@@ -255,14 +256,13 @@ function builtin_classify(graph, node, value) {
 		}
 		case 'Map': {
 			const children = [];
-			const path = graph.path;
-			const path_kinds = graph.path_kinds;
 			for (const [key, member] of /** @type {Map<unknown, unknown>} */ (value)) {
-				path.push(key);
-				path_kinds.push(MAP_KEY);
-				children.push(child(graph, key), child(graph, member));
-				path.pop();
-				path_kinds.pop();
+				try {
+					children.push(child(graph, key), child(graph, member));
+				} catch (e) {
+					graph.unwind.push(`.get(${is_primitive(key) ? stringify_primitive(key) : '...'})`);
+					throw e;
+				}
 			}
 			node.children = children;
 			return;
@@ -294,18 +294,17 @@ function builtin_classify(graph, node, value) {
 			node.kind = Object.getPrototypeOf(object) === null ? 'NullObject' : 'Object';
 			const keys = Object.keys(object);
 			const children = new Array(keys.length);
-			const path = graph.path;
-			const path_kinds = graph.path_kinds;
 			for (let i = 0; i < keys.length; i++) {
 				const key = keys[i];
 				if (key === '__proto__') {
 					throw error(graph, 'Cannot stringify objects with __proto__ keys', value);
 				}
-				path.push(key);
-				path_kinds.push(OBJECT_KEY);
-				children[i] = child(graph, object[key]);
-				path.pop();
-				path_kinds.pop();
+				try {
+					children[i] = child(graph, object[key]);
+				} catch (e) {
+					graph.unwind.push(stringify_key(key));
+					throw e;
+				}
 			}
 			node.keys = keys;
 			node.children = children;
@@ -320,13 +319,7 @@ function builtin_classify(graph, node, value) {
  * @param {unknown} value
  */
 function error(graph, message, value) {
-	// Path segments are stored raw during discovery (formatting per child is pure
-	// overhead on the happy path) and rendered only when an error is actually thrown.
-	const keys = graph.path.map((key, index) => {
-		const kind = graph.path_kinds[index];
-		if (kind === ARRAY_INDEX) return `[${key}]`;
-		if (kind === OBJECT_KEY) return stringify_key(/** @type {string} */ (key));
-		return `.get(${is_primitive(key) ? stringify_primitive(key) : '...'})`;
-	});
-	return new DevalueError(message, keys, value, graph.root_value);
+	// The path is unknown here; enclosing containers append their segments as the error
+	// unwinds and `rollback` assembles them.
+	return new DevalueError(message, [], value, graph.root_value);
 }
