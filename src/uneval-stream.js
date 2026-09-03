@@ -11,11 +11,7 @@
  */
 
 import { DevalueError, is_primitive, stringify_primitive, stringify_string } from './utils.js';
-import {
-	capture,
-	create_captured_graph,
-	discover
-} from './graph.js';
+import { create_captured_graph, discover, rollback } from './graph.js';
 
 const promise_then = Promise.prototype.then;
 const TOKEN_PATTERN = /"\d+"/g;
@@ -73,8 +69,10 @@ class Session {
 	#onerror;
 	/** Captured identities shared by all emitted regions. @type {CapturedGraph} */
 	#graph;
-	/** Async descriptor states discovered anywhere in the streamed graph. @type {Set<Source>} */
-	#sources = new Set();
+	/** Async descriptor states in discovery order; a capture appends and a failed capture truncates. @type {Source[]} */
+	#sources = [];
+	/** Index into `#sources` of the first source not yet started. @type {number} */
+	#started = 0;
 	/** Events collected during the current scheduled flush window. @type {Event[]} */
 	#batch = [];
 	/** Whether the current batch has been finalized and is ready to emit. @type {boolean} */
@@ -111,8 +109,6 @@ class Session {
 	#abort;
 	/** Canonical captured node for the initial graph root. @type {CapturedNode | undefined} */
 	#root;
-	/** Committed sources not yet started. @type {Source[]} */
-	#unstarted = [];
 	/** Session helpers already defined in emitted output. @type {Partial<Record<keyof typeof RUNTIMES, boolean>>} */
 	#runtimes_emitted = {};
 	/** Native promise sources whose terminal operation has not been emitted. @type {number} */
@@ -125,8 +121,6 @@ class Session {
 	#emit_dispatch = false;
 	/** Shortest committed client path for each captured identity. @type {Map<CapturedNode, ClientPath>} */
 	#references = new Map();
-	/** Existing opaque values changed by the active capture. @type {Map<CapturedNode, boolean> | undefined} */
-	#capture_opaque;
 	/** Monotonic owner tag for reusable node planning scratch. */
 	#region_id = 0;
 
@@ -155,7 +149,7 @@ class Session {
 	async serialize(value) {
 		try {
 			this.#capture(value, true);
-			this.#commit();
+			this.#active = this.#sources.length;
 		} catch (error) {
 			await this.#cancel(error);
 			throw this.#failure ?? error;
@@ -165,7 +159,7 @@ class Session {
 			throw this.#failure;
 		}
 
-		if (this.#sources.size === 0) {
+		if (this.#sources.length === 0) {
 			return { head: this.#emit_region(value, false).source, tail: empty_tail(), id: this.#id };
 		}
 
@@ -269,42 +263,45 @@ class Session {
 	}
 
 	/**
-	 * Transactionally walks a value's devalue-visible graph and discovers async sources.
+	 * Atomically walks a value's devalue-visible graph and discovers async sources.
+	 *
+	 * Everything a walk touches is either append-only (graph nodes, sources, new custom
+	 * nodes) or a counter (pending indices, opaque use counts), so a checkpoint is a few
+	 * integers and rollback truncates back to them. Success costs nothing beyond the walk.
 	 *
 	 * @param {unknown} value
 	 * @param {boolean} root
 	 * @returns {CapturedNode | undefined}
 	 */
 	#capture(value, root = false) {
+		const graph = this.#graph;
+		const nodes = graph.nodes.length;
+		const sources = this.#sources.length;
+		const custom = this.#new_custom.length;
 		const pending = this.#pending;
 		const native_pending = this.#native_pending;
-		const sources = new Set(this.#sources);
-		const unstarted = this.#unstarted.length;
-		const custom = this.#new_custom.length;
-		const opaque = new Map();
-		this.#capture_opaque = opaque;
 		try {
-			const node = capture(this.#graph, value, () => this.#validate_new_custom(custom));
+			const node = discover(graph, value);
+			this.#validate_new_custom(custom);
 			if (root) this.#root = node;
 			return node;
 		} catch (error) {
 			this.#pending = pending;
 			this.#native_pending = native_pending;
-			for (let i = this.#unstarted.length - 1; i >= unstarted; i--) {
-				const source = this.#unstarted[i];
+			for (let i = this.#sources.length - 1; i >= sources; i--) {
+				const source = this.#sources[i];
 				source.active = false;
 				if (source.observer) source.observer.active = false;
-				if (!sources.has(source)) this.#sources.delete(source);
 			}
-			this.#unstarted.length = unstarted;
+			this.#sources.length = sources;
+			for (let i = this.#new_custom.length - 1; i >= custom; i--) {
+				for (const child of this.#new_custom[i].data.values) {
+					if (child) child.opaque--;
+				}
+			}
 			this.#new_custom.length = custom;
-			for (const [node, previous] of opaque) {
-				if (previous) node.opaque = true;
-				else delete node.opaque;
-			}
+			rollback(graph, nodes);
 			throw error;
-		} finally {
-			this.#capture_opaque = undefined;
 		}
 	}
 
@@ -356,12 +353,7 @@ class Session {
 					const child_node = discover(graph, child);
 					dependencies.push(child_node);
 					edges.push(child_node ? { node: child_node.id } : { value: child });
-					if (child_node) {
-						if (this.#capture_opaque && !this.#capture_opaque.has(child_node)) {
-							this.#capture_opaque.set(child_node, child_node.opaque === true);
-						}
-						child_node.opaque = true;
-					}
+					if (child_node) child_node.opaque++;
 				}
 				this.#new_custom.push(node);
 				return { kind: 'Custom', data: { source: result, values: dependencies }, edges };
@@ -452,8 +444,7 @@ class Session {
 		/** @type {Source} */
 		const state = { node, descriptor, type, started: false, terminal: false, cleaned: false, active: true, flushed_pending: 0 };
 		const classification = { kind: 'Async', data: { source, pending, captured, state }, edges: [] };
-		this.#sources.add(state);
-		this.#unstarted.push(state);
+		this.#sources.push(state);
 		if (this.#signal?.aborted) throw this.#signal.reason;
 		return { state, classification };
 	}
@@ -544,14 +535,6 @@ class Session {
 		}
 	}
 
-	/**
-	 * Commits initial capture and initializes the count of client values awaiting termination.
-	 *
-	 */
-	#commit() {
-		this.#active = this.#sources.size;
-	}
-
 	/** Starts every committed source unless the constructor's AbortSignal listener has cancelled the session. */
 	#start_sources() {
 		if (this.#signal?.aborted) {
@@ -561,10 +544,12 @@ class Session {
 		this.#start_unstarted();
 	}
 
+	/** Starts every source appended since the previous call. */
 	#start_unstarted() {
-		const sources = this.#unstarted;
-		this.#unstarted = [];
-		for (const source of sources) this.#start(source);
+		const sources = this.#sources;
+		const end = sources.length;
+		for (let i = this.#started; i < end; i++) this.#start(sources[i]);
+		this.#started = end;
 	}
 
 	/**
@@ -684,10 +669,10 @@ class Session {
 			source.terminal = true;
 		}
 		const event = { source, type, value, sequence: this.#sequence++, invalid: false };
-		const source_count = this.#sources.size;
+		const source_count = this.#sources.length;
 		try {
 			this.#capture(value);
-			this.#active += this.#sources.size - source_count;
+			this.#active += this.#sources.length - source_count;
 		} catch (error) {
 			this.#report(error, value);
 			event.type = source.type === 'sequence' ? 'error' : 'reject';
