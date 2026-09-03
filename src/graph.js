@@ -232,12 +232,12 @@ function builtin_classify(graph, node, value) {
 			return;
 		case 'Array': {
 			const array = /** @type {unknown[]} */ (value);
-			const keys = valid_array_indices(array);
+			const keys = /** @type {string[]} */ (valid_array_indices(array));
 			const children = new Array(keys.length);
 			for (let i = 0; i < keys.length; i++) {
 				const key = keys[i];
 				try {
-					children[i] = child(graph, array[key]);
+					children[i] = child(graph, array[/** @type {any} */ (key)]);
 				} catch (e) {
 					graph.unwind.push(`[${key}]`);
 					throw e;
