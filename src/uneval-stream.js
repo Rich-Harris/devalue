@@ -7,21 +7,41 @@
  *   UnevalStreamResult,
  *   UnevalStreamTail
  * } from './types.js'
- * @import { Classification, Graph, GraphNode, Reference } from './graph.js'
+ * @import { CapturedGraph, CapturedNode, Classification, ClientPath } from './graph.js'
  */
 
 import { DevalueError, is_primitive, stringify_primitive, stringify_string } from './utils.js';
 import {
-	checkpoint,
-	create_graph,
-	discover,
-	release_checkpoint,
-	rollback
+	capture,
+	create_captured_graph,
+	discover
 } from './graph.js';
 
 const promise_then = Promise.prototype.then;
-const generic_error = 'new Error("devalue: failed to serialize asynchronous value")';
 const TOKEN_PATTERN = /"\d+"/g;
+const SOURCE = Symbol('JavaScriptSource');
+
+/** @param {TemplateStringsArray | readonly string[]} strings @param {...unknown} values @returns {JavaScriptSource} */
+function js(strings, ...values) {
+	return create_source(strings, values);
+}
+
+/** @param {readonly string[]} strings @param {readonly unknown[]} values @returns {JavaScriptSource} */
+function create_source(strings, values) {
+	return { [SOURCE]: true, strings, values };
+}
+
+const generic_error = js`new Error("devalue: failed to serialize asynchronous value")`;
+
+/** @param {unknown} value @returns {value is JavaScriptSource} */
+function is_source(value) {
+	return typeof value === 'object' && value !== null && value[SOURCE] === true;
+}
+
+/** @param {string} text @returns {JavaScriptSource} */
+function raw_source(text) {
+	return create_source([text], []);
+}
 
 /**
  * Stream executable source while preserving identities across asynchronous regions.
@@ -51,7 +71,7 @@ class Session {
 	#signal;
 	/** Diagnostic callback for asynchronous outcomes that fail to serialize. @type {UnevalStreamOptions['onerror']} */
 	#onerror;
-	/** Identity graph shared by all emitted regions. @type {Graph} */
+	/** Captured identities shared by all emitted regions. @type {CapturedGraph} */
 	#graph;
 	/** Async descriptor states discovered anywhere in the streamed graph. @type {Set<Source>} */
 	#sources = new Set();
@@ -89,25 +109,27 @@ class Session {
 	#promise_tokens = new Map();
 	/** Stable AbortSignal listener that forwards cancellation. @type {() => void} */
 	#abort;
-	/** Canonical captured node for the initial graph root. @type {GraphNode | undefined} */
+	/** Canonical captured node for the initial graph root. @type {CapturedNode | undefined} */
 	#root;
-	/** Transaction rollback operations. @type {Array<() => void>} */
-	#undo = [];
-	/** Number of nested generation transactions. @type {number} */
-	#transaction_depth = 0;
 	/** Committed sources not yet started. @type {Source[]} */
 	#unstarted = [];
 	/** Session helpers already defined in emitted output. @type {Partial<Record<keyof typeof RUNTIMES, boolean>>} */
 	#runtimes_emitted = {};
 	/** Native promise sources whose terminal operation has not been emitted. @type {number} */
 	#native_pending = 0;
-	/** Custom nodes captured since the last atomic-cycle validation. @type {GraphNode[]} */
+	/** Custom nodes captured since the last atomic-cycle validation. @type {CapturedNode[]} */
 	#new_custom = [];
-	/** Custom nodes already proven acyclic. @type {Set<GraphNode>} */
+	/** Custom nodes already proven acyclic. @type {Set<CapturedNode>} */
 	#validated = new Set();
 	/** Whether the head must define the block dispatch helper. @type {boolean} */
 	#emit_dispatch = false;
-	/** Monotonic identifier for per-region node scratch state. @type {number} */
+	/** Shortest committed client path for each captured identity. @type {Map<CapturedNode, ClientPath>} */
+	#references = new Map();
+	/** Existing opaque values changed by the active capture. @type {Map<CapturedNode, boolean> | undefined} */
+	#capture_opaque;
+	/** Draft used by synchronous descriptor and runtime-helper callbacks during emission. @type {EmissionContext | undefined} */
+	#emitting;
+	/** Monotonic owner tag for reusable node planning scratch. */
 	#region_id = 0;
 
 	/**
@@ -126,7 +148,7 @@ class Session {
 		this.#replacer = replacer;
 		this.#signal = signal;
 		this.#onerror = options.onerror;
-		this.#graph = create_graph(root, (value, node, graph) => this.#classify(value, node, graph));
+		this.#graph = create_captured_graph(root, (value, node, graph) => this.#classify(value, node, graph));
 		this.#abort = () => void this.#cancel(signal?.reason);
 		signal?.addEventListener('abort', this.#abort, { once: true });
 	}
@@ -136,7 +158,6 @@ class Session {
 		try {
 			this.#capture(value, true);
 			this.#commit();
-			this.#validate_new_custom();
 		} catch (error) {
 			await this.#cancel(error);
 			throw this.#failure ?? error;
@@ -155,19 +176,20 @@ class Session {
 		if (this.#failure) throw this.#failure;
 
 		try {
-			const head_region = this.#emit_region(value, true);
-			this.#assign_references(value, { root: 's.a[0]', segments: [] }, new Map());
+			const head_context = this.#emission_context();
+			const head_region = this.#emit_region(value, true, undefined, head_context);
+			this.#assign_references(head_context, value, { root: 's.a[0]', segments: [] }, new Map());
+			this.#commit_emission(head_context);
 			let operations = '';
 			if (this.#batch_ready) {
 				const batch = { events: this.#batch };
-				operations += this.#emit_batch(batch, false);
+				const emitted = this.#emit_batch(batch, false);
+				operations += emitted.source;
 				this.#batch = [];
 				this.#batch_ready = false;
-				for (const event of batch.events) {
-					if (!event.source.needs_close) continue;
-					event.source.needs_close = false;
+				for (const source of emitted.close) {
 					try {
-						await this.#close_sequence(event.source);
+						await this.#close_sequence(source);
 					} catch (error) {
 						await this.#cancel(error);
 						throw this.#failure ?? error;
@@ -231,8 +253,9 @@ class Session {
 		if (this.#runtime_tokens.size === 0 && this.#promise_tokens.size === 0) return { defs, source };
 		/** @param {keyof typeof RUNTIMES} key */
 		const define = (key) => {
-			if (this.#runtimes_emitted[key]) return;
-			this.#set(this.#runtimes_emitted, key, true);
+			const emitted = this.#emitting?.runtimes_emitted ?? this.#runtimes_emitted;
+			if (emitted[key]) return;
+			emitted[key] = true;
 			defs.push(`s.${key}=${RUNTIMES[key]}`);
 		};
 		const resolved = source.replace(TOKEN_PATTERN, (token) => {
@@ -249,77 +272,43 @@ class Session {
 		return { defs, source: resolved };
 	}
 
-	#begin_transaction() {
-		this.#transaction_depth++;
-		return { undo: this.#undo.length, graph: checkpoint(this.#graph) };
-	}
-
-	/** @param {{ undo: number, graph: import('./graph.js').Checkpoint }} marker */
-	#commit_transaction(marker) {
-		this.#transaction_depth--;
-		if (this.#transaction_depth === 0) {
-			release_checkpoint(this.#graph, marker.graph);
-			this.#undo.length = marker.undo;
-		}
-	}
-
-	/** @param {{ undo: number, graph: import('./graph.js').Checkpoint }} marker */
-	#rollback_transaction(marker) {
-		for (let i = this.#undo.length - 1; i >= marker.undo; i--) this.#undo[i]();
-		this.#undo.length = marker.undo;
-		rollback(this.#graph, marker.graph);
-		this.#transaction_depth--;
-	}
-
-	/**
-	 * @param {any} target
-	 * @param {string} key
-	 * @param {any} value
-	 */
-	#set(target, key, value) {
-		const had = Object.hasOwn(target, key);
-		const previous = target[key];
-		if (this.#transaction_depth) this.#undo.push(() => had ? target[key] = previous : delete target[key]);
-		target[key] = value;
-	}
-
-	#set_private(key, value) {
-		let previous;
-		const transactional = this.#transaction_depth > 0;
-		switch (key) {
-			case 'root': previous = this.#root; this.#root = value; break;
-			case 'native_pending': previous = this.#native_pending; this.#native_pending = value; break;
-			case 'pending': previous = this.#pending; this.#pending = value; break;
-			case 'collection': previous = this.#collection; this.#collection = value; break;
-			case 'slot': previous = this.#slot; this.#slot = value; break;
-			case 'anchor': previous = this.#anchor; this.#anchor = value; break;
-			case 'active': previous = this.#active; this.#active = value; break;
-		}
-		if (transactional) this.#undo.push(() => {
-			const depth = this.#transaction_depth;
-			this.#transaction_depth = 0;
-			this.#set_private(key, previous);
-			this.#transaction_depth = depth;
-		});
-	}
-
 	/**
 	 * Transactionally walks a value's devalue-visible graph and discovers async sources.
 	 *
 	 * @param {unknown} value
 	 * @param {boolean} root
-	 * @returns {GraphNode | undefined}
+	 * @returns {CapturedNode | undefined}
 	 */
 	#capture(value, root = false) {
-		const marker = this.#begin_transaction();
+		const pending = this.#pending;
+		const native_pending = this.#native_pending;
+		const sources = new Set(this.#sources);
+		const unstarted = this.#unstarted.length;
+		const custom = this.#new_custom.length;
+		const opaque = new Map();
+		this.#capture_opaque = opaque;
 		try {
-			const node = discover(this.#graph, value);
-			if (root) this.#set_private('root', node);
-			this.#commit_transaction(marker);
+			const node = capture(this.#graph, value, () => this.#validate_new_custom(custom));
+			if (root) this.#root = node;
 			return node;
 		} catch (error) {
-			this.#rollback_transaction(marker);
+			this.#pending = pending;
+			this.#native_pending = native_pending;
+			for (let i = this.#unstarted.length - 1; i >= unstarted; i--) {
+				const source = this.#unstarted[i];
+				source.active = false;
+				if (source.observer) source.observer.active = false;
+				if (!sources.has(source)) this.#sources.delete(source);
+			}
+			this.#unstarted.length = unstarted;
+			this.#new_custom.length = custom;
+			for (const [node, previous] of opaque) {
+				if (previous) node.opaque = true;
+				else delete node.opaque;
+			}
 			throw error;
+		} finally {
+			this.#capture_opaque = undefined;
 		}
 	}
 
@@ -328,24 +317,27 @@ class Session {
 	 * nodes discovered since the previous validation. Edges are immutable once captured,
 	 * so a new cycle always passes through a newly captured node.
 	 */
-	#validate_new_custom() {
-		if (this.#new_custom.length === 0) return;
-		const pending = this.#new_custom;
-		this.#new_custom = [];
-		/** @type {Set<GraphNode>} */
+	#validate_new_custom(start = 0) {
+		if (this.#new_custom.length === start) return;
+		const pending = this.#new_custom.slice(start);
+		/** @type {Set<CapturedNode>} */
 		const validating = new Set();
-		/** @param {GraphNode} node */
+		/** @type {Set<CapturedNode>} */
+		const validated = new Set();
+		/** @param {CapturedNode} node */
 		const validate = (node) => {
-			if (this.#validated.has(node)) return;
+			if (this.#validated.has(node) || validated.has(node)) return;
 			if (validating.has(node)) throw this.#error('Cannot stringify an atomic custom cycle', node.value);
 			validating.add(node);
-			for (const child of node.data.tokens.values()) {
-				if (child.kind === 'Custom') validate(child);
+			for (const child of node.data.values) {
+				if (child?.kind === 'Custom') validate(child);
 			}
 			validating.delete(node);
-			this.#validated.add(node);
+			validated.add(node);
 		};
 		for (const node of pending) validate(node);
+		this.#new_custom.splice(start);
+		for (const node of validated) this.#validated.add(node);
 	}
 
 	/**
@@ -353,42 +345,30 @@ class Session {
 	 * AsyncIterable. Returning false delegates to graph's built-in discovery.
 	 *
 	 * @param {unknown} value
-	 * @param {GraphNode} node
-	 * @param {Graph} graph
+	 * @param {CapturedNode} node
+	 * @param {CapturedGraph} graph
 	 * @returns {Classification | false}
 	 */
 	#classify(value, node, graph) {
 		if (this.#replacer) {
-			const tokens = new Map();
-			const result = this.#replacer(value, (child) => {
-				if (is_primitive(child)) {
-					discover(graph, child);
-					return stringify_primitive(child);
-				}
-				const token = this.#placeholder();
-				tokens.set(token, child);
-				return token;
-			});
-			if (typeof result === 'string') {
+			const result = this.#replacer(value, js);
+			if (is_source(result)) {
+				const values = source_values(result);
+				const dependencies = [];
 				const edges = [];
-				for (const [token, child] of tokens) {
-					if (!result.includes(token)) {
-						tokens.delete(token);
-						continue;
+				for (const child of values) {
+					const child_node = discover(graph, child);
+					dependencies.push(child_node);
+					edges.push(child_node ? { node: child_node.id } : { value: child });
+					if (child_node) {
+						if (this.#capture_opaque && !this.#capture_opaque.has(child_node)) {
+							this.#capture_opaque.set(child_node, child_node.opaque === true);
+						}
+						child_node.opaque = true;
 					}
-					const captured = discover(graph, child);
-					tokens.set(token, captured);
-					edges.push(captured ? { node: captured.id } : { value: child });
-					if (captured) this.#set(captured, 'opaque', true);
 				}
 				this.#new_custom.push(node);
-				if (this.#transaction_depth) {
-					this.#undo.push(() => {
-						const index = this.#new_custom.lastIndexOf(node);
-						if (index !== -1) this.#new_custom.splice(index, 1);
-					});
-				}
-				return { kind: 'Custom', data: { source: result, tokens }, edges };
+				return { kind: 'Custom', data: { source: result, values: dependencies }, edges };
 			}
 			if (result !== undefined && result !== null && result !== false) {
 				if (typeof result !== 'object' || !Object.hasOwn(result, 'type')) {
@@ -437,8 +417,8 @@ class Session {
 				let added;
 				try {
 					added = this.#add_source(node, descriptor, 'native');
-					this.#set(added.state, 'observer', observer);
-					this.#set_private('native_pending', this.#native_pending + 1);
+					added.state.observer = observer;
+					this.#native_pending++;
 				} catch (error) {
 					observer.active = false;
 					throw error;
@@ -456,35 +436,28 @@ class Session {
 	/**
 	 * Constructs an async descriptor target once and stages its server source state.
 	 *
-	 * @param {GraphNode} node
+	 * @param {CapturedNode} node
 	 * @param {any} descriptor
 	 * @param {'value' | 'sequence' | 'native'} type
 	 * @returns {{ state: Source, classification: Classification }}
 	 */
 	#add_source(node, descriptor, type) {
 		let captured = false;
-		const control = () => {
-			if (captured) throw new TypeError('devalue: capture may only be called once');
-			captured = true;
-			return `s.p[${this.#pending}]=$1`;
-		};
-		const source = descriptor.construct((/** @type {string} */ expression) =>
-			control().replace('$1', () => needs_parentheses(expression) ? `(${expression})` : expression)
-		);
-		if (typeof source !== 'string') throw new TypeError('Invalid async descriptor construct result');
 		const pending = this.#pending;
-		this.#set_private('pending', pending + 1);
+		const control = (expression) => {
+			if (captured) throw new TypeError('devalue: capture may only be called once');
+			if (!is_source(expression)) throw new TypeError('Invalid async descriptor capture');
+			captured = true;
+			return /** @type {JavaScriptSource} */ ({ [SOURCE]: true, strings: ['', ''], values: [{ type: 'capture', pending, source: expression }] });
+		};
+		const source = descriptor.construct(control);
+		if (!is_source(source)) throw new TypeError('Invalid async descriptor construct result');
+		this.#pending = pending + 1;
 		/** @type {Source} */
 		const state = { node, descriptor, type, started: false, terminal: false, cleaned: false, active: true, flushed_pending: 0 };
 		const classification = { kind: 'Async', data: { source, pending, captured, state }, edges: [] };
 		this.#sources.add(state);
 		this.#unstarted.push(state);
-		if (this.#transaction_depth) this.#undo.push(() => {
-			state.active = false;
-			if (state.observer) state.observer.active = false;
-			this.#unstarted.splice(this.#unstarted.lastIndexOf(state), 1);
-			if (!this.#cancelled) this.#sources.delete(state);
-		});
 		if (this.#signal?.aborted) throw this.#signal.reason;
 		return { state, classification };
 	}
@@ -509,21 +482,23 @@ class Session {
 	#native_descriptor(promise) {
 		let pending = -1;
 		const settle = (reference, which, value) => {
-			const remaining = this.#native_pending;
-			this.#set_private('native_pending', remaining - 1);
-			if (this.#runtimes_emitted.r || remaining >= 3) {
-				return `${this.#runtime_token('r')}(${pending},${which},${value})`;
+			const context = this.#emitting;
+			const remaining = context?.native_pending ?? this.#native_pending;
+			if (context) context.native_pending = remaining - 1;
+			else this.#native_pending = remaining - 1;
+			if ((context?.runtimes_emitted ?? this.#runtimes_emitted).r || remaining >= 3) {
+				return js`${raw_source(this.#runtime_token('r'))}(${pending},${which},${value})`;
 			}
-			return `${reference.control}[${which}](${value});delete ${reference.control}`;
+			return js`${reference.control}[${which}](${value});delete ${reference.control}`;
 		};
 		return {
 			type: 'async-value',
 			source: promise,
 			manages_pending: true,
 			construct: (capture) => {
-				capture('[a,b]');
+				capture(js`[a,b]`);
 				pending = this.#pending;
-				return this.#promise_token(pending);
+				return raw_source(this.#promise_token(pending));
 			},
 			resolve: (reference, value) => settle(reference, 0, value),
 			reject: (reference, reason) => settle(reference, 1, reason)
@@ -535,10 +510,10 @@ class Session {
 		return {
 			type: 'async-sequence',
 			source: /** @type {AsyncIterable<unknown, unknown, unknown>} */ (source),
-			construct: (capture) => `${this.#runtime_token('f')}(g=>{${capture('g')}})`,
-			next: ({ control }, value) => `${control}(0,${value})`,
-			complete: ({ control }, value) => `${control}(1,${value})`,
-			error: ({ control }, reason) => `${control}(2,${reason})`
+			construct: (capture) => js`${raw_source(this.#runtime_token('f'))}(g=>{${capture(js`g`)}})`,
+			next: ({ control }, value) => js`${control}(0,${value})`,
+			complete: ({ control }, value) => js`${control}(1,${value})`,
+			error: ({ control }, reason) => js`${control}(2,${reason})`
 		};
 	}
 
@@ -719,7 +694,6 @@ class Session {
 		const source_count = this.#sources.size;
 		try {
 			this.#capture(value);
-			this.#validate_new_custom();
 			this.#active += this.#sources.size - source_count;
 		} catch (error) {
 			this.#report(error, value);
@@ -773,25 +747,22 @@ class Session {
 	 *
 	 * @param {unknown} value
 	 * @param {boolean} persistent
-	 * @param {Set<GraphNode>} [references]
-	 * @returns {{ source: string, tokens: Map<string, { node: GraphNode, reference: Reference }> }}
+	 * @param {Set<CapturedNode>} [references]
+	 * @returns {{ source: string, tokens: Map<string, { node: CapturedNode, reference: ClientPath }> }}
 	 */
-	#emit_region(value, persistent, references) {
+	#emit_region(value, persistent, references, context = this.#emission_context()) {
 		/** Canonical node list; recorded edges resolve through indices rather than identity lookups. */
 		const nodes_list = this.#graph.nodes;
 		const identities = this.#graph.identities;
 		/** Resolves a recorded edge to its node, or undefined for a primitive edge. @param {{ node: number } | { value: unknown }} reference */
-		const node_of = (reference) => 'node' in reference ? /** @type {GraphNode} */ (nodes_list[reference.node]) : undefined;
+		const node_of = (reference) => 'node' in reference ? /** @type {CapturedNode} */ (nodes_list[reference.node]) : undefined;
 
-		// Region-local analysis state lives in scratch fields on the nodes themselves,
-		// tagged with a fresh id instead of per-region Maps/Sets keyed by node.
-		// `node.region_id === region_id` means "included in this region".
 		const region_id = ++this.#region_id;
-		/** @type {GraphNode[]} */
+		/** @type {CapturedNode[]} */
 		const order = [];
-		/** @param {GraphNode | undefined} node */
+		/** @param {CapturedNode | undefined} node */
 		const visit = (node) => {
-			if (!node || node.reference || node.region_id === region_id) return;
+			if (!node || context.references.has(node) || node.region_id === region_id) return;
 			node.region_id = region_id;
 			node.uses = 0;
 			node.hoisted = false;
@@ -810,8 +781,8 @@ class Session {
 		 * Invokes a callback for each represented child node (undefined for primitive
 		 * children) with its in-region occurrence count.
 		 *
-		 * @param {GraphNode} node
-		 * @param {(child: GraphNode | undefined, occurrences: number) => void} callback
+		 * @param {CapturedNode} node
+		 * @param {(child: CapturedNode | undefined, occurrences: number) => void} callback
 		 */
 		const each_child = (node, callback) => {
 			switch (node.kind) {
@@ -830,9 +801,7 @@ class Session {
 					}
 					break;
 				case 'Custom':
-					for (const [token, child] of node.data.tokens) {
-						callback(child, count_occurrences(node.data.source, token));
-					}
+					for (const child of node.data.values) callback(child, 1);
 					break;
 				default:
 					if (is_view(node.kind)) callback(node_of(node.data.buffer), 1);
@@ -841,11 +810,11 @@ class Session {
 
 		// In-region use counts; a node used once can be inlined at its single use site.
 		/**
-		 * @param {GraphNode | undefined} node
+		 * @param {CapturedNode | undefined} node
 		 * @param {number} occurrences
 		 */
 		const bump = (node, occurrences = 1) => {
-			if (node && node.region_id === region_id) node.uses += occurrences;
+			if (node?.region_id === region_id) node.uses += occurrences;
 		};
 		if (!is_primitive(value)) bump(identities.get(/** @type {object} */ (value)));
 		for (const node of order) {
@@ -855,7 +824,7 @@ class Session {
 			if (persistent && (node.kind === 'Set' || node.kind === 'Map')) each_child(node, bump);
 		}
 
-		/** @param {GraphNode} node */
+		/** @param {CapturedNode} node */
 		const is_sparse = (node) => node.kind === 'Array' && node.data.entries.length !== node.data.length;
 		let hoisted_count = 0;
 		for (const node of order) {
@@ -870,9 +839,9 @@ class Session {
 		/**
 		 * Reports whether a child's expansion reaches a name declared at or after `limit`.
 		 *
-		 * @param {GraphNode | undefined} node
+		 * @param {CapturedNode | undefined} node
 		 * @param {number} limit
-		 * @param {Set<GraphNode>} seen
+		 * @param {Set<CapturedNode>} seen
 		 * @returns {boolean}
 		 */
 		const references_later = (node, limit, seen) => {
@@ -891,7 +860,7 @@ class Session {
 		// declared at or after the atomic is hoisted (its back-edges become fills); a direct
 		// child that is itself a later-declared hoisted container is declared empty up front;
 		// a direct atomic child is secured recursively (atomics cannot defer anything).
-		/** @param {GraphNode} node */
+		/** @param {CapturedNode} node */
 		const secure_atomic = (node) => {
 			const limit = node.position;
 			each_child(node, (child_node) => {
@@ -918,7 +887,7 @@ class Session {
 		// precede parents in post-order, and any back-edge target is necessarily hoisted
 		// (a cycle entry always has two or more uses), so one bottom-up pass suffices.
 		/**
-		 * @param {GraphNode | undefined} node
+		 * @param {CapturedNode | undefined} node
 		 * @returns {number}
 		 */
 		const latest_of = (node) => {
@@ -930,7 +899,7 @@ class Session {
 		 * @param {{ node: number } | { value: unknown }} reference
 		 * @returns {number}
 		 */
-		const latest_of_ref = (reference) => 'value' in reference ? -1 : latest_of(/** @type {GraphNode} */ (nodes_list[reference.node]));
+		const latest_of_ref = (reference) => 'value' in reference ? -1 : latest_of(/** @type {CapturedNode} */ (nodes_list[reference.node]));
 		if (hoisted_count > 0) {
 			for (const node of order) {
 				if (node.hoisted) continue;
@@ -964,18 +933,19 @@ class Session {
 			return expression_node(node);
 		};
 		/**
-		 * @param {GraphNode} node
+		 * @param {CapturedNode} node
 		 * @returns {string}
 		 */
 		const expression_node = (node) => {
-			if (node.reference && node.region_id !== region_id) {
+			const retained = context.references.get(node);
+			if (retained && node.region_id !== region_id) {
 				references?.add(node);
 				if (references) {
 					const token = this.#placeholder();
-					tokens.set(token, { node, reference: node.reference });
+					tokens.set(token, { node, reference: retained });
 					return token;
 				}
-				return render_reference(node.reference);
+				return render_reference(retained);
 			}
 			if (node.region_id === region_id && node.name) return node.name;
 			// `rendering` guards against unexpected re-entry while expanding inline.
@@ -989,12 +959,12 @@ class Session {
 		};
 		/** @param {{ node: number } | { value: unknown }} reference */
 		const expression_ref = (reference) =>
-			'value' in reference ? stringify_primitive(reference.value) : expression_node(/** @type {GraphNode} */ (nodes_list[reference.node]));
+			'value' in reference ? stringify_primitive(reference.value) : expression_node(/** @type {CapturedNode} */ (nodes_list[reference.node]));
 
 		/**
 		 * Emits the full construction of a single-use node at its use site.
 		 *
-		 * @param {GraphNode} node
+		 * @param {CapturedNode} node
 		 * @returns {string}
 		 */
 		const inline = (node) => {
@@ -1014,13 +984,9 @@ class Session {
 						: 'new Map';
 				}
 				case 'Async':
-					return node.data.source;
+					return render_descriptor_source(node.data.source);
 				case 'Custom': {
-					if (node.data.tokens.size === 0) return node.data.source;
-					return node.data.source.replace(TOKEN_PATTERN, (/** @type {string} */ match) => {
-						const child = node.data.tokens.get(match);
-						return child ? expression_node(child) : match;
-					});
+					return render_source(node.data.source, expression);
 				}
 				default:
 					return scalar(node, expression_ref);
@@ -1127,12 +1093,11 @@ class Session {
 				const elements = (node.kind === 'Set' ? node.data.values : node.data.entries.flat())
 					.filter((/** @type {{ node: number } | { value: unknown }} */ child) => 'node' in child);
 				if (elements.length) {
-					const index = this.#collection;
-					this.#set_private('collection', index + 1);
+					const index = context.collection++;
 					sidecars.push(`s.c[${index}]=[${elements.map(expression_ref).join(',')}]`);
 					for (let i = 0; i < elements.length; i++) {
 						const child = elements[i];
-						this.#reference_node(/** @type {GraphNode} */ (nodes_list[child.node]), { root: `s.c[${index}]`, segments: [`[${i}]`] });
+						this.#reference_node(context, /** @type {CapturedNode} */ (nodes_list[child.node]), { root: `s.c[${index}]`, segments: [`[${i}]`] });
 					}
 				}
 			}
@@ -1142,11 +1107,11 @@ class Session {
 		if (persistent) {
 			for (const node of order) {
 				if (!node.opaque) continue;
-				const index = this.#slot;
-				this.#set_private('slot', index + 1);
+				const index = context.slot++;
 				slots.push(`s.s[${index}]=${node.name}`);
-				this.#set(node, 'reference', { root: `s.s[${index}]`, segments: [] });
-				this.#assign_references(node.value, node.reference, new Map());
+				const reference = { root: `s.s[${index}]`, segments: [] };
+				this.#reference_node(context, node, reference);
+				this.#assign_references(context, node.value, reference, new Map());
 			}
 		}
 		const all_declarations = early_declarations.concat(declarations);
@@ -1157,55 +1122,58 @@ class Session {
 			...slots
 		];
 		const body = [...statements, `return ${root}`].join(';');
-		return {
-			source: statements.length ? `(()=>{${body}})()` : root,
-			tokens
-		};
+		return { source: statements.length ? `(()=>{${body}})()` : root, tokens };
 	}
 
 	/**
 	 * Records a client reference when it is the shortest known source expression for an identity.
 	 *
 	 * @param {unknown} value
-	 * @param {Reference} reference
+	 * @param {ClientPath} reference
 	 */
 	#reference(value, reference) {
+		const context = this.#emission_context();
 		if (!is_primitive(value)) {
 			const node = this.#graph.identities.get(/** @type {object} */ (value));
-			if (node) this.#reference_node(node, reference);
+			if (node) this.#reference_node(context, node, reference);
 		}
+		this.#references = context.references;
 	}
 
 	/**
-	 * @param {GraphNode} node
-	 * @param {Reference} reference
+	 * @param {EmissionContext} context
+	 * @param {CapturedNode} node
+	 * @param {ClientPath} reference
 	 */
-	#reference_node(node, reference) {
-		if (!node.reference || reference_length(reference) < reference_length(node.reference)) {
-			this.#set(node, 'reference', reference);
+	#reference_node(context, node, reference) {
+		const previous = context.references.get(node);
+		if (!previous || reference_length(reference) < reference_length(previous)) {
+			context.references.set(node, reference);
 		}
 	}
 
 	/**
 	 * Walks stable graph edges and assigns the cheapest reachable client reference to each node.
 	 *
+	 * @param {EmissionContext} context
 	 * @param {unknown} value
-	 * @param {Reference} reference
-	 * @param {Map<GraphNode, number>} seen
+	 * @param {ClientPath} reference
+	 * @param {Map<CapturedNode, number>} seen
 	 */
-	#assign_references(value, reference, seen) {
+	#assign_references(context, value, reference, seen) {
 		if (is_primitive(value)) return;
 		const node = this.#graph.identities.get(/** @type {object} */ (value));
-		if (node) this.#assign_references_node(node, reference, seen);
+		if (node) this.#assign_references_node(context, node, reference, seen);
 	}
 
 	/**
-	 * @param {GraphNode} node
-	 * @param {Reference} reference
-	 * @param {Map<GraphNode, number>} seen
+	 * @param {EmissionContext} context
+	 * @param {CapturedNode} node
+	 * @param {ClientPath} reference
+	 * @param {Map<CapturedNode, number>} seen
 	 */
-	#assign_references_node(node, reference, seen) {
-		this.#reference_node(node, reference);
+	#assign_references_node(context, node, reference, seen) {
+		this.#reference_node(context, node, reference);
 		const length = reference_length(reference);
 		const previous = seen.get(node);
 		if (previous !== undefined && previous <= length) return;
@@ -1213,16 +1181,43 @@ class Session {
 		const nodes_list = this.#graph.nodes;
 		if (node.kind === 'Array') {
 			for (const [key, child] of node.data.entries) {
-				if ('node' in child) this.#assign_references_node(nodes_list[child.node], append_reference(reference, `[${key}]`), seen);
+				if ('node' in child) this.#assign_references_node(context, nodes_list[child.node], append_reference(reference, `[${key}]`), seen);
 			}
 		} else if (node.kind === 'Object' || node.kind === 'NullObject') {
 			for (const [key, child] of node.data.entries) {
-				if ('node' in child) this.#assign_references_node(nodes_list[child.node], append_reference(reference, prop(key)), seen);
+				if ('node' in child) this.#assign_references_node(context, nodes_list[child.node], append_reference(reference, prop(key)), seen);
 			}
 		} else if (is_view(node.kind)) {
 			const buffer = node.data.buffer;
-			if ('node' in buffer) this.#assign_references_node(nodes_list[buffer.node], append_reference(reference, '.buffer'), seen);
+			if ('node' in buffer) this.#assign_references_node(context, nodes_list[buffer.node], append_reference(reference, '.buffer'), seen);
 		}
+	}
+
+	/** @returns {EmissionContext} */
+	#emission_context() {
+		return {
+			anchor: this.#anchor,
+			slot: this.#slot,
+			collection: this.#collection,
+			native_pending: this.#native_pending,
+			active: this.#active,
+			references: new Map(this.#references),
+			runtimes_emitted: { ...this.#runtimes_emitted },
+			event_types: new Map(),
+			close: []
+		};
+	}
+
+	/** @param {EmissionContext} context */
+	#commit_emission(context) {
+		this.#anchor = context.anchor;
+		this.#slot = context.slot;
+		this.#collection = context.collection;
+		this.#native_pending = context.native_pending;
+		this.#active = context.active;
+		this.#references = context.references;
+		this.#runtimes_emitted = context.runtimes_emitted;
+		for (const [event, type] of context.event_types) event.type = type;
 	}
 
 	/**
@@ -1270,34 +1265,38 @@ class Session {
 	 */
 	#emit_batch(batch, block = true) {
 		const prefix = block ? `;${this.#scope}[${stringify_string(this.#id)}].b((s,n)=>{` : '';
-		const marker = this.#begin_transaction();
+		const context = this.#emission_context();
 		const operations = [];
-		/** @type {Set<GraphNode>} */
+		/** @type {Set<CapturedNode>} */
 		const references = new Set();
 		try {
+		this.#emitting = context;
 		for (const event of batch.events) {
 			const source = event.source;
 			const node = source.node;
 			const operations_before = operations.length;
 			references.add(node);
-			const target_token = this.#placeholder();
-			const control_token = node.data.captured ? this.#placeholder() : undefined;
+			const target = source_reference(node, context.references.get(node));
+			const control = node.data.captured ? raw_source(`s.p[${node.data.pending}]`) : undefined;
 			const reference = {
-				target: target_token,
-				control: control_token
+				target,
+				control
 			};
 			let value_source;
-			/** @type {{ name: string, write: string, folded: string, tokens: Map<string, any> } | undefined} */
+			/** @type {{ source: JavaScriptSource, write: string, folded: string } | undefined} */
 			let anchor;
 			if (!event.invalid) {
 				// Persistent: async outcomes must retain Map/Set element and opaque custom
 				// child identities for future regions, exactly like the head region.
-				const region = this.#emit_region(event.value, true, references);
-				value_source = region.source;
+				const region = this.#emit_region(event.value, true, references, context);
+				value_source = region_source(region);
+				const rendered_region = render_fragment(value_source, (value) => {
+					if (value?.type === 'reference') return render_reference(value.reference ?? context.references.get(value.node));
+					return render_fragment_hole(value);
+				});
 				if (!is_primitive(event.value)) {
-					const index = this.#anchor;
-					this.#set_private('anchor', index + 1);
-					this.#assign_references(event.value, { root: `s.a[${index}]`, segments: [] }, new Map());
+					const index = context.anchor++;
+					this.#assign_references(context, event.value, { root: `s.a[${index}]`, segments: [] }, new Map());
 					const name = `s.a[${index}]`;
 					// Implicit anchoring: anchor indices are allocated monotonically and every
 					// allocated index is written exactly once in allocation order, so once the
@@ -1306,13 +1305,14 @@ class Session {
 					// writes before the switch keep `s.a` dense, so mixing both forms is safe.
 					const use_helper = this.#runtimes_emitted.v || index > 5;
 					const write = use_helper
-						? `${this.#runtime_token('v')}(${region.source})`
-						: `${name}=${region.source}`;
+						? `${this.#runtime_token('v')}(${rendered_region})`
+						: `${name}=${rendered_region}`;
 					// Defer the anchor write: when the operation uses the value exactly
 					// once, the write is folded into that use site. A helper call is a
 					// primary expression; only the assignment form needs parentheses.
-					anchor = { name, write, folded: use_helper ? write : `(${write})`, tokens: region.tokens };
-					value_source = this.#placeholder();
+					const outcome = { type: 'outcome', source: value_source, anchored: name, folded: use_helper ? write : `(${write})` };
+					anchor = { source: outcome, write, folded: outcome.folded };
+					value_source = create_source(['', ''], [outcome]);
 				}
 			} else {
 				value_source = generic_error;
@@ -1325,44 +1325,42 @@ class Session {
 				else if (event.type === 'next') operation = source.descriptor.next(reference, value_source);
 				else if (event.type === 'complete') operation = source.descriptor.complete(reference, value_source);
 				else operation = source.descriptor.error(reference, value_source);
-				if (typeof operation !== 'string') throw new TypeError('Invalid async descriptor operation');
-				const tokens = operation_tokens(node, target_token, control_token);
+				if (!is_source(operation)) throw new TypeError('Invalid async descriptor operation');
 				if (anchor) {
-					if (count_occurrences(operation, value_source) === 1) {
-						operation = operation.replace(value_source, () => anchor.folded);
-					} else {
-						operations.push({ source: anchor.write, tokens: anchor.tokens });
-						operation = operation.split(value_source).join(anchor.name);
+					if (count_source(operation, anchor.source) === 1) anchor.source.render = anchor.folded;
+					else {
+						operations.push(raw_source(anchor.write));
+						anchor.source.render = anchor.source.anchored;
 					}
-					for (const [token, value] of anchor.tokens) tokens.set(token, value);
 				}
-				operations.push({ source: operation, tokens });
+				operations.push(operation);
 			} catch (error) {
 				if (event.type === 'resolve' || event.type === 'next' || event.type === 'complete') {
 					this.#report(error, event.value);
 					// The outcome's identities were assigned anchor references, so the anchor
 					// must still ship even though the operation falls back to a generic error.
-					if (anchor) operations.push({ source: anchor.write, tokens: anchor.tokens });
+					if (anchor) operations.push(raw_source(anchor.write));
 					const fallback = source.type === 'sequence'
 						? source.descriptor.error(reference, generic_error)
 						: source.descriptor.reject(reference, generic_error);
-					if (typeof fallback !== 'string') throw new TypeError('Invalid async descriptor operation');
-					operations.push({ source: fallback, tokens: operation_tokens(node, target_token, control_token) });
-					this.#set(event, 'type', source.type === 'sequence' ? 'error' : 'reject');
+					if (!is_source(fallback)) throw new TypeError('Invalid async descriptor operation');
+					operations.push(fallback);
+					context.event_types.set(event, source.type === 'sequence' ? 'error' : 'reject');
 				} else {
 					throw error;
 				}
 			}
 			if (event.type !== 'next' && node.data.captured && !source.descriptor.manages_pending) {
-				operations.push({ source: `delete s.p[${node.data.pending}]`, tokens: new Map() });
+				operations.push(raw_source(`delete s.p[${node.data.pending}]`));
 			}
-			if (event.type !== 'next') {
-				this.#set_private('active', this.#active - 1);
-				if (source.type === 'sequence' && event.type === 'error') this.#set(source, 'needs_close', true);
+			const effective_type = context.event_types.get(event) ?? event.type;
+			if (effective_type !== 'next') {
+				context.active--;
+				if (source.type === 'sequence' && effective_type === 'error') context.close.push(source);
 			}
 		}
-		const rendered = this.#render_operations(operations, references);
-		if (block && this.#active === 0 && this.#batch.length === 0) {
+		const rendered = this.#render_operations(operations, references, context);
+		if (block && context.active === 0 && this.#batch.length === 0) {
 			rendered.push(this.#cleanup_source());
 		}
 		let body = rendered.join(';');
@@ -1374,11 +1372,12 @@ class Session {
 			body = resolved.defs.length ? `${resolved.defs.join(';')};${resolved.source}` : resolved.source;
 		}
 		const result = prefix + body + (block ? '})' : rendered.length ? ';' : '');
-		this.#commit_transaction(marker);
-		return result;
+		this.#commit_emission(context);
+		return { source: result, close: context.close };
 		} catch (error) {
-			this.#rollback_transaction(marker);
 			throw error;
+		} finally {
+			this.#emitting = undefined;
 		}
 	}
 
@@ -1386,28 +1385,26 @@ class Session {
 	 * Creates persistent client-slot aliases for repeated long paths when profitable in
 	 * this batch, then retains those aliases as the nodes' shortest references.
 	 *
-	 * @param {Array<{ source: string, tokens: Map<string, { node?: GraphNode, reference?: Reference, source?: string }> }>} operations
-	 * @param {Set<GraphNode>} references
+	 * @param {Array<{ source: string, tokens: Map<string, { node?: CapturedNode, reference?: ClientPath, source?: string }> }>} operations
+	 * @param {Set<CapturedNode>} references
 	 */
-	#render_operations(operations, references) {
+	#render_operations(operations, references, context) {
 		const uses = new Map();
 		const imported_references = new Map();
-		const pattern = TOKEN_PATTERN;
 		for (const operation of operations) {
-			if (operation.tokens.size === 0) continue;
-			for (const match of operation.source.matchAll(pattern)) {
-				const token = operation.tokens.get(match[0]);
-				if (!token?.node) continue;
-				uses.set(token.node, (uses.get(token.node) ?? 0) + 1);
-				if (token.reference && !imported_references.has(token.node)) {
-					imported_references.set(token.node, token.reference);
+			for (const value of source_holes(operation)) {
+				if (value?.type !== 'reference') continue;
+				uses.set(value.node, (uses.get(value.node) ?? 0) + 1);
+				if (value.reference && !imported_references.has(value.node)) {
+					imported_references.set(value.node, value.reference);
 				}
 			}
 		}
 		const candidates = [];
 		for (const node of references) {
-			if (!node.reference || node.reference.root.startsWith('s.s[')) continue;
-			const path = render_reference(imported_references.get(node) ?? node.reference);
+			const reference = context.references.get(node);
+			if (!reference || reference.root.startsWith('s.s[')) continue;
+			const path = render_reference(imported_references.get(node) ?? reference);
 			const count = uses.get(node) ?? 0;
 			if (count < 2) continue;
 			candidates.push({ node, path, uses: count });
@@ -1416,24 +1413,26 @@ class Session {
 		const aliases = new Map();
 		const prefix = [];
 		for (const { node, path, uses } of candidates) {
-			const slot = `s.s[${this.#slot}]`;
+			const slot = `s.s[${context.slot}]`;
 			if (`${slot}=${path};`.length + slot.length * uses >= path.length * uses) continue;
-			this.#set_private('slot', this.#slot + 1);
+			context.slot++;
 			prefix.push(`${slot}=${path}`);
 			aliases.set(node, slot);
-			this.#set(node, 'reference', { root: slot, segments: [] });
+			context.references.set(node, { root: slot, segments: [] });
 		}
-		return prefix.concat(operations.map((operation) => {
-			if (operation.tokens.size === 0) return operation.source;
-			// Single pass replaces every mapped placeholder instead of one split/join per token.
-			return operation.source.replace(pattern, (match) => {
-				const value = operation.tokens.get(match);
-				if (!value) return match;
-				return /** @type {string} */ (value.node
-					? aliases.get(value.node) ?? render_reference(value.reference ?? value.node.reference)
-					: value.source);
-			});
-		}));
+		const render = (value) => {
+			if (value?.type === 'reference') {
+				return aliases.get(value.node) ?? render_reference(value.reference ?? context.references.get(value.node));
+			}
+			if (value?.type === 'capture') {
+				const source = render_fragment(value.source, render);
+				return `s.p[${value.pending}]=${needs_parentheses(source) ? `(${source})` : source}`;
+			}
+			if (value?.type === 'outcome') return value.render ?? render_fragment(value.source, render);
+			if (value?.type === 'generated') return value.source;
+			return render_fragment_hole(value);
+		};
+		return prefix.concat(operations.map((operation) => render_fragment(operation, render)));
 	}
 
 	/**
@@ -1516,11 +1515,9 @@ class Session {
 						throw session.#failure ?? error;
 					}
 					let close_failure;
-					for (const event of batch.events) {
-						if (!event.source.needs_close) continue;
-						event.source.needs_close = false;
+					for (const source of block.close) {
 						try {
-							await session.#close_sequence(event.source);
+							await session.#close_sequence(source);
 						} catch (error) {
 							close_failure ??= error;
 						}
@@ -1528,7 +1525,7 @@ class Session {
 					session.#start_unstarted();
 					session.#consume(batch);
 					if (close_failure) session.#fail(close_failure);
-					return { done: false, value: block };
+					return { done: false, value: block.source };
 				} finally {
 					pending = false;
 				}
@@ -1642,7 +1639,7 @@ class Session {
 /**
  * Emits a constructor expression for a captured non-container built-in.
  *
- * @param {GraphNode} node
+ * @param {CapturedNode} node
  * @param {(value: unknown) => string} expression
  * @returns {string}
  */
@@ -1730,20 +1727,106 @@ function prop(key) {
 	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key) ? `.${key}` : `[${stringify_string(key)}]`;
 }
 
-/**
- * Builds the placeholder token map for one async descriptor operation.
- *
- * @param {GraphNode} node
- * @param {string} target_token
- * @param {string | undefined} control_token
- * @returns {Map<string, { node?: GraphNode, reference?: Reference, source?: string }>}
- */
-function operation_tokens(node, target_token, control_token) {
-	/** @type {Map<string, { node?: GraphNode, reference?: Reference, source?: string }>} */
-	const tokens = new Map();
-	tokens.set(target_token, { node, reference: node.reference });
-	if (control_token) tokens.set(control_token, { source: `s.p[${node.data.pending}]` });
-	return tokens;
+/** @param {CapturedNode} node @param {ClientPath | undefined} reference @returns {JavaScriptSource} */
+function source_reference(node, reference) {
+	return /** @type {JavaScriptSource} */ ({ [SOURCE]: true, strings: ['', ''], values: [{ type: 'reference', node, reference }] });
+}
+
+/** @param {{ source: string, tokens: Map<string, { node: CapturedNode, reference: ClientPath }> }} region */
+function region_source(region) {
+	if (region.tokens.size === 0) return raw_source(region.source);
+	const strings = [];
+	const values = [];
+	let index = 0;
+	for (const match of region.source.matchAll(TOKEN_PATTERN)) {
+		const token = match[0];
+		const reference = region.tokens.get(token);
+		if (!reference) continue;
+		strings.push(region.source.slice(index, match.index));
+		values.push({ type: 'reference', ...reference });
+		index = match.index + token.length;
+	}
+	strings.push(region.source.slice(index));
+	return create_source(strings, values);
+}
+
+/** Returns ordinary value holes reachable through nested source fragments. @param {JavaScriptSource} source */
+function source_values(source) {
+	const values = [];
+	for (const value of source.values) {
+		if (is_source(value)) values.push(...source_values(value));
+		else if (!is_internal_hole(value)) values.push(value);
+	}
+	return values;
+}
+
+/** Returns every structural hole reachable through nested source fragments. @param {JavaScriptSource} source */
+function source_holes(source) {
+	const values = [];
+	for (const value of source.values) {
+		if (is_source(value)) values.push(...source_holes(value));
+		else if (value?.type === 'outcome') values.push(...source_holes(value.source));
+		else values.push(value);
+	}
+	return values;
+}
+
+/** @param {JavaScriptSource} source @param {unknown} target */
+function count_source(source, target) {
+	let count = 0;
+	for (const value of source.values) {
+		if (value === target) count++;
+		else if (is_source(value)) count += count_source(value, target);
+	}
+	return count;
+}
+
+/** @param {JavaScriptSource} source @param {unknown} target @param {JavaScriptSource} replacement @returns {JavaScriptSource} */
+function replace_source(source, target, replacement) {
+	return create_source(source.strings, source.values.map((value) => {
+		if (value === target) return replacement;
+		return is_source(value) && value !== target ? replace_source(value, target, replacement) : value;
+	}));
+}
+
+/** @param {JavaScriptSource} source @param {(value: any) => string} render */
+function render_fragment(source, render) {
+	let result = source.strings[0];
+	for (let i = 0; i < source.values.length; i++) {
+		const value = source.values[i];
+		result += is_source(value) ? render_fragment(value, render) : render(value);
+		result += source.strings[i + 1];
+	}
+	return result;
+}
+
+/** @param {any} value */
+function render_fragment_hole(value) {
+	if (value?.type === 'reference') return render_reference(value.reference);
+	if (is_primitive(value)) return stringify_primitive(value);
+	throw new TypeError('Invalid JavaScript source interpolation');
+}
+
+/** @param {unknown} value */
+function is_internal_hole(value) {
+	return typeof value === 'object' && value !== null && (value.type === 'reference' || value.type === 'capture' || value.type === 'generated' || value.type === 'outcome');
+}
+
+/** @param {JavaScriptSource} source @param {(value: unknown) => string} expression */
+function render_source(source, expression) {
+	return render_fragment(source, (value) => expression(value));
+}
+
+/** @param {JavaScriptSource} source */
+function render_descriptor_source(source) {
+	return render_fragment(source, (value) => {
+		if (value?.type === 'capture') {
+			const captured = render_descriptor_source(value.source);
+			return `s.p[${value.pending}]=${needs_parentheses(captured) ? `(${captured})` : captured}`;
+		}
+		if (is_primitive(value)) return stringify_primitive(value);
+		throw new TypeError('Invalid JavaScript source interpolation');
+	});
 }
 
 /** Bare identifiers and bracketed identifier lists, e.g. `g` or `[a,b]`. */
@@ -1775,9 +1858,9 @@ function literal_key(key) {
 /**
  * Returns a structured client reference with one additional path segment.
  *
- * @param {Reference} reference
+ * @param {ClientPath} reference
  * @param {string} segment
- * @returns {Reference}
+ * @returns {ClientPath}
  */
 function append_reference(reference, segment) {
 	return { root: reference.root, segments: [...reference.segments, segment] };
@@ -1786,7 +1869,7 @@ function append_reference(reference, segment) {
 /**
  * Renders a structured client reference as executable source.
  *
- * @param {Reference} reference
+ * @param {ClientPath} reference
  * @returns {string}
  */
 function render_reference(reference) {
@@ -1796,30 +1879,13 @@ function render_reference(reference) {
 /**
  * Computes the rendered length of a structured client reference without allocating it.
  *
- * @param {Reference} reference
+ * @param {ClientPath} reference
  * @returns {number}
  */
 function reference_length(reference) {
 	let length = reference.root.length;
 	for (const segment of reference.segments) length += segment.length;
 	return length;
-}
-
-/**
- * Counts non-overlapping appearances of a placeholder token or source fragment.
- *
- * @param {string} source
- * @param {string} value
- * @returns {number}
- */
-function count_occurrences(source, value) {
-	let count = 0;
-	let index = 0;
-	while ((index = source.indexOf(value, index)) !== -1) {
-		count++;
-		index += value.length;
-	}
-	return count;
 }
 
 /**
@@ -1877,6 +1943,8 @@ function empty_tail() {
 	return tail;
 }
 
-/** @typedef {{ node: GraphNode, descriptor: any, type: 'value' | 'sequence' | 'native', started: boolean, terminal: boolean, cleaned: boolean, active: boolean, flushed_pending: number, iterator?: any, iterator_closed?: boolean, next?: Function, pulling?: boolean, pulled?: Promise<void>, pulled_resolve?: () => void, observer?: { active: boolean }, early?: ['resolve' | 'reject', unknown], needs_close?: boolean }} Source */
+/** @typedef {{ anchor: number, slot: number, collection: number, native_pending: number, active: number, references: Map<CapturedNode, ClientPath>, runtimes_emitted: Partial<Record<keyof typeof RUNTIMES, boolean>>, event_types: Map<Event, Event['type']>, close: Source[] }} EmissionContext */
+/** @typedef {{ node: CapturedNode, descriptor: any, type: 'value' | 'sequence' | 'native', started: boolean, terminal: boolean, cleaned: boolean, active: boolean, flushed_pending: number, iterator?: any, iterator_closed?: boolean, next?: Function, pulling?: boolean, pulled?: Promise<void>, pulled_resolve?: () => void, observer?: { active: boolean }, early?: ['resolve' | 'reject', unknown] }} Source */
 /** @typedef {{ source: Source, type: 'resolve' | 'reject' | 'next' | 'complete' | 'error', value: unknown, sequence: number, invalid: boolean }} Event */
 /** @typedef {{ events: Event[] }} Batch */
+/** @typedef {{ readonly [SOURCE]: true, readonly strings: readonly string[], readonly values: readonly unknown[] }} JavaScriptSource */

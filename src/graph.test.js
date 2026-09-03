@@ -1,16 +1,16 @@
 import { suite } from 'uvu';
 import * as assert from 'uvu/assert';
-import { checkpoint, create_graph, discover, rollback } from './graph.js';
+import { capture, create_captured_graph, discover } from './graph.js';
 
 const test = suite('shared graph');
-const create_test_graph = (root) => create_graph(root, () => false);
+const create_test_graph = (root) => create_captured_graph(root, () => false);
 
 test('records one node per identity', () => {
 	const shared = {};
 	const root = { first: shared, second: shared };
 	root.self = root;
 	const graph = create_test_graph(root);
-	discover(graph, root);
+	capture(graph, root);
 
 	assert.is(graph.nodes.length, 2);
 	assert.is(graph.identities.get(root), graph.nodes[0]);
@@ -25,7 +25,7 @@ test('captures sparse arrays and container order as canonical edges', () => {
 	const set = new Set([array, key]);
 	const root = { map, set };
 	const graph = create_test_graph(root);
-	discover(graph, root);
+	capture(graph, root);
 
 	const array_node = graph.identities.get(array);
 	assert.equal(array_node?.data.entries.map((entry) => entry[0]), ['3']);
@@ -42,7 +42,7 @@ test('applies classifications while graph owns recursive discovery', () => {
 	}
 	const child = {};
 	const root = new Box(child);
-	const graph = create_graph(root, (value, _node, graph) => {
+	const graph = create_captured_graph(root, (value, _node, graph) => {
 		if (!(value instanceof Box)) return false;
 		const captured = discover(graph, value.value);
 		return {
@@ -51,7 +51,7 @@ test('applies classifications while graph owns recursive discovery', () => {
 			edges: captured ? [{ node: captured.id }] : [{ value: value.value }]
 		};
 	});
-	const node = discover(graph, root);
+	const node = capture(graph, root);
 
 	assert.is(node?.kind, 'Box');
 	assert.is(node?.data.child, graph.identities.get(child));
@@ -61,13 +61,9 @@ test('applies classifications while graph owns recursive discovery', () => {
 test('rolls back appended identities without touching earlier captures', () => {
 	const shared = {};
 	const graph = create_test_graph(shared);
-	discover(graph, shared);
-	const marker = checkpoint(graph);
+	capture(graph, shared);
 	const value = { shared, extra: {} };
-	discover(graph, value);
-	assert.is(graph.nodes.length, 3);
-
-	rollback(graph, marker);
+	assert.throws(() => capture(graph, value, () => { throw new Error('invalid'); }));
 	assert.is(graph.nodes.length, 1);
 	assert.is(graph.identities.size, 1);
 	assert.is(graph.identities.has(value), false);
@@ -77,10 +73,7 @@ test('rolls back appended identities without touching earlier captures', () => {
 test('rolls back an entire failed recursive discovery', () => {
 	const root = { child: {}, invalid: () => {} };
 	const graph = create_test_graph(root);
-	const marker = checkpoint(graph);
-
-	assert.throws(() => discover(graph, root));
-	rollback(graph, marker);
+	assert.throws(() => capture(graph, root));
 
 	assert.is(graph.nodes.length, 0);
 	assert.is(graph.identities.size, 0);

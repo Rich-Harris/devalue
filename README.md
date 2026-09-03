@@ -139,7 +139,7 @@ Native AsyncIterables reconstruct as buffered `AsyncIterableIterator` values. Th
 
 #### Custom asynchronous values
 
-A replacer may return a synchronous source string as with `uneval`, an `AsyncValueDescriptor`, or an `AsyncSequenceDescriptor`. This example adapts a nonthenable server object whose completion is Promise-like:
+A replacer receives a `js` template tag and may return a synchronous source fragment, an `AsyncValueDescriptor`, or an `AsyncSequenceDescriptor`. Ordinary template holes are serialized values; nested fragments created by `js` compose as source. This example adapts a nonthenable server object whose completion is Promise-like:
 
 ```js
 class ServerJob {
@@ -158,15 +158,15 @@ class RemoteJob {
 	}
 }
 
-const replacer = (value) => {
+const replacer = (value, js) => {
 	if (!(value instanceof ServerJob)) return;
 
 	return {
 		type: 'async-value',
 		source: value.completion,
-		construct: () => 'new RemoteJob()',
-		resolve: ({ target }, payload) => `${target}.resolve(${payload})`,
-		reject: ({ target }, reason) => `${target}.reject(${reason})`
+		construct: () => js`new RemoteJob()`,
+		resolve: ({ target }, payload) => js`${target}.resolve(${payload})`,
+		reject: ({ target }, reason) => js`${target}.reject(${reason})`
 	};
 };
 
@@ -178,16 +178,16 @@ const { head, tail } = await unevalStream(new ServerJob(jobPromise), replacer);
 AsyncIterables need no replacer when the client should receive a buffered async iterator. A descriptor can instead adapt one into a custom multi-shot client value:
 
 ```js
-const sequenceReplacer = (value) => {
+const sequenceReplacer = (value, js) => {
 	if (!value?.events) return;
 
 	return {
 		type: 'async-sequence',
 		source: value.events,
-		construct: () => 'new RemoteSequence()',
-		next: ({ target }, item) => `${target}.next(${item})`,
-		complete: ({ target }, result) => `${target}.complete(${result})`,
-		error: ({ target }, reason) => `${target}.error(${reason})`,
+		construct: () => js`new RemoteSequence()`,
+		next: ({ target }, item) => js`${target}.next(${item})`,
+		complete: ({ target }, result) => js`${target}.complete(${result})`,
+		error: ({ target }, reason) => js`${target}.error(${reason})`,
 		cancel: () => value.close()
 	};
 };
@@ -195,9 +195,9 @@ const sequenceReplacer = (value) => {
 
 The iterable's yields, return value and failure are serialized through `next`, `complete` and `error`. Only one pull is outstanding and one ready item is unconsumed at a time. Cancellation calls the iterator's `return()` and descriptor `cancel()` at most once.
 
-Replacer results are strict: `undefined`, `null` and `false` mean no replacement; strings are synchronous replacements; valid discriminated descriptors are asynchronous replacements; all other values throw. Replacers are synchronous, not async, and run once per represented object. A string replacer's child serializer returns opaque executable source expressions that should be interpolated directly into the returned source; do not inspect or modify them.
+Replacer results are strict: `undefined`, `null` and `false` mean no replacement; a fragment returned by `js` is a synchronous replacement; valid discriminated descriptors are asynchronous replacements; all other values, including raw strings, throw. Replacers are synchronous, not async, and run once per represented object. Fragment creation is lazy: values interpolated into fragments that are never returned or composed are not discovered.
 
-Descriptor constructors and operation callbacks return trusted executable JavaScript, like `uneval` replacer strings. They must return strings, correctly use the provided source expressions, and must not contain untrusted text without devalue-compatible escaping. Names such as `RemoteJob` and `RemoteSequence` in the examples must exist in the global realm where the generated source is evaluated. Client constructor or generated-operation failures are unrecoverable.
+Descriptor constructors and operation callbacks return `js` fragments. Their target, optional control, payload and reason arguments are themselves composable fragments. Static template text is trusted executable JavaScript; interpolate dynamic values so devalue escapes and serializes them. Names such as `RemoteJob` and `RemoteSequence` in the examples must exist in the global realm where the generated source is evaluated. Client constructor or generated-operation failures are unrecoverable.
 
 Initial traversal, classification and construction-validation errors reject `unevalStream`. After an async boundary is established, an unserializable result transitions that client value to rejection/error using a generic Error; a serializable rejection reason retains graph identity. Failures in trusted `reject`/`error` operation generation terminate tail iteration and cancel server sources.
 
