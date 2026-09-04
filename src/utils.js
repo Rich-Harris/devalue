@@ -114,8 +114,10 @@ export function stringify_string(str) {
 
 /** @param {Record<string | symbol, any>} object */
 export function enumerable_symbols(object) {
+	// Own symbols always have a descriptor; the optional chain only satisfies the lib's
+	// `PropertyDescriptor | undefined` return type.
 	return Object.getOwnPropertySymbols(object).filter(
-		(symbol) => Object.getOwnPropertyDescriptor(object, symbol).enumerable
+		(symbol) => Object.getOwnPropertyDescriptor(object, symbol)?.enumerable
 	);
 }
 
