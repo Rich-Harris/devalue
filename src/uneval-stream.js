@@ -613,7 +613,10 @@ class Session {
 	 * @param {Source} source
 	 */
 	#pull(source) {
-		if (source.terminal || source.pulling || this.#cancelled) return;
+		// `next` is set by #start_sequence before the first pull, and later pulls are only
+		// triggered by 'next' events, which require an earlier successful pull.
+		const next = source.next;
+		if (!next || source.terminal || source.pulling || this.#cancelled) return;
 		source.pulling = true;
 		source.pulled = new Promise((resolve) => {
 			source.pulled_resolve = resolve;
@@ -623,7 +626,6 @@ class Session {
 			source.pulled_resolve?.();
 			source.pulled_resolve = undefined;
 		};
-		const next = source.next;
 		let result;
 		try {
 			result = next.call(source.iterator);
@@ -1099,6 +1101,20 @@ class Session {
 	}
 
 	/**
+	 * Resolves a reference hole to a concrete client path: the path fixed when the hole
+	 * was created, or else the node's shortest committed path. Every node that reaches
+	 * a batch has been anchored by an earlier region, so a miss is an internal error.
+	 *
+	 * @param {ReferenceHole} hole
+	 * @returns {ClientPath}
+	 */
+	#resolve_reference(hole) {
+		const reference = hole.reference ?? this.#references.get(hole.node);
+		if (!reference) throw this.#error('Cannot stringify value', hole.node.value);
+		return reference;
+	}
+
+	/**
 	 * Walks stable graph edges and assigns the cheapest reachable client reference to each node.
 	 *
 	 * @param {unknown} value
@@ -1211,7 +1227,7 @@ class Session {
 				value_source = region_source(region);
 				const rendered_region = render_fragment(value_source, (value) => {
 					if (is_internal_hole(value) && value.type === 'reference') {
-						return render_reference(value.reference ?? this.#references.get(value.node));
+						return render_reference(this.#resolve_reference(value));
 					}
 					return render_fragment_hole(value);
 				});
@@ -1347,7 +1363,7 @@ class Session {
 		const render = (value) => {
 			if (is_internal_hole(value)) {
 				if (value.type === 'reference') {
-					return aliases.get(value.node) ?? render_reference(value.reference ?? this.#references.get(value.node));
+					return aliases.get(value.node) ?? render_reference(this.#resolve_reference(value));
 				}
 				if (value.type === 'capture') {
 					const source = render_fragment(value.source, render);
@@ -1747,9 +1763,13 @@ function render_fragment(source, render) {
 	return result;
 }
 
-/** @param {unknown} value */
+/**
+ * Renders a user-interpolated hole. Internal holes are handled by the caller before
+ * reaching here, so anything non-primitive is an invalid interpolation.
+ *
+ * @param {unknown} value
+ */
 function render_fragment_hole(value) {
-	if (is_internal_hole(value) && value.type === 'reference') return render_reference(value.reference);
 	if (is_primitive(value)) return stringify_primitive(value);
 	throw new TypeError('Invalid JavaScript source interpolation');
 }
@@ -1898,7 +1918,7 @@ function empty_tail() {
 	return tail;
 }
 
-/** @typedef {{ node: AsyncNode, descriptor: any, type: 'value' | 'sequence' | 'native', started: boolean, terminal: boolean, cleaned: boolean, active: boolean, flushed_pending: number, iterator?: any, iterator_closed?: boolean, next?: Function, pulling?: boolean, pulled?: Promise<void>, pulled_resolve?: () => void, observer?: { active: boolean }, early?: ['resolve' | 'reject', unknown] }} Source */
+/** @typedef {{ node: AsyncNode, descriptor: any, type: 'value' | 'sequence' | 'native', started: boolean, terminal: boolean, cleaned: boolean, active: boolean, flushed_pending: number, iterator?: AsyncIterator<unknown>, iterator_closed?: boolean, next?: AsyncIterator<unknown>['next'], pulling?: boolean, pulled?: Promise<void>, pulled_resolve?: () => void, observer?: { active: boolean }, early?: ['resolve' | 'reject', unknown] }} Source */
 /** @typedef {{ source: Source, type: 'resolve' | 'reject' | 'next' | 'complete' | 'error', value: unknown, sequence: number, invalid: boolean }} Event */
 /** @typedef {{ events: Event[] }} Batch */
 /**
