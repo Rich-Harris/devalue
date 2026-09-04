@@ -1,4 +1,5 @@
-const SOURCE = Symbol('JavaScriptSource');
+/** Brands a `JavaScriptSource` and stores its parts, keeping them off the object's own enumerable keys. */
+export const SOURCE = Symbol('JavaScriptSource');
 
 /**
  * @param {TemplateStringsArray} strings
