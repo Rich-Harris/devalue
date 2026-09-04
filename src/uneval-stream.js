@@ -13,7 +13,7 @@
  */
 
 import { DevalueError, is_primitive, stringify_primitive, stringify_string } from './utils.js';
-import { child, create_captured_graph, discover, is_node, rollback } from './graph.js';
+import { child, create_captured_graph, discover, is_node, roll_back } from './graph.js';
 import { SOURCE, create_source, is_source, js, raw_source } from './javascript-source.js';
 
 const promise_then = Promise.prototype.then;
@@ -284,7 +284,7 @@ class Session {
 				}
 			}
 			this.#new_custom.length = custom;
-			rollback(graph, nodes, error);
+			roll_back(graph, nodes, error);
 			throw error;
 		}
 	}
