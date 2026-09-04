@@ -9,39 +9,30 @@ import {
 	valid_array_indices
 } from './utils.js';
 
+/** @import { Source } from './uneval-stream.js' */
+/** @import { JavaScriptSource } from './javascript-source.js' */
+
 /**
- * A direct child of a captured node: the canonical node for a non-primitive value, or the
- * primitive value itself. Nodes are always objects, so `is_node` distinguishes the two
- * without a wrapper allocation.
+ * A direct child of a captured node. Can either be another node or a primitive.
  * @typedef {CapturedNode | null | undefined | boolean | number | string | bigint} Child
  */
+
 /**
- * A source expression for reaching a non-primitive value created on the client.
+ * A source expression for reaching a non-primitive value created on the client. This answers
+ * the question "how can I figure out where in the client's memory space this value resides?"
  *
  * @typedef {object} ClientPath
  * @property {string} root Expression that evaluates to the reference's starting object.
  * @property {string[]} segments Property-access segments appended to `root`.
  */
+
 /**
- * A captured non-primitive value. Discovery fills `value` through `children`; streaming
- * emission temporarily fills `region_id` through `rendering` while planning its output.
+ * Fields shared by every captured node regardless of `kind`. Discovery fills `value`;
+ * streaming emission temporarily fills `region_id` through `rendering` while planning
+ * its output.
  *
- * The meaning of `keys`, `children`, and `data` depends on `kind`:
- * - `Array`: `keys` are populated index strings, `children` their values, `data` the array length.
- * - `Object` / `NullObject`: `keys` are property names, `children` their values.
- * - `Set`: `children` are the members in insertion order.
- * - `Map`: `children` alternate key, value, key, value, … in insertion order.
- * - ArrayBuffer views and `DataView`: `children[0]` is the buffer; `data` holds `byteOffset`, `byteLength`, `length`.
- * - `Custom`: `children` are the replacer template's holes in order; `data` is the template.
- * - `Async`: no children; `data` is the descriptor plan.
- * - Scalars (`Date`, `RegExp`, boxed primitives, …): no children; `data` is the captured representation.
- *
- * @typedef {object} CapturedNode
+ * @typedef {object} NodeBase
  * @property {any} value The original value represented by this node. Its contents are not read again during emission.
- * @property {string} kind The reconstruction tag, such as `Array`, `Map`, `Custom`, or `Async`.
- * @property {string[]} keys Property names or index strings parallel to `children`; empty for other kinds.
- * @property {Child[]} children Direct dependencies needed to reconstruct this value, in reconstruction order.
- * @property {any} data Kind-specific captured representation.
  * @property {number} opaque Number of custom constructors embedding this node; when positive, emission must preserve it as a named value rather than duplicate it inline.
  * @property {number} region_id Identifies the emitted region for which the following planning fields are valid.
  * @property {number} position This node's position in the current emission's child-before-parent order.
@@ -52,6 +43,53 @@ import {
  * @property {string} name Temporary variable name, or an empty string when the node is inlined.
  * @property {boolean} rendering Whether this node is currently being expanded inline.
  */
+
+/**
+ * The reconstruction tags of ArrayBuffer views.
+ * @typedef {'Int8Array' | 'Uint8Array' | 'Uint8ClampedArray' | 'Int16Array' | 'Uint16Array' | 'Float16Array' | 'Int32Array' | 'Uint32Array' | 'Float32Array' | 'Float64Array' | 'BigInt64Array' | 'BigUint64Array' | 'DataView'} ViewKind
+ */
+
+/**
+ * The reconstruction tags of values captured as a single string via `String(value)`.
+ * @typedef {'URL' | 'URLSearchParams' | 'Temporal.Duration' | 'Temporal.Instant' | 'Temporal.PlainDate' | 'Temporal.PlainTime' | 'Temporal.PlainDateTime' | 'Temporal.PlainMonthDay' | 'Temporal.PlainYearMonth' | 'Temporal.ZonedDateTime'} StringKind
+ */
+
+/**
+ * A captured non-primitive value, discriminated by `kind`. Every variant carries the same
+ * property set (`keys`, `children`, `data`) so that all nodes share one object shape; the
+ * types of those properties narrow with `kind`.
+ *
+ * `children` lists the direct dependencies needed to reconstruct the value, in
+ * reconstruction order, for every kind; emission walks it without inspecting `kind`.
+ *
+ * @typedef {NodeBase & (
+ *   | { kind: '', keys: never[], children: never[], data: undefined }
+ *   | { kind: 'Array', keys: string[], children: Child[], data: number }
+ *   | { kind: 'Object' | 'NullObject', keys: string[], children: Child[], data: undefined }
+ *   | { kind: 'Set' | 'Map', keys: never[], children: Child[], data: undefined }
+ *   | { kind: ViewKind, keys: never[], children: [CapturedNode], data: { byteOffset: number, byteLength: number, length: number | undefined } }
+ *   | { kind: 'Custom', keys: never[], children: Child[], data: JavaScriptSource }
+ *   | { kind: 'Async', keys: never[], children: never[], data: { source: JavaScriptSource, pending: number, captured: boolean, state: Source } }
+ *   | { kind: 'Number' | 'String' | 'Boolean' | 'BigInt', keys: never[], children: never[], data: number | string | boolean | bigint }
+ *   | { kind: 'Date', keys: never[], children: never[], data: number }
+ *   | { kind: 'RegExp', keys: never[], children: never[], data: { source: string, flags: string } }
+ *   | { kind: StringKind, keys: never[], children: never[], data: string }
+ *   | { kind: 'ArrayBuffer', keys: never[], children: never[], data: Uint8Array }
+ * )} CapturedNode
+ *
+ * Per variant:
+ * - `''`: reserved by `discover` but not yet classified; only observable during a cycle.
+ * - `Array`: `keys` are populated index strings, `children` their values, `data` the array length.
+ * - `Object` / `NullObject`: `keys` are property names, `children` their values.
+ * - `Set`: `children` are the members in insertion order.
+ * - `Map`: `children` alternate key, value, key, value, … in insertion order.
+ * - Views: `children[0]` is the buffer; `length` is undefined for `DataView`.
+ * - `Custom`: `children` are the replacer template's holes in order; `data` is the template.
+ * - `Async`: `data` is the descriptor plan, filled by `uneval-stream`.
+ */
+/** @typedef {CapturedNode['kind']} Kind */
+/** @typedef {CapturedNode & { kind: 'Async' }} AsyncNode */
+
 /**
  * A reusable snapshot of the non-primitive values discovered during one stream session.
  *
@@ -197,7 +235,9 @@ export function child(graph, value) {
  */
 function builtin_classify(graph, node, value) {
 	if (typeof value === 'function') throw error(graph, 'Cannot stringify a function', value);
-	const type = get_type(value);
+	// Every `get_type` result that survives the `default` branch is a member of `Kind`;
+	// unknown tags are rejected there as non-POJOs.
+	const type = /** @type {Kind} */ (get_type(value));
 	node.kind = type;
 
 	switch (type) {
