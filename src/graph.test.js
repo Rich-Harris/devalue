@@ -45,7 +45,7 @@ test('applies classifications while graph owns recursive discovery', () => {
 	}
 	const inner = {};
 	const root = new Box(inner);
-	const graph = create_captured_graph(root, (value, node, graph) => {
+	const graph = create_captured_graph(root, (graph, node, value) => {
 		if (!(value instanceof Box)) return false;
 		node.kind = 'Box';
 		node.children = [child(graph, value.value)];
