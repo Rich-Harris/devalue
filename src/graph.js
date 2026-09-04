@@ -160,7 +160,7 @@ export function create_captured_graph(root, custom_classify) {
  * @param {number} mark
  * @param {unknown} error
  */
-export function rollback(graph, mark, error) {
+export function roll_back(graph, mark, error) {
 	const nodes = graph.nodes;
 	const identities = graph.identities;
 	for (let i = nodes.length - 1; i >= mark; i--) identities.delete(nodes[i].value);
