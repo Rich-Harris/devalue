@@ -33,7 +33,10 @@ export class DevalueError extends Error {
 	}
 }
 
-/** @param {any} thing */
+/**
+ * @param {unknown} thing
+ * @returns {thing is null | undefined | boolean | number | string | bigint | symbol}
+ */
 export function is_primitive(thing) {
 	return thing === null || (typeof thing !== 'object' && typeof thing !== 'function');
 }
