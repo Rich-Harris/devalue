@@ -186,15 +186,14 @@ function array_index_cut(keys) {
 }
 
 /**
- * Finds the populated indices of an array.
- * @template {unknown[]} T
- * @param {T} array
- * @returns {(keyof T)[]}
+ * Finds the populated indices of an array, as index strings in ascending order.
+ * @param {unknown[]} array
+ * @returns {string[]}
  */
 export function valid_array_indices(array) {
 	const keys = Object.keys(array);
 	keys.length = array_index_cut(keys);
-	return /** @type {(keyof T)[]} */ (keys);
+	return keys;
 }
 
 /**
