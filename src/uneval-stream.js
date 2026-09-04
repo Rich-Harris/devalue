@@ -122,7 +122,7 @@ class Session {
 		this.#replacer = replacer;
 		this.#signal = signal;
 		this.#onerror = options.onerror;
-		this.#graph = create_captured_graph(root, (value, node, graph) => this.#classify(value, node, graph));
+		this.#graph = create_captured_graph(root, (graph, node, value) => this.#classify(graph, node, value));
 		this.#abort = () => void this.#cancel(signal?.reason);
 		signal?.addEventListener('abort', this.#abort, { once: true });
 	}
@@ -322,12 +322,12 @@ class Session {
 	 * AsyncIterable, filling the node in place. Returning false delegates to graph's
 	 * built-in discovery.
 	 *
-	 * @param {unknown} value
-	 * @param {CapturedNode} node
 	 * @param {CapturedGraph} graph
+	 * @param {CapturedNode} node
+	 * @param {unknown} value
 	 * @returns {boolean}
 	 */
-	#classify(value, node, graph) {
+	#classify(graph, node, value) {
 		if (this.#replacer) {
 			const result = this.#replacer(value, js);
 			if (is_source(result)) {
