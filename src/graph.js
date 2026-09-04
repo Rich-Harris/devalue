@@ -186,8 +186,7 @@ export function discover(graph, value) {
 		return undefined;
 	}
 
-	const identity = /** @type {object} */ (value);
-	const existing = graph.identities.get(identity);
+	const existing = graph.identities.get(value);
 	if (existing) return existing;
 
 	/** @type {CapturedNode} */
@@ -208,7 +207,8 @@ export function discover(graph, value) {
 		rendering: false
 	};
 	graph.nodes.push(node);
-	graph.identities.set(identity, node);
+  graph.identities.set(value, node);
+	// lest you miss it, this is where the cool stuff happens and the node gets populated
 	graph.classify(value, node);
 	return node;
 }
