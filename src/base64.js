@@ -34,7 +34,8 @@ export function encode_legacy(array_buffer) {
 	const chunk_size = 0x8000;
 	for (let i = 0; i < array.length; i += chunk_size) {
 		const chunk = array.subarray(i, i + chunk_size);
-		binary += String.fromCharCode.apply(null, chunk);
+		// `apply` accepts any array-like at runtime; lib types only admit `number[]`.
+		binary += String.fromCharCode.apply(null, /** @type {number[]} */ (/** @type {unknown} */ (chunk)));
 	}
 
 	return btoa(binary);
