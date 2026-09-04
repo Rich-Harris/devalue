@@ -9,10 +9,10 @@
 		"diagnostics": true,
 		"noEmitOnError": true,
 		"lib": ["es6", "esnext", "dom"],
+		"module": "esnext",
 		"target": "esnext",
 		"types": ["node"]
 	},
-	"module": "ES6",
 	"include": ["index.js", "src/*.js"],
 	"exclude": ["node_modules", "src/*.test.js"]
 }
