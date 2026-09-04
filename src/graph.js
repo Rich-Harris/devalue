@@ -88,7 +88,7 @@ import {
  * - `Async`: `data` is the descriptor plan, filled by `uneval-stream`.
  */
 /** @typedef {CapturedNode['kind']} Kind */
-/** @typedef {CapturedNode & { kind: 'Async' }} AsyncNode */
+/** @typedef {Extract<CapturedNode, { kind: 'Async' }>} AsyncNode */
 
 /**
  * A reusable snapshot of the non-primitive values discovered during one stream session.
@@ -130,11 +130,10 @@ export function is_node(child) {
  *
  * The graph is append-only. A caller that needs atomic discovery records `nodes.length`
  * before calling `discover` and passes it to `rollback` if discovery throws: every node
- * appended since is removed along with its identity entry, so no per-addition tagging
- * is needed and the success path pays nothing.
+ * appended since is removed along with its identity entry.
  *
  * @param {unknown} root
- * @param {(value: unknown, node: CapturedNode, graph: CapturedGraph) => boolean} custom_classify Fills in the node and returns true, or returns false to use built-in discovery.
+ * @param {(graph: CapturedGraph, node: CapturedNode, value: unknown) => boolean} custom_classify Fills in the node and returns true, or returns false to use built-in discovery.
  * @returns {CapturedGraph}
  */
 export function create_captured_graph(root, custom_classify) {
@@ -143,9 +142,7 @@ export function create_captured_graph(root, custom_classify) {
 		root_value: root,
 		nodes: [],
 		identities: new Map(),
-		classify: (value, node) => {
-			if (!custom_classify(value, node, graph)) builtin_classify(graph, node, value);
-		},
+		classify: (value, node) => custom_classify(graph, node, value) || builtin_classify(graph, node, value),
 		unwind: []
 	};
 	return graph;
