@@ -1863,6 +1863,32 @@ asyncErrorTests('throws for promise resolving to function', async () => {
 	}
 });
 
+asyncErrorTests('populates error.path for values inside promises', async () => {
+	try {
+		await stringifyAsync({
+			foo: {
+				array: [Promise.resolve(function invalid() {})]
+			}
+		});
+		assert.unreachable('should have thrown');
+	} catch (e) {
+		assert.equal(e.name, 'DevalueError');
+		assert.equal(e.path, '.foo.array[0]');
+	}
+
+	try {
+		await stringifyAsync({
+			foo: Promise.resolve({
+				bar: Promise.resolve({ invalid() {} })
+			})
+		});
+		assert.unreachable('should have thrown');
+	} catch (e) {
+		assert.equal(e.name, 'DevalueError');
+		assert.equal(e.path, '.foo.bar.invalid');
+	}
+});
+
 asyncErrorTests.run();
 
 const circularCustomTypes = uvu.suite('circular references through custom types');
