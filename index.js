@@ -1,3 +1,19 @@
+/**
+ * @import {
+ *   JavaScriptSource as JavaScriptSourceType,
+ *   JavaScriptTag as JavaScriptTagType,
+ *   UnevalReplacer as UnevalReplacerType,
+ *   StringValueTag as StringValueTagType,
+ *   ViewTag as ViewTagType,
+ *   StringifyOperations as StringifyOperationsType,
+ *   DefaultStringifyOperations as DefaultStringifyOperationsType,
+ *   StringifyOptions as StringifyOptionsType,
+ *   ParseOperations as ParseOperationsType,
+ *   DefaultParseOperations as DefaultParseOperationsType,
+ *   ParseOptions as ParseOptionsType
+ * } from './src/types.js'
+ */
+
 export { uneval } from './src/uneval.js';
 export { parse, unflatten } from './src/parse.js';
 export { stringify, stringifyAsync } from './src/stringify.js';
@@ -7,11 +23,14 @@ export {
 } from './src/operations.js';
 export { DevalueError, filter_array_indices as filterArrayIndices } from './src/utils.js';
 
-/** @typedef {import('./src/types.js').StringValueTag} StringValueTag */
-/** @typedef {import('./src/types.js').ViewTag} ViewTag */
-/** @typedef {import('./src/types.js').StringifyOperations} StringifyOperations */
-/** @typedef {import('./src/types.js').DefaultStringifyOperations} DefaultStringifyOperations */
-/** @typedef {import('./src/types.js').StringifyOptions} StringifyOptions */
-/** @typedef {import('./src/types.js').ParseOperations} ParseOperations */
-/** @typedef {import('./src/types.js').DefaultParseOperations} DefaultParseOperations */
-/** @typedef {import('./src/types.js').ParseOptions} ParseOptions */
+/** @typedef {JavaScriptSourceType} JavaScriptSource */
+/** @typedef {JavaScriptTagType} JavaScriptTag */
+/** @typedef {UnevalReplacerType} UnevalReplacer */
+/** @typedef {StringValueTagType} StringValueTag */
+/** @typedef {ViewTagType} ViewTag */
+/** @typedef {StringifyOperationsType} StringifyOperations */
+/** @typedef {DefaultStringifyOperationsType} DefaultStringifyOperations */
+/** @typedef {StringifyOptionsType} StringifyOptions */
+/** @typedef {ParseOperationsType} ParseOperations */
+/** @typedef {DefaultParseOperationsType} DefaultParseOperations */
+/** @typedef {ParseOptionsType} ParseOptions */
