@@ -241,10 +241,11 @@ export interface UnevalStreamOptions {
 	/** Cancels server-side observation and sequence pulling. */
 	signal?: AbortSignal;
 	/**
-	 * Diagnostic callback invoked when an asynchronous outcome cannot be serialized and is
-	 * replaced by a generic client-side error. Receives the serialization failure and the
-	 * unserializable outcome. Exceptions thrown by the callback are ignored; the stream
-	 * continues either way.
+	 * Diagnostic callback for recoverable failures the stream survives: an asynchronous
+	 * outcome that cannot be serialized (replaced by a generic client-side error; receives the
+	 * failure and the unserializable outcome), or a failed sequence's `return()` throwing
+	 * (receives the failure and the source iterable). Exceptions thrown by the callback are
+	 * ignored; the stream continues either way.
 	 */
 	onerror?: (error: unknown, value: unknown) => void;
 }
