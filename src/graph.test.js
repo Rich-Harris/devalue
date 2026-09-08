@@ -1,6 +1,6 @@
 import { suite } from 'uvu';
 import * as assert from 'uvu/assert';
-import { child, create_captured_graph, discover, rollback } from './graph.js';
+import { child, create_captured_graph, discover, roll_back } from './graph.js';
 
 const test = suite('shared graph');
 const create_test_graph = (root) => create_captured_graph(root, () => false);
@@ -66,7 +66,7 @@ test('rolls back appended identities without touching earlier captures', () => {
 	const mark = graph.nodes.length;
 	discover(graph, value);
 	assert.is(graph.nodes.length, 3);
-	rollback(graph, mark);
+	roll_back(graph, mark);
 	assert.is(graph.nodes.length, 1);
 	assert.is(graph.identities.size, 1);
 	assert.is(graph.identities.has(value), false);
@@ -82,7 +82,7 @@ test('rolls back an entire failed recursive discovery', () => {
 	} catch (e) {
 		error = e;
 	}
-	rollback(graph, 0, error);
+	roll_back(graph, 0, error);
 
 	assert.is(graph.nodes.length, 0);
 	assert.is(graph.unwind.length, 0);
@@ -103,7 +103,7 @@ test('assembles error paths while unwinding', () => {
 	} catch (e) {
 		error = e;
 	}
-	rollback(graph, 0, error);
+	roll_back(graph, 0, error);
 
 	assert.is(error.name, 'DevalueError');
 	assert.is(error.message, 'Cannot stringify arbitrary non-POJOs');
@@ -122,7 +122,7 @@ test('reports __proto__ keys at the owning object', () => {
 	} catch (e) {
 		error = e;
 	}
-	rollback(graph, 0, error);
+	roll_back(graph, 0, error);
 
 	assert.is(error.message, 'Cannot stringify objects with __proto__ keys');
 	assert.is(error.path, '.foo');
