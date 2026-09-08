@@ -51,8 +51,14 @@ export interface JavaScriptTag {
 	(strings: TemplateStringsArray, ...values: unknown[]): JavaScriptSource;
 }
 
-/** A function that replaces a value with JavaScript that can be evaluated to reproduce that value. */
-export type UnevalReplacer = (value: unknown, js: JavaScriptTag) => JavaScriptSource | void;
+/**
+ * A function that replaces a value with a JavaScript expression that can be evaluated to reproduce
+ * that value. Return `undefined`, `null` or `false` when the value should be serialized normally.
+ */
+export type UnevalReplacer = (
+	value: unknown,
+	js: JavaScriptTag
+) => JavaScriptSource | false | null | void;
 
 /**
  * The introspection/extraction operations `stringify` performs on the value

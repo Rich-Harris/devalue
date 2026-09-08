@@ -922,7 +922,7 @@ const fixtures = {
 		{
 			name: 'Custom type',
 			value: [instance, instance],
-			js: '(function(a){return [a,a]}(new Foo({bar:new Bar({answer:42})})))',
+			js: '(function(a){return [a,a]}((new Foo({bar:(new Bar({answer:42}))}))))',
 			json: '[[1,1],["Foo",2],{"bar":3},["Bar",4],{"answer":5},42]',
 			replacer: (value, js) => {
 				if (value instanceof Foo) {
@@ -955,7 +955,7 @@ const fixtures = {
 		{
 			name: 'Custom fallback',
 			value: date,
-			js: "new Date('')",
+			js: "(new Date(''))",
 			json: '[["Date",""]]',
 			replacer: (value, js) => value instanceof Date && js`new Date('')`,
 			reducers: {
@@ -985,7 +985,7 @@ const fixtures = {
 			{
 				name: 'Function wrapped in custom type',
 				value: new FunctionRef(testFn),
-				js: 'new FunctionRef((x) => x * 2)',
+				js: '(new FunctionRef((x) => x * 2))',
 				json: '[["FunctionRef",1],"(x) => x * 2"]',
 				replacer: (value, js) => {
 					if (value instanceof FunctionRef) {
@@ -1017,7 +1017,7 @@ const fixtures = {
 			{
 				name: 'Function in nested structure',
 				value: { fn: testFn, nested: { data: 42 } },
-				js: '{fn:(x) => x * 2,nested:{data:42}}',
+				js: '{fn:((x) => x * 2),nested:{data:42}}',
 				json: '[{"fn":1,"nested":3},["FunctionRef",2],"(x) => x * 2",{"data":4},42]',
 				replacer: (value, js) => {
 					if (typeof value === 'function') {
@@ -1071,6 +1071,292 @@ custom_source_test('preserves identities referenced by custom source', () => {
 	);
 	const result = eval(source);
 	assert.is(result.wrapped.inner, result.shared);
+});
+custom_source_test('constructs a repeated wrapper after its shared child is populated', () => {
+	class Wrapper {
+		static calls = 0;
+
+		constructor(inner) {
+			Wrapper.calls += 1;
+			this.inner = inner;
+			this.answer = inner.answer;
+		}
+	}
+
+	const child = { answer: 42 };
+	const wrapper = new Wrapper(child);
+	Wrapper.calls = 0;
+	let replacer_calls = 0;
+	const source = uneval([wrapper, wrapper, child], (value, js) => {
+		if (value instanceof Wrapper) {
+			replacer_calls += 1;
+			return js`new Wrapper(${value.inner})`;
+		}
+	});
+	const result = vm.runInNewContext(source, { Wrapper });
+
+	assert.ok(source.startsWith('(function(b){var a;'));
+	assert.ok(source.endsWith('}({}))'));
+	assert.is(replacer_calls, 1);
+	assert.is(Wrapper.calls, 1);
+	assert.is(result[0], result[1]);
+	assert.is(result[0].inner, result[2]);
+	assert.is(result[0].answer, 42);
+});
+custom_source_test('orders nested custom dependencies', () => {
+	class Inner {
+		static calls = 0;
+
+		constructor(value) {
+			Inner.calls += 1;
+			this.value = value;
+		}
+	}
+	class Outer {
+		static calls = 0;
+
+		constructor(inner) {
+			Outer.calls += 1;
+			this.inner = inner;
+			this.answer = inner.value.answer;
+		}
+	}
+
+	const child = { answer: 42 };
+	const inner = new Inner(child);
+	const outer = new Outer(inner);
+	Inner.calls = 0;
+	Outer.calls = 0;
+	const replacer_calls = new Map();
+	const source = uneval([outer, outer, inner, inner, child], (value, js) => {
+		if (value instanceof Outer) {
+			replacer_calls.set(value, (replacer_calls.get(value) ?? 0) + 1);
+			return js`new Outer(${value.inner})`;
+		}
+		if (value instanceof Inner) {
+			replacer_calls.set(value, (replacer_calls.get(value) ?? 0) + 1);
+			return js`new Inner(${value.value})`;
+		}
+	});
+	const result = vm.runInNewContext(source, { Inner, Outer });
+
+	assert.is(replacer_calls.get(inner), 1);
+	assert.is(replacer_calls.get(outer), 1);
+	assert.is(Inner.calls, 1);
+	assert.is(Outer.calls, 1);
+	assert.is(result[0], result[1]);
+	assert.is(result[0].inner, result[2]);
+	assert.is(result[2], result[3]);
+	assert.is(result[2].value, result[4]);
+	assert.is(result[0].answer, 42);
+});
+custom_source_test('finds custom dependencies inside inline containers', () => {
+	class Inner {
+		static calls = 0;
+
+		constructor(value) {
+			Inner.calls += 1;
+			this.value = value;
+		}
+	}
+	class Outer {
+		static calls = 0;
+
+		constructor(options) {
+			Outer.calls += 1;
+			this.inner = options.inner;
+			this.answer = options.inner.value.answer;
+		}
+	}
+
+	const inner = new Inner({ answer: 42 });
+	const outer = new Outer({ inner });
+	Inner.calls = 0;
+	Outer.calls = 0;
+	const source = uneval([outer, outer, inner], (value, js) => {
+		if (value instanceof Outer) return js`new Outer(${{ inner: value.inner }})`;
+		if (value instanceof Inner) return js`new Inner(${value.value})`;
+	});
+	const result = vm.runInNewContext(source, { Inner, Outer });
+
+	assert.is(Inner.calls, 1);
+	assert.is(Outer.calls, 1);
+	assert.is(result[0], result[1]);
+	assert.is(result[0].inner, result[2]);
+	assert.is(result[0].answer, 42);
+});
+custom_source_test('preserves a child used by multiple source holes', () => {
+	class Pair {
+		constructor(left, right) {
+			this.left = left;
+			this.right = right;
+		}
+	}
+
+	const child = { answer: 42 };
+	const source = uneval(new Pair(child, child), (value, js) =>
+		value instanceof Pair ? js`new Pair(${value.left},${value.right})` : undefined
+	);
+	const result = vm.runInNewContext(source, { Pair });
+
+	assert.is(result.left, result.right);
+	assert.is(result.left.answer, 42);
+});
+custom_source_test('keeps dependency-free custom constructions in IIFE arguments', () => {
+	class Wrapper {}
+
+	const wrapper = new Wrapper();
+	const source = uneval([wrapper, wrapper], (value, js) =>
+		value instanceof Wrapper ? js`new Wrapper()` : undefined
+	);
+
+	assert.is(source, '(function(a){return [a,a]}((new Wrapper())))');
+	const result = vm.runInNewContext(source, { Wrapper });
+	assert.is(result[0], result[1]);
+});
+custom_source_test('orders a shared typed view after its backing buffer', () => {
+	class Wrapper {
+		static calls = 0;
+
+		constructor(view, buffer) {
+			Wrapper.calls += 1;
+			this.view = view;
+			this.buffer = buffer;
+			this.first = view[0];
+		}
+	}
+
+	const view = new Uint8Array([1, 2, 3]);
+	const wrapper = new Wrapper(view, view.buffer);
+	Wrapper.calls = 0;
+	let replacer_calls = 0;
+	const source = uneval([wrapper, wrapper, view, view.buffer], (value, js) => {
+		if (value instanceof Wrapper) {
+			replacer_calls += 1;
+			return js`new Wrapper(${value.view},${value.buffer})`;
+		}
+	});
+	const result = vm.runInNewContext(source, { Wrapper });
+
+	assert.is(replacer_calls, 1);
+	assert.is(Wrapper.calls, 1);
+	assert.is(result[0], result[1]);
+	assert.is(result[0].view, result[2]);
+	assert.is(result[2].buffer, result[3]);
+	assert.is(result[0].buffer, result[3]);
+	assert.is(result[0].first, 1);
+});
+custom_source_test('reconstructs custom cycles through mutable containers', () => {
+	class Wrapper {
+		static calls = 0;
+
+		constructor(inner) {
+			Wrapper.calls += 1;
+			this.inner = inner;
+		}
+	}
+
+	const container = {};
+	const wrapper = new Wrapper(container);
+	container.wrapper = wrapper;
+	Wrapper.calls = 0;
+	let replacer_calls = 0;
+	const source = uneval(wrapper, (value, js) => {
+		if (value instanceof Wrapper) {
+			replacer_calls += 1;
+			return js`new Wrapper(${value.inner})`;
+		}
+	});
+	const result = vm.runInNewContext(source, { Wrapper });
+
+	assert.is(replacer_calls, 1);
+	assert.is(Wrapper.calls, 1);
+	assert.is(result.inner.wrapper, result);
+});
+custom_source_test('rejects cycles made entirely of custom constructions', () => {
+	class Atomic {
+		constructor() {
+			this.other = undefined;
+		}
+	}
+
+	const a = new Atomic();
+	const b = new Atomic();
+	a.other = b;
+	b.other = a;
+	const self = new Atomic();
+	self.other = self;
+	for (const value of [a, self]) {
+		assert.throws(
+			() =>
+				uneval(value, (item, js) =>
+					item instanceof Atomic
+						? js`Object.assign(new Atomic(),{other:${item.other}})`
+						: undefined
+				),
+			(error) =>
+				error.name === 'DevalueError' &&
+				error.message === 'Cannot stringify a circular chain of atomic values'
+		);
+	}
+});
+custom_source_test('accepts only documented fallback values', () => {
+	for (const fallback of [undefined, null, false]) {
+		assert.is(uneval({ answer: 42 }, () => fallback), '{answer:42}');
+	}
+
+	for (const invalid of ['', 0, 1, true, Promise.resolve(), {}]) {
+		assert.throws(
+			() => uneval({ answer: 42 }, () => invalid),
+			(error) => error instanceof TypeError && error.message === 'Invalid uneval replacer result'
+		);
+	}
+});
+custom_source_test('treats replacer results as expressions', () => {
+	class Replacement {
+		constructor(source) {
+			this.source = source;
+		}
+	}
+
+	const comma = new Replacement('comma');
+	const conditional = new Replacement('conditional');
+	const object = new Replacement('object');
+	const nested = new Replacement('nested');
+	const escaped = new Replacement('escaped');
+	const source = uneval([comma, conditional, object, nested, escaped], (value, js) => {
+		if (!(value instanceof Replacement)) return;
+		switch (value.source) {
+			case 'comma':
+				return js`1,2`;
+			case 'conditional':
+				return js`false?1:2`;
+			case 'object':
+				return js`{answer:42}`;
+			case 'nested':
+				return js`${js`Math.max(`}${1},${2}${js`)`}`;
+			case 'escaped':
+				return js`${'</script>'}`;
+		}
+	});
+	const result = vm.runInNewContext(source);
+
+	assert.is(result.length, 5);
+	assert.is(result[0], 2);
+	assert.is(result[1], 2);
+	assert.is(result[2].answer, 42);
+	assert.is(result[3], 2);
+	assert.is(result[4], '</script>');
+	assert.ok(!source.includes('</script>'));
+});
+custom_source_test('groups a root object-literal replacement', () => {
+	class Replacement {}
+
+	const source = uneval(new Replacement(), (value, js) =>
+		value instanceof Replacement ? js`{answer:42}` : undefined
+	);
+	assert.is(source, '({answer:42})');
+	assert.is(vm.runInNewContext(source).answer, 42);
 });
 custom_source_test('requires js to be used as a tagged template', () => {
 	for (const invoke of [
@@ -1973,6 +2259,7 @@ circularCustomTypes.run();
 		const value = { a: shared, b: shared.slice() };
 
 		const serialized = uneval(value);
+		assert.ok(serialized.includes('arguments[0]'));
 		const roundtripped = new Function('return ' + serialized)();
 
 		assert.equal(roundtripped.a.length, 70000);
@@ -1980,6 +2267,22 @@ circularCustomTypes.run();
 		assert.equal(roundtripped.a[69999].i, 69999);
 		// the two arrays share object identity
 		assert.ok(roundtripped.a[123] === roundtripped.b[123]);
+	});
+
+	test('packs oversized custom-graph IIFE arguments into one array', () => {
+		class Marker {}
+		const shared = Array.from({ length: 65536 }, (_, i) => ({ i }));
+		const marker = new Marker();
+		const value = { a: shared, b: shared.slice(), marker };
+
+		const serialized = uneval(value, (item, js) =>
+			item instanceof Marker ? js`({custom:true})` : undefined
+		);
+		assert.ok(serialized.includes('arguments[0]'));
+		const roundtripped = new Function('return ' + serialized)();
+
+		assert.is(roundtripped.a[65535], roundtripped.b[65535]);
+		assert.is(roundtripped.marker.custom, true);
 	});
 
 	test.run();
