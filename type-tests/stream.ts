@@ -19,6 +19,7 @@ const reference: ClientReference = { target: source, control: source };
 
 const value: AsyncValueDescriptor<number> = {
 	type: 'async-value',
+	id: 'typed-value',
 	source: promise,
 	construct: () => source,
 	resolve: () => source,

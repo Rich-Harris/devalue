@@ -88,6 +88,14 @@ export interface ClientReference {
  */
 export interface AsyncValueDescriptor<T = unknown> {
 	type: 'async-value';
+	/**
+	 * Optional stable key, unique within the stream. When present, the constructed client value
+	 * and its captured control are registered under this key in the session, and settlements
+	 * address the key instead of positional state. A `detached` stream with the same session
+	 * id can therefore settle a value constructed by a previously saved head. The key is
+	 * removed once the value settles.
+	 */
+	id?: string;
 	/** A Promise-like representation of the asynchronous value. */
 	source: PromiseLike<T>;
 	/**
@@ -146,6 +154,8 @@ export interface AsyncValueDescriptor<T = unknown> {
  */
 export interface AsyncSequenceDescriptor<T = unknown, TReturn = unknown> {
 	type: 'async-sequence';
+	/** Optional stable key with the same semantics as `AsyncValueDescriptor.id`. */
+	id?: string;
 	/**
 	 * The server-only sequence. `unevalStream` acquires its async iterator and pulls one value at a
 	 * time, but never serializes the source or iterator themselves.
@@ -228,11 +238,21 @@ export interface UnevalStreamOptions {
 	/**
 	 * Optional deterministic per-stream key. It must be unique among concurrent streams in the
 	 * client realm; duplicate caller-supplied IDs are unsupported and may overwrite a session.
-	 * A collision-resistant key is generated otherwise.
+	 * A collision-resistant key is generated otherwise. A `detached` stream must use the same
+	 * id as the saved head whose keyed values its tail settles.
 	 */
 	id?: string;
 	/** Cancels server-side observation and sequence pulling. */
 	signal?: AbortSignal;
+	/**
+	 * Emits a tail that does not depend on this stream's `head` having been evaluated. Tail
+	 * blocks bootstrap a private session, re-serialize values shared with the head, and settle
+	 * asynchronous values through the keyed registry, so they can be applied to a previously
+	 * saved head that registered the same `id`s. Every asynchronous value still pending when
+	 * the head is emitted must have an `id`. The `head` is still produced and can be saved to
+	 * serve future requests.
+	 */
+	detached?: boolean;
 	/**
 	 * Diagnostic callback for recoverable failures the stream survives: an asynchronous
 	 * outcome that cannot be serialized (replaced by a generic client-side error; receives the

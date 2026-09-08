@@ -112,6 +112,149 @@ test('preserves identity between separate promise outcomes', async () => {
 	assert.is(await root[0], await root[1]);
 });
 
+/** Replacer keying every `Deferred` by its cache key, as a PPR renderer would. */
+class Deferred {
+	constructor(key, source) {
+		this.key = key;
+		this.source = source;
+	}
+}
+const keyed_replacer = (value, js) => value instanceof Deferred && ({
+	type: 'async-value',
+	id: value.key,
+	source: value.source,
+	construct: (capture) => js`new Promise((a,b)=>{${capture(js`[a,b]`)}})`,
+	resolve: ({ control }, result) => js`${control}[0](${result})`,
+	reject: ({ control }, reason) => js`${control}[1](${reason})`
+});
+
+test('settles keyed values through the registry within one stream', async () => {
+	const pending = deferred();
+	const result = await unevalStream({ value: new Deferred('k', pending.promise) }, keyed_replacer, { id: 'keyed' });
+	const target = client();
+	const root = target.head(result.head);
+	assert.ok(Object.hasOwn(target.context.__d.keyed.k, 'k'));
+	pending.resolve(1);
+	target.block((await result.tail.next()).value);
+	assert.is(await root.value, 1);
+	// The session (and its registry) is removed once every value has settled.
+	assert.is(target.context.__d.keyed, undefined);
+	assert.equal(await result.tail.next(), { done: true, value: undefined });
+});
+
+test('grafts a detached tail onto a previously saved head', async () => {
+	// Request 1 (cache miss): a normal render. Its head is cached; its tail is never applied here.
+	const first_source = deferred();
+	const shared = { name: 'shared' };
+	const saved = await unevalStream({ shared, value: new Deferred('k', first_source.promise) }, keyed_replacer, { id: 'ppr' });
+	await saved.tail.return();
+
+	// Request 2: the cached head is served immediately...
+	const target = client();
+	const root = target.head(saved.head);
+
+	// ...while a fresh render runs detached. Its head is discarded; only its tail is applied.
+	const second_source = deferred();
+	const fresh_shared = { name: 'shared' };
+	const fresh = await unevalStream({ shared: fresh_shared, value: new Deferred('k', second_source.promise) }, keyed_replacer, { id: 'ppr', detached: true });
+	assert.ok(fresh.head.length > 0);
+	second_source.resolve({ fresh_shared, when: new Date(0) });
+	const block = (await fresh.tail.next()).value;
+	// The detached block attaches to the saved session directly, not through its dispatcher.
+	assert.not.match(block, /\.b\(/);
+	target.block(block);
+	const resolved = await root.value;
+	assert.is(resolved.fresh_shared.name, 'shared');
+	assert.is(resolved.when.getTime(), 0);
+	assert.equal(await fresh.tail.next(), { done: true, value: undefined });
+	// The detached tail took over the saved session and removed it when done.
+	assert.equal(Object.keys(target.context.__d), []);
+});
+
+test('fails a detached tail block when the saved head was never evaluated', async () => {
+	const pending = deferred();
+	const fresh = await unevalStream(new Deferred('k', pending.promise), keyed_replacer, { id: 'absent', detached: true });
+	pending.resolve(1);
+	const block = (await fresh.tail.next()).value;
+	let error;
+	try { client().block(block); } catch (caught) { error = caught; }
+	assert.match(error.message, /missing session absent/);
+});
+
+test('restarts positional anchors when a detached tail takes over the session', async () => {
+	// Enough outcomes settle before the head is emitted to switch anchoring to the push helper.
+	const folded = Array.from({ length: 8 }, (_, i) => Promise.resolve({ i }));
+	const pending = deferred();
+	const value = () => ({ folded, value: new Deferred('k', pending.promise) });
+	const saved = await unevalStream(value(), keyed_replacer, { id: 'anchors' });
+	await saved.tail.return();
+	const target = client();
+	const root = target.head(saved.head);
+
+	const fresh = await unevalStream(value(), keyed_replacer, { id: 'anchors', detached: true });
+	const shared = {};
+	const inner = deferred();
+	pending.resolve({ shared, again: shared, inner: inner.promise });
+	target.block((await fresh.tail.next()).value);
+	inner.resolve(shared);
+	target.block((await fresh.tail.next()).value);
+	const resolved = await root.value;
+	assert.is(resolved.shared, resolved.again);
+	assert.is(await resolved.inner, resolved.shared);
+});
+
+test('preserves identity across detached tail blocks and nested async values', async () => {
+	const a = deferred();
+	const b = deferred();
+	const nested = deferred();
+	const saved = await unevalStream([new Deferred('a', a.promise), new Deferred('b', b.promise)], keyed_replacer, { id: 'ppr-identity' });
+	await saved.tail.return();
+	const target = client();
+	const root = target.head(saved.head);
+
+	const fresh = await unevalStream([new Deferred('a', a.promise), new Deferred('b', b.promise)], keyed_replacer, { id: 'ppr-identity', detached: true });
+	const shared = { nested: nested.promise };
+	a.resolve(shared);
+	target.block((await fresh.tail.next()).value);
+	b.resolve(shared);
+	target.block((await fresh.tail.next()).value);
+	nested.resolve(42);
+	target.block((await fresh.tail.next()).value);
+	const [first, second] = await Promise.all([root[0], root[1]]);
+	assert.is(first, second);
+	assert.is(await first.nested, 42);
+	assert.equal(await fresh.tail.next(), { done: true, value: undefined });
+});
+
+test('fails a detached tail block when the saved head lacks the key', async () => {
+	const saved = await unevalStream(new Deferred('other', new Promise(() => {})), keyed_replacer, { id: 'keys' });
+	await saved.tail.return();
+	const target = client();
+	target.head(saved.head);
+	const pending = deferred();
+	const fresh = await unevalStream(new Deferred('missing', pending.promise), keyed_replacer, { id: 'keys', detached: true });
+	pending.resolve(1);
+	const block = (await fresh.tail.next()).value;
+	let error;
+	try { target.block(block); } catch (caught) { error = caught; }
+	assert.match(error.message, /missing asynchronous value missing/);
+});
+
+test('rejects detaching a stream with unkeyed pending values', async () => {
+	await rejects(unevalStream({ pending: new Promise(() => {}) }, undefined, { detached: true }), /Cannot detach an unkeyed asynchronous value/);
+	// Values settled before the head is emitted are folded into it and need no key.
+	const { root } = await drain(await unevalStream({ done: Promise.resolve(1) }, undefined, { detached: true }));
+	assert.is(await root.done, 1);
+});
+
+test('rejects duplicate and invalid asynchronous value ids', async () => {
+	await rejects(unevalStream(new Deferred(1, new Promise(() => {})), keyed_replacer), /Invalid async-value id/);
+	await rejects(
+		unevalStream([new Deferred('same', new Promise(() => {})), new Deferred('same', new Promise(() => {}))], keyed_replacer),
+		/Duplicate asynchronous value id "same"/
+	);
+});
+
 test('recognizes only branded native promises across realms and subclasses', async () => {
 	const foreign = vm.runInNewContext('Promise.resolve(2)');
 	class SubPromise extends Promise {}
