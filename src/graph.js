@@ -129,7 +129,7 @@ export function is_node(child) {
  * distinguishes those results from values left on nodes by previous walks.
  *
  * The graph is append-only. A caller that needs atomic discovery records `nodes.length`
- * before calling `discover` and passes it to `rollback` if discovery throws: every node
+ * before calling `discover` and passes it to `roll_back` if discovery throws: every node
  * appended since is removed along with its identity entry.
  *
  * @param {unknown} root
@@ -357,6 +357,6 @@ function builtin_classify(graph, node, value) {
  */
 function error(graph, message, value) {
 	// The path is unknown here; enclosing containers append their segments as the error
-	// unwinds and `rollback` assembles them.
+	// unwinds and `roll_back` assembles them.
 	return new DevalueError(message, [], value, graph.root_value);
 }
