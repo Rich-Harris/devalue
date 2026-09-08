@@ -59,17 +59,13 @@ class Session {
 	#batch = [];
 	/** Whether the current batch has been finalized and is ready to emit. @type {boolean} */
 	#batch_ready = false;
-	/** Resolvers for tail reads waiting for delivery or a lifecycle change. @type {Array<() => void>} */
-	#waiters = [];
-	/** Monotonic observation order assigned before events are batched. @type {number} */
-	#sequence = 0;
+	/** Wakes the tail generator when a batch is ready or the lifecycle changes. @type {(() => void) | undefined} */
+	#wake;
 	/** Number of async sources whose terminal client operation has not been generated. @type {number} */
 	#active = 0;
 	/** Whether a batch finalization is currently scheduled. @type {boolean} */
 	#flushing = false;
-	/** Whether server-side observation and queued delivery have been cancelled. @type {boolean} */
-	#cancelled = false;
-	/** In-flight cleanup shared by repeated cancellation requests. @type {Promise<void> | undefined} */
+	/** In-flight cleanup; defined once the session has been cancelled. @type {Promise<void> | undefined} */
 	#cancelling;
 	/** Fatal generation error, cancellation reason, or first cleanup failure. @type {unknown} */
 	#failure;
@@ -130,47 +126,35 @@ class Session {
 	/** @param {unknown} value @returns {Promise<UnevalStreamResult>} */
 	async serialize(value) {
 		try {
+			// walk the graph and capture the synchronous values and the first layer of async sources
 			this.#capture(value, true);
 			this.#active = this.#sources.length;
+			if (this.#cancelling) throw this.#failure;
 		} catch (error) {
 			await this.#cancel(error);
 			throw this.#failure ?? error;
-		}
-		if (this.#cancelled) {
-			await this.#cancel(this.#failure);
-			throw this.#failure;
 		}
 
 		if (this.#sources.length === 0) {
 			return { head: this.#emit_region(value, false).source, tail: empty_tail(), id: this.#id };
 		}
 
+		// start observing the async sources
 		this.#start_sources();
-		await this.#initial_window();
+		// give them a 1-task window in which they can resolve to be batched into the initial body.
+		// Sources settle in microtasks after this point, so always wait at least one macrotask,
+		// then keep waiting while a flush is scheduled so the window matches tail batching.
+		do await macrotask();
+		while (this.#flushing);
 		if (this.#failure) throw this.#failure;
 
 		try {
 			const head_region = this.#emit_region(value, true);
 			this.#assign_references(value, { root: 's.a[0]', segments: [] }, new Map());
-			let operations = '';
-			if (this.#batch_ready) {
-				const batch = { events: this.#batch };
-				const emitted = this.#emit_batch(batch, false);
-				operations += emitted.source;
-				this.#batch = [];
-				this.#batch_ready = false;
-				for (const source of emitted.close) {
-					try {
-						await this.#close_sequence(source);
-					} catch (error) {
-						await this.#cancel(error);
-						throw this.#failure ?? error;
-					}
-				}
-				this.#consume(batch);
-			}
-			this.#start_unstarted();
+			// anything that settled within the window is folded into the head rather than shipped as a block
+			const operations = this.#batch_ready ? await this.#deliver(this.#take_batch(), false) : '';
 
+			// if everything resolved in 1 task, then we ended up with a single batch, so we don't need to do anything else
 			if (this.#active === 0 && this.#batch.length === 0) {
 				return { head: this.#wrap_head(head_region, operations + this.#cleanup_source()), tail: empty_tail(), id: this.#id };
 			}
@@ -434,7 +418,7 @@ class Session {
 		// the mutation that TypeScript cannot follow.
 		const async_node = /** @type {AsyncNode} */ (node);
 		/** @type {Source} */
-		const state = { node: async_node, descriptor, type, started: false, terminal: false, cleaned: false, active: true, flushed_pending: 0 };
+		const state = { node: async_node, descriptor, type, started: false, terminal: false, cleaned: false, active: true };
 		async_node.kind = 'Async';
 		async_node.data = { source, pending, captured, state };
 		this.#sources.push(state);
@@ -556,7 +540,7 @@ class Session {
 	 * @param {Source} source
 	 */
 	#start(source) {
-		if (source.started || this.#cancelled) return;
+		if (source.started || this.#cancelling) return;
 		source.started = true;
 		if (source.type === 'sequence') {
 			this.#start_sequence(source);
@@ -616,7 +600,7 @@ class Session {
 		// `next` is set by #start_sequence before the first pull, and later pulls are only
 		// triggered by 'next' events, which require an earlier successful pull.
 		const next = source.next;
-		if (!next || source.terminal || source.pulling || this.#cancelled) return;
+		if (!next || source.terminal || source.pulling || this.#cancelling) return;
 		source.pulling = true;
 		source.pulled = new Promise((resolve) => {
 			source.pulled_resolve = resolve;
@@ -637,7 +621,7 @@ class Session {
 		Promise.resolve(result).then(
 			(result) => {
 				finish();
-				if (source.terminal || this.#cancelled) return;
+				if (source.terminal || this.#cancelling) return;
 				try {
 					if ((typeof result !== 'object' || result === null) && typeof result !== 'function') {
 						throw new TypeError('async iterator result is not an object');
@@ -664,11 +648,11 @@ class Session {
 	 * @param {unknown} value
 	 */
 	#event(source, type, value) {
-		if (source.terminal || this.#cancelled) return;
+		if (source.terminal || this.#cancelling) return;
 		if (type !== 'next') {
 			source.terminal = true;
 		}
-		const event = { source, type, value, sequence: this.#sequence++, invalid: false };
+		const event = { source, type, value, invalid: false };
 		const source_count = this.#sources.length;
 		try {
 			this.#capture(value);
@@ -690,34 +674,66 @@ class Session {
 	}
 
 	/**
-	 * Marks a batch's events as emitted or dequeued and resumes sequence pulling for
-	 * sources with no other undelivered events.
+	 * Marks a batch's events as emitted and resumes sequence pulling. A sequence only pulls
+	 * once its previous `next` event is consumed, so each sequence has at most one
+	 * unconsumed `next` event and every such event resumes exactly one pull.
 	 *
-	 * @param {Batch} batch
+	 * @param {Event[]} events
 	 */
-	#consume(batch) {
-		for (const event of batch.events) event.source.flushed_pending--;
-		for (const event of batch.events) {
-			if (event.type === 'next' && event.source.flushed_pending === 0) this.#pull(event.source);
+	#consume(events) {
+		for (const event of events) {
+			if (event.type === 'next') this.#pull(event.source);
 		}
 	}
 
-	/** Finalizes the current events as one ordered batch and wakes waiting tail reads. */
+	/** Finalizes the current events as one batch and wakes the tail. Events are already in observation order. */
 	#flush() {
 		this.#flushing = false;
-		if (this.#cancelled || this.#batch.length === 0) return;
-		this.#batch.sort((a, b) => a.sequence - b.sequence);
-		for (const event of this.#batch) event.source.flushed_pending++;
+		if (this.#cancelling || this.#batch.length === 0) return;
 		this.#batch_ready = true;
 		this.#notify();
 	}
 
-	/** Waits for the same scheduled flush window used by tail batches before freezing the head. */
-	#initial_window() {
-		return new Promise(/** @param {(value?: void | PromiseLike<void>) => void} resolve */ (resolve) => {
-			const settle = () => setTimeout(() => this.#flushing ? settle() : resolve(), 0);
-			settle();
-		});
+	/**
+	 * Detaches the finalized batch so new events accumulate separately while it is delivered.
+	 *
+	 * @returns {Event[]}
+	 */
+	#take_batch() {
+		const events = this.#batch;
+		this.#batch = [];
+		this.#batch_ready = false;
+		return events;
+	}
+
+	/**
+	 * Renders a batch, closes any sequences that failed within it, starts sources discovered by
+	 * it, and resumes pulling. Generation failures are fatal and cancel the session.
+	 *
+	 * @param {Event[]} events
+	 * @param {boolean} block whether to wrap the operations as a standalone tail block
+	 * @returns {Promise<string>}
+	 */
+	async #deliver(events, block) {
+		let emitted;
+		try {
+			emitted = this.#emit_batch(events, block);
+		} catch (error) {
+			await this.#cancel(error);
+			throw this.#failure ?? error;
+		}
+		for (const source of emitted.close) {
+			try {
+				await this.#close_sequence(source);
+			} catch (error) {
+				// The iterator already failed and its client error operation is in this batch, so a
+				// failing `return()` has nothing left to affect. Report it and keep streaming.
+				this.#report(error, source.descriptor.source);
+			}
+		}
+		this.#start_unstarted();
+		this.#consume(events);
+		return emitted.source;
 	}
 
 	/**
@@ -1194,11 +1210,11 @@ class Session {
 	 * Generates ordered client operations for a finalized event batch. Failures here are
 	 * fatal to the session, so emission mutates session state directly.
 	 *
-	 * @param {Batch} batch
+	 * @param {Event[]} events
 	 * @param {boolean} block
 	 * @returns {{ source: string, close: Source[] }}
 	 */
-	#emit_batch(batch, block = true) {
+	#emit_batch(events, block = true) {
 		const prefix = block ? `;${this.#scope}[${stringify_string(this.#id)}].b((s,n)=>{` : '';
 		/** @type {JavaScriptSource[]} */
 		const operations = [];
@@ -1206,7 +1222,7 @@ class Session {
 		const references = new Set();
 		/** @type {Source[]} */
 		const close = [];
-		for (const event of batch.events) {
+		for (const event of events) {
 			const source = event.source;
 			const node = source.node;
 			references.add(node);
@@ -1394,103 +1410,89 @@ class Session {
 	 */
 	#tail() {
 		const session = this;
-		let pending = false;
-		/** @type {Promise<IteratorResult<string, void>> | undefined} */
-		let advancing;
+		const generator = this.#blocks();
+		// Tracks whether the generator has completed, so that `return()` after completion is a
+		// no-op like any other async generator instead of re-running cancellation.
 		let done = false;
-		return {
+		/** @param {Promise<IteratorResult<string, void>>} result */
+		const track = (result) =>
+			result.then(
+				(result) => {
+					if (result.done) done = true;
+					return result;
+				},
+				(error) => {
+					done = true;
+					throw error;
+				}
+			);
+		/** @type {UnevalStreamTail} */
+		const tail = {
 			[Symbol.asyncIterator]() {
 				return this;
 			},
-			next() {
-				if (pending) {
-					return Promise.reject(new TypeError('devalue: concurrent tail.next() is not supported'));
-				}
-				return advancing = advance();
-			},
-			async return() {
-				if (done) return { done: true, value: undefined };
+			next: () => track(generator.next()),
+			return: async () => {
+				if (done) return generator.return();
 				done = true;
+				// An async generator queues `return()` behind an in-flight `next()`, and `next()`
+				// may be parked waiting on a source that never settles. Cancelling first wakes the
+				// generator so the pending `next()` completes and the queued `return()` can run.
 				const cancelling = session.#cancel();
-				if (advancing) {
-					try {
-						await advancing;
-					} catch {}
-				}
+				const result = await generator.return();
 				await cancelling;
 				if (session.#failure) throw session.#failure;
-				return { done: true, value: undefined };
+				return result;
 			}
 		};
+		return tail;
+	}
 
-		/** @returns {Promise<IteratorResult<string, void>>} */
-		async function advance() {
-				if (done) {
-					if (session.#failure) throw session.#failure;
-					return { done: true, value: undefined };
-				}
-				pending = true;
-				try {
-					while (!session.#batch_ready && session.#active > 0 && !session.#failure && !session.#cancelled) {
-						await new Promise(/** @param {(value?: void | PromiseLike<void>) => void} resolve */ (resolve) => session.#waiters.push(resolve));
-					}
-					if (session.#failure) throw session.#failure;
-					if (session.#cancelled) {
-						await session.#cancelling;
-						done = true;
-						if (session.#failure) throw session.#failure;
-						return { done: true, value: undefined };
-					}
-					if (!session.#batch_ready) {
-						done = true;
-						return { done: true, value: undefined };
-					}
-					const batch = { events: session.#batch };
-					session.#batch = [];
-					session.#batch_ready = false;
-					let block;
-					try {
-						block = session.#emit_batch(batch);
-					} catch (error) {
-						await session.#cancel(error);
-						throw session.#failure ?? error;
-					}
-					let close_failure;
-					for (const source of block.close) {
-						try {
-							await session.#close_sequence(source);
-						} catch (error) {
-							close_failure ??= error;
-						}
-					}
-					session.#start_unstarted();
-					session.#consume(batch);
-					if (close_failure) session.#fail(close_failure);
-					return { done: false, value: block.source };
-				} finally {
-					pending = false;
-				}
+	/**
+	 * Yields each finalized batch as an executable block, waiting for sources between
+	 * batches. Ends once every source has emitted its terminal operation, or once the session
+	 * is cancelled — after cleanup finishes, so consumers observe cleanup failures.
+	 *
+	 * @returns {AsyncGenerator<string, void, void>}
+	 */
+	async *#blocks() {
+		while (true) {
+			while (!this.#batch_ready && this.#active > 0 && !this.#cancelling) await this.#sleep();
+			if (this.#cancelling) {
+				await this.#cancelling;
+				if (this.#failure) throw this.#failure;
+				return;
+			}
+			if (this.#active === 0) return;
+			yield await this.#deliver(this.#take_batch(), true);
 		}
 	}
 
-	/** Wakes every tail read currently waiting for delivery or lifecycle state to change. */
+	/** Suspends the tail generator until the next `#notify`. The generator is the only waiter. */
+	#sleep() {
+		return new Promise(/** @param {(value?: void | PromiseLike<void>) => void} resolve */ (resolve) => {
+			this.#wake = resolve;
+		});
+	}
+
+	/** Wakes the tail generator if it is waiting for delivery or a lifecycle change. */
 	#notify() {
-		const waiters = this.#waiters;
-		this.#waiters = [];
-		for (const resolve of waiters) resolve();
+		const wake = this.#wake;
+		this.#wake = undefined;
+		wake?.();
 	}
 
 	/**
 	 * Idempotently starts server-side cleanup and returns the shared cleanup operation.
+	 * `#cancelling` doubles as the cancelled flag for source callbacks and the tail.
 	 *
 	 * @param {unknown} [reason]
 	 * @returns {Promise<void>}
 	 */
-	async #cancel(reason) {
+	#cancel(reason) {
 		if (this.#cancelling) return this.#cancelling;
-		this.#cancelled = true;
-		this.#notify();
 		this.#cancelling = this.#cleanup(reason);
+		this.#notify();
 		return this.#cancelling;
 	}
 
@@ -1538,8 +1540,12 @@ class Session {
 			return;
 		}
 		const returned = Promise.resolve().then(() => method.call(source.iterator));
-		if (source.pulled) await Promise.all([source.pulled, returned]);
-		else await returned;
+    if (source.pulled) {
+      await Promise.all([source.pulled, returned]);
+    }
+    else {
+      await returned;
+    }
 	}
 
 	/**
@@ -1903,24 +1909,16 @@ function create_session_id() {
 
 /** Returns a completed tail iterator for graphs with no asynchronous work. */
 function empty_tail() {
-	/** @type {UnevalStreamTail} */
-	const tail = {
-		[Symbol.asyncIterator]() {
-			return this;
-		},
-		async next() {
-			return { done: true, value: undefined };
-		},
-		async return() {
-			return { done: true, value: undefined };
-		}
-	};
-	return tail;
+	return (async function* () {})();
 }
 
-/** @typedef {{ node: AsyncNode, descriptor: any, type: 'value' | 'sequence' | 'native', started: boolean, terminal: boolean, cleaned: boolean, active: boolean, flushed_pending: number, iterator?: AsyncIterator<unknown>, iterator_closed?: boolean, next?: AsyncIterator<unknown>['next'], pulling?: boolean, pulled?: Promise<void>, pulled_resolve?: () => void, observer?: { active: boolean }, early?: ['resolve' | 'reject', unknown] }} Source */
-/** @typedef {{ source: Source, type: 'resolve' | 'reject' | 'next' | 'complete' | 'error', value: unknown, sequence: number, invalid: boolean }} Event */
-/** @typedef {{ events: Event[] }} Batch */
+/** Resolves in a fresh macrotask, after any flush already scheduled with `setTimeout(..., 0)`. */
+function macrotask() {
+	return new Promise(/** @param {(value?: void | PromiseLike<void>) => void} resolve */ (resolve) => setTimeout(resolve, 0));
+}
+
+/** @typedef {{ node: AsyncNode, descriptor: any, type: 'value' | 'sequence' | 'native', started: boolean, terminal: boolean, cleaned: boolean, active: boolean, iterator?: AsyncIterator<unknown>, iterator_closed?: boolean, next?: AsyncIterator<unknown>['next'], pulling?: boolean, pulled?: Promise<void>, pulled_resolve?: () => void, observer?: { active: boolean }, early?: ['resolve' | 'reject', unknown] }} Source */
+/** @typedef {{ source: Source, type: 'resolve' | 'reject' | 'next' | 'complete' | 'error', value: unknown, invalid: boolean }} Event */
 /**
  * A source hole that refers to a captured identity on the client. `reference` is the path
  * fixed at creation, or undefined to resolve the node's shortest committed path at render time.
