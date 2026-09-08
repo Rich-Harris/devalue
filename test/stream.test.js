@@ -801,6 +801,25 @@ test('backpressures an async sequence until flushed blocks are consumed', async 
 	assert.equal(await result.tail.next(), { done: true, value: undefined });
 });
 
+test('resumes sequence pulling after batches accumulate while the consumer is idle', async () => {
+	const source = { async *[Symbol.asyncIterator]() { yield 1; yield 2; yield 3; } };
+	// settles a few flush windows after the sequence's first item, while nobody is reading
+	const late = new Promise((resolve) => setTimeout(() => resolve('late'), 5));
+	const result = await unevalStream({ source, late }, undefined, { id: 'idle-consumer' });
+	const target = client();
+	const root = target.head(result.head);
+	await delay(30);
+	const seen = [];
+	const drained = (async () => {
+		for await (const value of root.source) seen.push(value);
+	})();
+	for await (const block of result.tail) target.block(block);
+	await drained;
+	assert.equal(seen, [1, 2, 3]);
+	assert.is(await root.late, 'late');
+	assert.ok(!Object.hasOwn(target.context.__d, 'idle-consumer'));
+});
+
 test('cancels an async sequence before tail iteration starts', async () => {
 	let returned = 0;
 	const pending = deferred();
@@ -879,14 +898,23 @@ test('cleans the client session in the final evaluated block', async () => {
 	assert.is(Object.getPrototypeOf(target.context.__d), null);
 });
 
-test('rejects concurrent tail next calls', async () => {
-	const pending = deferred();
-	const result = await unevalStream(pending.promise, undefined, { id: 'concurrent' });
-	client().head(result.head);
-	const first = result.tail.next();
-	await rejects(result.tail.next(), /concurrent tail\.next\(\)/);
-	pending.resolve(1);
-	await first;
+test('serves concurrent tail next calls in order', async () => {
+	const first = deferred();
+	const second = deferred();
+	const result = await unevalStream([first.promise, second.promise], undefined, { id: 'concurrent' });
+	const target = client();
+	const root = target.head(result.head);
+	const reads = [result.tail.next(), result.tail.next(), result.tail.next()];
+	first.resolve(1);
+	await delay(5);
+	second.resolve(2);
+	const [a, b, c] = await Promise.all(reads);
+	assert.is(a.done, false);
+	assert.is(b.done, false);
+	assert.equal(c, { done: true, value: undefined });
+	target.block(a.value);
+	target.block(b.value);
+	assert.equal(await Promise.all(root), [1, 2]);
 });
 
 test('rejects pre-aborted signals before invoking a replacer', async () => {
@@ -1269,7 +1297,8 @@ test('rolls back a whole batch when a later terminal operation is fatal', async 
 	assert.equal(Array.from(root[0].values), []);
 	assert.equal(Array.from(root[1].values), []);
 	assert.is(cancels, 2);
-	await rejects(result.tail.next(), /Invalid async descriptor operation/);
+	// like any async generator, the tail is done once it has thrown
+	assert.equal(await result.tail.next(), { done: true, value: undefined });
 });
 
 test('validates async iterator acquisition and result protocol failures', async () => {
@@ -1324,32 +1353,56 @@ test('closes a sequence once after an unserializable yield', async () => {
 	assert.is(returns, 1);
 });
 
-test('cancels all committed sources when a pre-head sequence close fails', async () => {
+test('reports a failed sequence close and keeps streaming other sources', async () => {
 	const calls = [];
+	const reported = [];
 	const close_failure = new Error('close');
+	const pending = deferred();
 	class Source {
 		constructor(name, sequence = false) {
 			this.name = name;
 			this.sequence = sequence;
 		}
 	}
+	const iterable = {
+		[Symbol.asyncIterator]() { return this; },
+		next() { return { done: false, value: () => {} }; },
+		return() { calls.push('return'); throw close_failure; }
+	};
 	const sequence = new Source('sequence', true);
 	const value = new Source('value');
 	const replacer = (source, js) => source instanceof Source && (source.sequence ? {
 		type: 'async-sequence',
-		source: {
-			[Symbol.asyncIterator]() { return this; },
-			next() { return { done: false, value: () => {} }; },
-			return() { calls.push('return'); throw close_failure; }
-		},
-		construct: () => js`0`, next: () => js``, complete: () => js``, error: () => js``,
+		source: iterable,
+		construct: () => js`({events:[]})`,
+		next: ({ target }, v) => js`${target}.events.push(["next",${v}])`,
+		complete: ({ target }, v) => js`${target}.events.push(["complete",${v}])`,
+		error: ({ target }, v) => js`${target}.events.push(["error",${v}])`,
 		cancel() { calls.push('sequence'); }
 	} : {
-		type: 'async-value', source: new Promise(() => {}), construct: () => js`0`,
-		resolve: () => js``, reject: () => js``, cancel() { calls.push('value'); }
+		type: 'async-value', source: pending.promise, construct: () => js`({values:[]})`,
+		resolve: ({ target }, v) => js`${target}.values.push(${v})`, reject: () => js``,
+		cancel() { calls.push('value'); }
 	});
-	await rejects(unevalStream([sequence, value], replacer), close_failure);
-	assert.equal(calls, ['return', 'sequence', 'value']);
+	const result = await unevalStream([sequence, value], replacer, {
+		id: 'close-failure',
+		onerror: (error, source) => reported.push([error, source])
+	});
+	const target = client();
+	const root = target.head(result.head);
+	// the unserializable yield failed the sequence in the head window; its close failure is
+	// reported but the stream stays healthy
+	assert.equal(calls, ['return']);
+	assert.is(reported.length, 2);
+	assert.is(reported[1][0], close_failure);
+	assert.is(reported[1][1], iterable);
+	assert.is(root[0].events.length, 1);
+	assert.is(root[0].events[0][0], 'error');
+	pending.resolve(1);
+	for await (const block of result.tail) target.block(block);
+	assert.equal(Array.from(root[1].values), [1]);
+	assert.equal(calls, ['return']);
+	assert.ok(!Object.hasOwn(target.context.__d, 'close-failure'));
 });
 
 test('cancels all sources and reports the first cleanup failure', async () => {
@@ -1363,7 +1416,8 @@ test('cancels all sources and reports the first cleanup failure', async () => {
 	const result = await unevalStream([new Job('first'), new Job('second')], replacer);
 	await rejects(result.tail.return(), /first/);
 	assert.equal(calls, ['first', 'second']);
-	await rejects(result.tail.next(), /first/);
+	assert.equal(await result.tail.next(), { done: true, value: undefined });
+	assert.equal(await result.tail.return(), { done: true, value: undefined });
 });
 
 test('aborts a pending tail consumer and ignores late source work', async () => {
@@ -1383,7 +1437,7 @@ test('aborts a pending tail consumer and ignores late source work', async () => 
 	assert.is(cancelled, 1);
 	pending.resolve(1);
 	await delay();
-	await rejects(result.tail.next(), reason);
+	assert.equal(await result.tail.next(), { done: true, value: undefined });
 });
 
 test('allows duplicate caller ids to overwrite unsupported concurrent sessions', async () => {
