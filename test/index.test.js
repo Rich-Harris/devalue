@@ -1273,6 +1273,106 @@ custom_source_test('reconstructs custom cycles through mutable containers', () =
 	assert.is(Wrapper.calls, 1);
 	assert.is(result.inner.wrapper, result);
 });
+custom_source_test('preserves property order around cyclic references', () => {
+	class Marker {}
+
+	for (const prototype of [Object.prototype, null]) {
+		for (const position of ['first', 'middle', 'last']) {
+			const value = Object.create(prototype);
+			const completed = { done: true };
+			if (position !== 'first') value.before = completed;
+			value.self = value;
+			if (position !== 'last') value.after = 42;
+
+			const source = uneval([value, new Marker()], (item, js) =>
+				item instanceof Marker ? js`new Marker()` : undefined
+			);
+			const [result] = vm.runInNewContext(source, { Marker });
+			const expected = [
+				...(position === 'first' ? [] : ['before']),
+				'self',
+				...(position === 'last' ? [] : ['after'])
+			];
+
+			assert.equal(Object.keys(result), expected);
+			assert.is(result.self, result);
+			if (position !== 'first') assert.is(result.before.done, true);
+		}
+	}
+});
+custom_source_test('preserves Map and Set order around cyclic references', () => {
+	class Marker {}
+
+	for (const position of ['first', 'middle', 'last']) {
+		const completed = { done: true };
+		const map = new Map();
+		if (position !== 'first') map.set('before', completed);
+		map.set('self', map);
+		if (position !== 'last') map.set('after', 42);
+
+		const set = new Set();
+		if (position !== 'first') set.add(completed);
+		set.add(set);
+		if (position !== 'last') set.add(42);
+
+		const source = uneval([map, set, new Marker()], (item, js) =>
+			item instanceof Marker ? js`new Marker()` : undefined
+		);
+		const [result_map, result_set] = vm.runInNewContext(source, { Marker });
+		const map_entries = Array.from(result_map);
+		const set_values = Array.from(result_set);
+
+		assert.equal(
+			map_entries.map(([key]) => key),
+			[...(position === 'first' ? [] : ['before']), 'self', ...(position === 'last' ? [] : ['after'])]
+		);
+		assert.is(map_entries[position === 'first' ? 0 : 1][1], result_map);
+		assert.is(set_values[position === 'first' ? 0 : 1], result_set);
+		if (position !== 'first') {
+			assert.is(map_entries[0][1].done, true);
+			assert.is(set_values[0].done, true);
+		}
+		if (position !== 'last') {
+			assert.is(map_entries.at(-1)[1], 42);
+			assert.is(set_values.at(-1), 42);
+		}
+	}
+});
+custom_source_test('preserves order in mutual and custom cycles', () => {
+	class Wrapper {
+		constructor(inner) {
+			this.inner = inner;
+			this.before = inner.before.done;
+		}
+	}
+
+	const left = {};
+	const right = {};
+	left.peer = right;
+	left.tail = 'left';
+	right.peer = left;
+	right.tail = 'right';
+
+	const container = {};
+	container.before = { done: true };
+	const wrapper = new Wrapper(container);
+	container.wrapper = wrapper;
+	container.tail = 42;
+
+	const source = uneval([left, right, wrapper], (item, js) =>
+		item instanceof Wrapper ? js`new Wrapper(${item.inner})` : undefined
+	);
+	const [result_left, result_right, result_wrapper] = vm.runInNewContext(source, { Wrapper });
+
+	assert.equal(Object.keys(result_left), ['peer', 'tail']);
+	assert.equal(Object.keys(result_right), ['peer', 'tail']);
+	assert.is(result_left.peer, result_right);
+	assert.is(result_right.peer, result_left);
+	assert.equal(Object.keys(result_wrapper.inner), ['before', 'wrapper', 'tail']);
+	assert.is(result_wrapper.inner.wrapper, result_wrapper);
+	assert.is(result_wrapper.before, true);
+	assert.is(result_wrapper.inner.tail, 42);
+});
 custom_source_test('rejects cycles made entirely of custom constructions', () => {
 	class Atomic {
 		constructor() {

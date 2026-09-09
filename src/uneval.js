@@ -259,12 +259,16 @@ class Renderer {
 
 		for (let group = 0; group < dependency_groups.length; group += 1) {
 			const group_values = /** @type {any[]} */ (dependency_groups[group]);
+			/** @type {string[]} */
+			const deferred_population = [];
 
-			// First fill references to earlier groups. A custom creation expression may
-			// inspect this data, so it must already be present when that expression runs.
+			// First fill the ordered prefix whose references belong to earlier groups. A
+			// custom creation expression may inspect this data, so it must already be
+			// present when that expression runs. Once an entry refers to this group, defer
+			// it and every following entry so observable insertion order is preserved.
 			for (const thing of group_values) {
 				if (this.#names.has(thing) && this.#is_mutable(thing)) {
-					this.#populate(thing, group, false, group_by_value, statements);
+					this.#populate(thing, group, group_by_value, statements, deferred_population);
 				}
 			}
 
@@ -283,13 +287,9 @@ class Renderer {
 				);
 			}
 
-			// Then connect references within this group. Waiting until now means every
-			// named value in the cycle exists before a container points to it.
-			for (const thing of group_values) {
-				if (this.#names.has(thing) && this.#is_mutable(thing)) {
-					this.#populate(thing, group, true, group_by_value, statements);
-				}
-			}
+			// Then emit each ordered suffix. Waiting until now means every named value in
+			// the cycle exists before a container points to it.
+			statements.push(...deferred_population);
 		}
 
 		statements.push(`return ${this.#reference(value)}`);
@@ -321,36 +321,18 @@ class Renderer {
 			}
 
 			const type = get_type(thing);
-			switch (type) {
-				case 'Number':
-				case 'String':
-				case 'Boolean':
-				case 'BigInt':
-					values.push(`Object(${this.#reference(thing.valueOf())})`);
-					break;
-
-				case 'RegExp': {
-					const { source, flags } = thing;
-					values.push(
-						flags
-							? `new RegExp(${stringify_string(source)},"${flags}")`
-							: `new RegExp(${stringify_string(source)})`
-					);
-					break;
+			const atomic = this.#construct_atomic(thing, type);
+			if (atomic !== undefined) {
+				if (ArrayBuffer.isView(thing)) {
+					values.push('{}');
+					reconstructions.push(`${name}=${atomic}`);
+				} else {
+					values.push(atomic);
 				}
+				return;
+			}
 
-				case 'Date':
-					values.push(`new Date(${thing.getTime()})`);
-					break;
-
-				case 'URL':
-					values.push(`new URL(${stringify_string(thing.toString())})`);
-					break;
-
-				case 'URLSearchParams':
-					values.push(`new URLSearchParams(${stringify_string(thing.toString())})`);
-					break;
-
+			switch (type) {
 				case 'Array':
 					values.push(`Array(${thing.length})`);
 					/** @type {any[]} */ (thing).forEach((item, i) => {
@@ -373,64 +355,6 @@ class Renderer {
 					if (sets.length > 0) statements.push(name + sets.join(''));
 					break;
 				}
-
-				case 'Int8Array':
-				case 'Uint8Array':
-				case 'Uint8ClampedArray':
-				case 'Int16Array':
-				case 'Uint16Array':
-				case 'Float16Array':
-				case 'Int32Array':
-				case 'Uint32Array':
-				case 'Float32Array':
-				case 'Float64Array':
-				case 'BigInt64Array':
-				case 'BigUint64Array': {
-					let expression = `new ${type}`;
-					if (!this.#names.has(thing.buffer)) {
-						expression += `([${stringify_typed_array_elements(type, thing.buffer)}])`;
-					} else {
-						expression += `(${this.#reference(thing.buffer)})`;
-					}
-					if (thing.byteLength !== thing.buffer.byteLength) {
-						const start = thing.byteOffset / thing.BYTES_PER_ELEMENT;
-						const end = start + thing.length;
-						expression += `.subarray(${start},${end})`;
-					}
-					values.push('{}');
-					reconstructions.push(`${name}=${expression}`);
-					break;
-				}
-
-				case 'DataView': {
-					let expression = 'new DataView';
-					if (!this.#names.has(thing.buffer)) {
-						expression += `(new Uint8Array([${new Uint8Array(thing.buffer)}]).buffer`;
-					} else {
-						expression += `(${this.#reference(thing.buffer)}`;
-					}
-					if (thing.byteLength !== thing.buffer.byteLength) {
-						expression += `,${thing.byteOffset},${thing.byteLength}`;
-					}
-					values.push('{}');
-					reconstructions.push(`${name}=${expression})`);
-					break;
-				}
-
-				case 'ArrayBuffer':
-					values.push(`new Uint8Array([${new Uint8Array(thing)}]).buffer`);
-					break;
-
-				case 'Temporal.Duration':
-				case 'Temporal.Instant':
-				case 'Temporal.PlainDate':
-				case 'Temporal.PlainTime':
-				case 'Temporal.PlainDateTime':
-				case 'Temporal.PlainMonthDay':
-				case 'Temporal.PlainYearMonth':
-				case 'Temporal.ZonedDateTime':
-					values.push(`${type}.from(${stringify_string(thing.toString())})`);
-					break;
 
 				default:
 					values.push(Object.getPrototypeOf(thing) === null ? 'Object.create(null)' : '{}');
@@ -516,27 +440,27 @@ class Renderer {
 	}
 
 	/**
-	 * Emits assignments that fill a mutable container. References outside the
-	 * current group are filled first; references within it are filled only after
-	 * every named value in that group has been created.
+	 * Emits the ordered prefix of assignments whose references are ready, and
+	 * records the suffix beginning with the first reference to the current group.
 	 *
 	 * @param {any} thing
 	 * @param {number} group
-	 * @param {boolean} within_group
 	 * @param {Map<any, number>} group_by_value
 	 * @param {string[]} statements
+	 * @param {string[]} deferred
 	 */
-	#populate(thing, group, within_group, group_by_value, statements) {
+	#populate(thing, group, group_by_value, statements, deferred) {
 		const name = this.#names.get(thing);
+		let waiting = false;
 		/**
 		 * @param {string} statement
 		 * @param {any[]} values
 		 */
 		const add = (statement, values) => {
-			const belongs_to_group = values.some(
+			waiting ||= values.some(
 				(value) => !is_primitive(value) && group_by_value.get(value) === group
 			);
-			if (belongs_to_group === within_group) statements.push(statement);
+			(waiting ? deferred : statements).push(statement);
 		};
 
 		switch (get_type(thing)) {
@@ -654,29 +578,10 @@ class Renderer {
 		}
 
 		const type = get_type(thing);
+		const atomic = this.#construct_atomic(thing, type);
+		if (atomic !== undefined) return atomic;
 
 		switch (type) {
-			case 'Number':
-			case 'String':
-			case 'Boolean':
-			case 'BigInt':
-				return `Object(${this.#reference(thing.valueOf())})`;
-
-			case 'RegExp':
-				const { source, flags } = thing;
-				return flags
-					? `new RegExp(${stringify_string(source)},"${flags}")`
-					: `new RegExp(${stringify_string(source)})`;
-
-			case 'Date':
-				return `new Date(${thing.getTime()})`;
-
-			case 'URL':
-				return `new URL(${stringify_string(thing.toString())})`;
-
-			case 'URLSearchParams':
-				return `new URLSearchParams(${stringify_string(thing.toString())})`;
-
 			case 'Array': {
 				// For dense arrays (no holes), we iterate normally.
 				// When we encounter the first hole, we call Object.keys
@@ -757,6 +662,50 @@ class Renderer {
 			case 'Map':
 				return `new ${type}([${Array.from(thing).map(this.#reference).join(',')}])`;
 
+			default:
+				const keys = Object.keys(thing);
+				const obj = keys.map((key) => `${safe_key(key)}:${this.#reference(thing[key])}`).join(',');
+				const proto = Object.getPrototypeOf(thing);
+				if (proto === null) {
+					return keys.length > 0 ? `{${obj},__proto__:null}` : `{__proto__:null}`;
+				}
+
+				return `{${obj}}`;
+		}
+	}
+
+	/**
+	 * Renders built-in atomic values whose construction is shared by the compact
+	 * and custom scheduling paths.
+	 *
+	 * @param {any} thing
+	 * @param {string} type
+	 * @returns {string | undefined}
+	 */
+	#construct_atomic(thing, type) {
+		switch (type) {
+			case 'Number':
+			case 'String':
+			case 'Boolean':
+			case 'BigInt':
+				return `Object(${this.#reference(thing.valueOf())})`;
+
+			case 'RegExp': {
+				const { source, flags } = thing;
+				return flags
+					? `new RegExp(${stringify_string(source)},"${flags}")`
+					: `new RegExp(${stringify_string(source)})`;
+			}
+
+			case 'Date':
+				return `new Date(${thing.getTime()})`;
+
+			case 'URL':
+				return `new URL(${stringify_string(thing.toString())})`;
+
+			case 'URLSearchParams':
+				return `new URLSearchParams(${stringify_string(thing.toString())})`;
+
 			case 'Int8Array':
 			case 'Uint8Array':
 			case 'Uint8ClampedArray':
@@ -769,45 +718,35 @@ class Renderer {
 			case 'Float64Array':
 			case 'BigInt64Array':
 			case 'BigUint64Array': {
-				let str = `new ${type}`;
-
+				let expression = `new ${type}`;
 				if (!this.#names.has(thing.buffer)) {
-					str += `([${stringify_typed_array_elements(type, thing.buffer)}])`;
+					expression += `([${stringify_typed_array_elements(type, thing.buffer)}])`;
 				} else {
-					str += `(${this.#reference(thing.buffer)})`;
+					expression += `(${this.#reference(thing.buffer)})`;
 				}
-
-				// handle subarrays
 				if (thing.byteLength !== thing.buffer.byteLength) {
 					const start = thing.byteOffset / thing.BYTES_PER_ELEMENT;
 					const end = start + thing.length;
-					str += `.subarray(${start},${end})`;
+					expression += `.subarray(${start},${end})`;
 				}
-
-				return str;
+				return expression;
 			}
 
 			case 'DataView': {
-				let str = `new DataView`;
-
+				let expression = 'new DataView';
 				if (!this.#names.has(thing.buffer)) {
-					str += `(new Uint8Array([${new Uint8Array(thing.buffer)}]).buffer`;
+					expression += `(new Uint8Array([${new Uint8Array(thing.buffer)}]).buffer`;
 				} else {
-					str += `(${this.#reference(thing.buffer)}`;
+					expression += `(${this.#reference(thing.buffer)}`;
 				}
-
-				// handle subviews
 				if (thing.byteLength !== thing.buffer.byteLength) {
-					str += `,${thing.byteOffset},${thing.byteLength}`;
+					expression += `,${thing.byteOffset},${thing.byteLength}`;
 				}
-
-				return str + ')';
+				return expression + ')';
 			}
 
-			case 'ArrayBuffer': {
-				const ui8 = new Uint8Array(thing);
-				return `new Uint8Array([${ui8.toString()}]).buffer`;
-			}
+			case 'ArrayBuffer':
+				return `new Uint8Array([${new Uint8Array(thing)}]).buffer`;
 
 			case 'Temporal.Duration':
 			case 'Temporal.Instant':
@@ -818,16 +757,6 @@ class Renderer {
 			case 'Temporal.PlainYearMonth':
 			case 'Temporal.ZonedDateTime':
 				return `${type}.from(${stringify_string(thing.toString())})`;
-
-			default:
-				const keys = Object.keys(thing);
-				const obj = keys.map((key) => `${safe_key(key)}:${this.#reference(thing[key])}`).join(',');
-				const proto = Object.getPrototypeOf(thing);
-				if (proto === null) {
-					return keys.length > 0 ? `{${obj},__proto__:null}` : `{__proto__:null}`;
-				}
-
-				return `{${obj}}`;
 		}
 	}
 }
