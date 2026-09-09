@@ -17,13 +17,19 @@ class Atomic {
 	}
 }
 
-/** @param {unknown} value @param {import('../../src/types.js').JavaScriptTag} js */
+/**
+ * @param {unknown} value
+ * @param {import('../../src/types.js').JavaScriptTag} js
+ */
 function replacer(value, js) {
 	if (value instanceof Wrapper) return js`({value:${value.value}})`;
 	if (value instanceof Atomic) return js`new Atomic(${value.value})`;
 }
 
-/** @param {number} depth @param {number} breadth */
+/**
+ * @param {number} depth
+ * @param {number} breadth
+ */
 function tree(depth, breadth) {
 	if (depth === 0) return { value: 1, label: 'leaf' };
 	return {
