@@ -88,10 +88,10 @@ class Session {
 	#active = 0;
 	/** Whether a batch finalization is currently scheduled. @type {boolean} */
 	#flushing = false;
-	/** In-flight cleanup; defined once the session has been cancelled. @type {Promise<void> | undefined} */
-	#cancelling;
-	/** Fatal generation error, cancellation reason, or first cleanup failure. @type {unknown} */
-	#failure;
+	/** Scheduled batch finalization handle. @type {ReturnType<typeof setTimeout> | undefined} */
+	#flush_handle;
+	/** Explicit session lifecycle, independent of source accounting and reason truthiness. @type {Lifecycle} */
+	#status = { state: 'preparing' };
 	/** Next client anchor index; index zero is reserved for the head root. @type {number} */
 	#anchor = 1;
 	/** Next client pending index used to store a descriptor's private control. @type {number} */
@@ -140,7 +140,7 @@ class Session {
 		this.#signal = signal;
 		this.#onerror = options.onerror;
 		this.#graph = create_captured_graph(root, (graph, node, value) => this.#classify(graph, node, value));
-		this.#abort = () => void this.#cancel(signal?.reason);
+		this.#abort = () => void this.#cancel(signal?.reason, true);
 		signal?.addEventListener('abort', this.#abort, { once: true });
 	}
 
@@ -153,26 +153,24 @@ class Session {
 			// walk the graph and capture the synchronous values and the first layer of async sources
 			this.#capture(value, true);
 			this.#active = this.#sources.length;
-			if (this.#cancelling) throw this.#failure;
-		} catch (error) {
-			await this.#cancel(error);
-			throw this.#failure ?? error;
-		}
+			if (!this.#is_active()) return await this.#throw_failure(undefined);
 
-		if (this.#sources.length === 0) {
-			return { head: render_stream_source(this.#emit_region(value, false)), tail: empty_tail(), id: this.#id };
-		}
+			if (this.#sources.length === 0) {
+				const head = render_stream_source(this.#emit_region(value, false));
+				this.#complete();
+				return { head, tail: empty_tail(), id: this.#id };
+			}
 
-		// start observing the async sources
-		this.#start_sources();
-		// give them a 1-task window in which they can resolve to be batched into the initial body.
-		// Sources settle in microtasks after this point, so always wait at least one macrotask,
-		// then keep waiting while a flush is scheduled so the window matches tail batching.
-		do await macrotask();
-		while (this.#flushing);
-		if (this.#failure) throw this.#failure;
+			this.#status = { state: 'streaming' };
+			// start observing the async sources
+			this.#start_sources();
+			// give them a 1-task window in which they can resolve to be batched into the initial body.
+			// Sources settle in microtasks after this point, so always wait at least one macrotask,
+			// then keep waiting while a flush is scheduled so the window matches tail batching.
+			do await macrotask();
+			while (this.#flushing && this.#is_active());
+			if (!this.#is_active()) return await this.#throw_failure(undefined);
 
-		try {
 			const head_region = this.#emit_region(value, true, undefined, 0, 0);
 			this.#assign_references(value, { kind: 'anchor', index: 0, segments: [] }, new Map(), 0);
 			// anything that settled within the window is folded into the head rather than shipped as a block
@@ -185,14 +183,15 @@ class Session {
 				const final_operations = operations
 					? join_sources([operations, this.#cleanup_source()], ';')
 					: this.#cleanup_source();
-				return { head: this.#wrap_head(head_region, final_operations), tail: empty_tail(), id: this.#id };
+				const head = this.#wrap_head(head_region, final_operations);
+				this.#complete();
+				return { head, tail: empty_tail(), id: this.#id };
 			}
 
 			this.#emit_dispatch = true;
 			return { head: this.#wrap_head(head_region, operations), tail: this.#tail(), id: this.#id };
 		} catch (error) {
-			await this.#cancel(error);
-			throw this.#failure ?? error;
+			return await this.#throw_failure(error);
 		}
 	}
 
@@ -230,6 +229,8 @@ class Session {
 		try {
 			const node = discover(graph, value);
 			this.#validate_new_custom(custom);
+			if (!this.#is_active()) throw this.#terminal_reason();
+			for (let i = sources; i < this.#sources.length; i++) this.#sources[i].committed = true;
 			if (root) this.#root = node;
 			return node;
 		} catch (error) {
@@ -237,8 +238,7 @@ class Session {
 			this.#native_pending = native_pending;
 			for (let i = this.#sources.length - 1; i >= sources; i--) {
 				const source = this.#sources[i];
-				source.active = false;
-				if (source.observer) source.observer.active = false;
+				this.#deactivate(source);
 			}
 			this.#sources.length = sources;
 			for (let i = this.#new_custom.length - 1; i >= custom; i--) {
@@ -293,8 +293,10 @@ class Session {
 	 * @returns {boolean}
 	 */
 	#classify(graph, node, value) {
+		if (!this.#is_active()) throw this.#terminal_reason();
 		if (this.#replacer) {
 			const result = this.#replacer(value, js);
+			if (!this.#is_active()) throw this.#terminal_reason();
 			if (is_source(result)) {
 				const values = source_values(result);
 				const children = new Array(values.length);
@@ -325,22 +327,23 @@ class Session {
 		}
 
 		if (typeof value === 'object' && value !== null) {
-			/** @type {{ active: boolean } | undefined} */
+			/** @type {{ active: boolean, dispatch?: (type: 'resolve' | 'reject', result: unknown) => void } | undefined} */
 			let observer;
 			if (is_native_promise(value)) try {
+				/** @type {{ active: boolean, dispatch?: (type: 'resolve' | 'reject', result: unknown) => void }} */
 				const current = observer = { active: true };
 				/**
 				 * Forwards a native Promise fulfillment while its provisional observer is active.
 				 *
 				 * @param {unknown} result
 				 */
-				const resolve = (result) => current.active && this.#native_event(value, 'resolve', result);
+				const resolve = (result) => current.active && current.dispatch?.('resolve', result);
 				/**
 				 * Forwards a native Promise rejection while its provisional observer is active.
 				 *
 				 * @param {unknown} reason
 				 */
-				const reject = (reason) => current.active && this.#native_event(value, 'reject', reason);
+				const reject = (reason) => current.active && current.dispatch?.('reject', reason);
 				const observed = promise_then.call(
 					value,
 					resolve,
@@ -353,7 +356,13 @@ class Session {
 			if (observer) {
 				const descriptor = this.#native_descriptor(/** @type {Promise<unknown>} */ (value));
 				try {
-					this.#add_source(node, descriptor, 'native', true).observer = observer;
+					const source = this.#add_source(node, descriptor, 'native', true);
+					source.observer = observer;
+					observer.dispatch = (type, result) => {
+						if (!source.active) return;
+						if (source.started) this.#event(source, type, result);
+						else source.early = [type, result];
+					};
 					this.#native_pending++;
 				} catch (error) {
 					observer.active = false;
@@ -392,6 +401,7 @@ class Session {
 			return capture_source(pending, expression);
 		};
 		const source = descriptor.construct(control);
+		if (!this.#is_active()) throw this.#terminal_reason();
 		if (!is_source(source)) throw new TypeError(`Invalid async descriptor construct result: construct() returned ${describe_received(source)}. It must synchronously return a js tagged template representing the client construction expression.`);
 		assert_descriptor_source(source, 'async descriptor construct()');
 		this.#pending = pending + 1;
@@ -399,28 +409,12 @@ class Session {
 		// the mutation that TypeScript cannot follow.
 		const async_node = /** @type {AsyncNode} */ (node);
 		/** @type {Source} */
-		const state = { node: async_node, descriptor, type, immediate, started: false, terminal: false, cleaned: false, active: true };
+		const state = { node: async_node, descriptor, type, immediate, committed: false, started: false, terminal: false, active: true };
 		async_node.kind = 'Async';
 		async_node.data = { source, pending, captured, state };
 		this.#sources.push(state);
 		if (this.#signal?.aborted) throw this.#signal.reason;
 		return state;
-	}
-
-	/**
-	 * Routes a native Promise outcome to its source, retaining outcomes observed before startup.
-	 *
-	 * @param {unknown} value
-	 * @param {'resolve' | 'reject'} type
-	 * @param {unknown} result
-	 */
-	#native_event(value, type, result) {
-		const node = this.#graph.identities.get(/** @type {object} */ (value));
-		if (!node) return;
-		const source = node.kind === 'Async' ? node.data.state : undefined;
-		if (!source?.active) return;
-		if (source?.started) this.#event(source, type, result);
-		else if (source) source.early = [type, result];
 	}
 
 	/**
@@ -513,7 +507,7 @@ class Session {
 	/** Starts every committed source unless the constructor's AbortSignal listener has cancelled the session. */
 	#start_sources() {
 		if (this.#signal?.aborted) {
-			void this.#cancel(this.#signal.reason);
+			void this.#cancel(this.#signal.reason, true);
 			return;
 		}
 		this.#start_unstarted();
@@ -523,7 +517,7 @@ class Session {
 	#start_unstarted() {
 		const sources = this.#sources;
 		const end = sources.length;
-		for (let i = this.#started; i < end; i++) this.#start(sources[i]);
+		for (let i = this.#started; i < end && this.#is_active(); i++) this.#start(sources[i]);
 		this.#started = end;
 	}
 
@@ -533,7 +527,7 @@ class Session {
 	 * @param {Source} source
 	 */
 	#start(source) {
-		if (source.started || this.#cancelling) return;
+		if (source.started || !this.#is_active()) return;
 		source.started = true;
 		if (source.type === 'sequence') {
 			this.#start_sequence(source);
@@ -545,6 +539,7 @@ class Session {
 		}
 		try {
 			const then = source.descriptor.source.then;
+			if (!this.#is_active()) return;
 			if (typeof then !== 'function') throw new TypeError('then is not callable');
 			new Promise((resolve, reject) => {
 				try {
@@ -567,21 +562,41 @@ class Session {
 	 * @param {Source} source
 	 */
 	#start_sequence(source) {
+		source.acquiring = true;
 		try {
 			const method = source.descriptor.source[Symbol.asyncIterator];
+			if (!this.#is_active()) return this.#finish_acquisition(source);
 			if (typeof method !== 'function') throw new TypeError('async iterator is not callable');
 			const iterator = method.call(source.descriptor.source);
 			if ((typeof iterator !== 'object' || iterator === null) && typeof iterator !== 'function') {
 				throw new TypeError('async iterator is not an object');
 			}
-			const next = iterator.next;
-			if (typeof next !== 'function') throw new TypeError('async iterator next is not callable');
 			source.iterator = iterator;
+			if (!this.#is_active()) return this.#finish_acquisition(source);
+			const next = iterator.next;
+			if (!this.#is_active()) return this.#finish_acquisition(source);
+			if (typeof next !== 'function') throw new TypeError('async iterator next is not callable');
 			source.next = next;
+			source.acquiring = false;
 			this.#pull(source);
 		} catch (error) {
-			this.#event(source, 'error', error);
+			source.acquiring = false;
+			if (this.#is_active()) this.#event(source, 'error', error);
+			else {
+				this.#close_sequence(source);
+				this.#cancel_source(source);
+			}
 		}
+	}
+
+	/**
+	 * Completes reentrant iterator acquisition after cancellation in return-before-cancel order.
+	 * @param {Source} source
+	 */
+	#finish_acquisition(source) {
+		source.acquiring = false;
+		this.#close_sequence(source);
+		this.#cancel_source(source);
 	}
 
 	/**
@@ -593,15 +608,10 @@ class Session {
 		// `next` is set by #start_sequence before the first pull, and later pulls are only
 		// triggered by 'next' events, which require an earlier successful pull.
 		const next = source.next;
-		if (!next || source.terminal || source.pulling || this.#cancelling) return;
+		if (!next || source.terminal || source.pulling || !this.#is_active()) return;
 		source.pulling = true;
-		source.pulled = new Promise((resolve) => {
-			source.pulled_resolve = resolve;
-		});
 		const finish = () => {
 			source.pulling = false;
-			source.pulled_resolve?.();
-			source.pulled_resolve = undefined;
 		};
 		let result;
 		try {
@@ -614,7 +624,7 @@ class Session {
 		Promise.resolve(result).then(
 			(result) => {
 				finish();
-				if (source.terminal || this.#cancelling) return;
+				if (source.terminal || !this.#is_active()) return;
 				try {
 					if ((typeof result !== 'object' || result === null) && typeof result !== 'function') {
 						throw new TypeError('async iterator result is not an object');
@@ -641,7 +651,7 @@ class Session {
 	 * @param {unknown} value
 	 */
 	#event(source, type, value) {
-		if (source.terminal || this.#cancelling) return;
+		if (source.terminal || !this.#is_active()) return;
 		if (type !== 'next') {
 			source.terminal = true;
 		}
@@ -651,6 +661,7 @@ class Session {
 			this.#capture(value);
 			this.#active += this.#sources.length - source_count;
 		} catch (error) {
+			if (!this.#is_active()) return;
 			this.#report(error, value);
 			event.type = source.type === 'sequence' ? 'error' : 'reject';
 			event.value = undefined;
@@ -659,7 +670,7 @@ class Session {
 		this.#batch.push(event);
 		if (!this.#flushing) {
 			this.#flushing = true;
-			setTimeout(() => this.#flush(), 0);
+			this.#flush_handle = setTimeout(() => this.#flush(), 0);
 		}
 		// Iterators contribute at most one item to each batch. The next pull starts when
 		// this batch is consumed, preventing an immediately-ready iterator from starving
@@ -682,7 +693,8 @@ class Session {
 	/** Finalizes the current events as one batch and wakes the tail. Events are already in observation order. */
 	#flush() {
 		this.#flushing = false;
-		if (this.#cancelling || this.#batch.length === 0) return;
+		this.#flush_handle = undefined;
+		if (!this.#is_active() || this.#batch.length === 0) return;
 		this.#batch_ready = true;
 		this.#notify();
 	}
@@ -708,25 +720,19 @@ class Session {
 	 * @returns {Promise<Emission>}
 	 */
 	async #deliver(events, block) {
-		let emitted;
 		try {
-			emitted = this.#emit_batch(events, block);
+			const emitted = this.#emit_batch(events, block);
+			if (!this.#is_active()) return await this.#throw_failure(undefined);
+			for (const source of emitted.close) this.#close_failed_sequence(source);
+			this.#start_unstarted();
+			this.#consume(events);
+			if (!this.#is_active()) return await this.#throw_failure(undefined);
+			const source = block ? this.#render_final(emitted.source) : emitted.source;
+			if (block && this.#active === 0 && this.#batch.length === 0) this.#complete();
+			return source;
 		} catch (error) {
-			await this.#cancel(error);
-			throw this.#failure ?? error;
+			return await this.#throw_failure(error);
 		}
-		for (const source of emitted.close) {
-			try {
-				await this.#close_sequence(source);
-			} catch (error) {
-				// The iterator already failed and its client error operation is in this batch, so a
-				// failing `return()` has nothing left to affect. Report it and keep streaming.
-				this.#report(error, source.descriptor.source);
-			}
-		}
-		this.#start_unstarted();
-		this.#consume(events);
-		return block ? this.#render_final(emitted.source) : emitted.source;
 	}
 
 	/**
@@ -1258,6 +1264,7 @@ class Session {
 		/** @type {Source[]} */
 		const close = [];
 		for (const event of events) {
+			if (!this.#is_active()) throw this.#terminal_reason();
 			const source = event.source;
 			const node = source.node;
 			const available = this.#availability;
@@ -1337,11 +1344,13 @@ class Session {
 				else if (event.type === 'next') operation = source.descriptor.next(reference, value_source);
 				else if (event.type === 'complete') operation = source.descriptor.complete(reference, value_source);
 				else operation = source.descriptor.error(reference, value_source);
+				if (!this.#is_active()) throw this.#terminal_reason();
 				if (!is_source(operation)) throw new TypeError(`Invalid async descriptor operation: ${event.type}() returned ${describe_received(operation)}. It must synchronously return a js tagged template containing client statements; use js\`\` for an empty operation.`);
 				assert_descriptor_source(operation, `async descriptor ${event.type}()`);
 				if (materialization) operations.push(materialization);
 				operations.push(operation);
 			} catch (error) {
+				if (!this.#is_active()) throw error;
 				if (event.type === 'resolve' || event.type === 'next' || event.type === 'complete') {
 					this.#report(error, event.value);
 					// A privately folded adapter is switched back to its separately emitted anchor
@@ -1362,6 +1371,7 @@ class Session {
 					const fallback = source.type === 'sequence'
 						? source.descriptor.error(reference, fallback_value)
 						: source.descriptor.reject(reference, fallback_value);
+					if (!this.#is_active()) throw this.#terminal_reason();
 					if (!is_source(fallback)) throw new TypeError(`Invalid async descriptor operation: fallback ${source.type === 'sequence' ? 'error' : 'reject'}() returned ${describe_received(fallback)}. It must synchronously return a js tagged template containing client statements; use js\`\` for an empty operation.`);
 					assert_descriptor_source(fallback, source.type === 'sequence' ? 'async descriptor fallback error()' : 'async descriptor fallback reject()');
 					operations.push(fallback);
@@ -1479,7 +1489,7 @@ class Session {
 				const cancelling = session.#cancel();
 				const result = await generator.return();
 				await cancelling;
-				if (session.#failure) throw session.#failure;
+				session.#throw_terminal_reason();
 				return result;
 			}
 		};
@@ -1495,13 +1505,18 @@ class Session {
 	 */
 	async *#blocks() {
 		while (true) {
-			while (!this.#batch_ready && this.#active > 0 && !this.#cancelling) await this.#sleep();
-			if (this.#cancelling) {
-				await this.#cancelling;
-				if (this.#failure) throw this.#failure;
+			while (!this.#batch_ready && this.#active > 0 && this.#is_active()) await this.#sleep();
+			if (!this.#is_active()) {
+				if (this.#status.state === 'cancelled' || this.#status.state === 'failed') {
+					await this.#status.cleanup;
+					this.#throw_terminal_reason();
+				}
 				return;
 			}
-			if (this.#active === 0) return;
+			if (this.#active === 0) {
+				this.#complete();
+				return;
+			}
 			yield /** @type {string} */ (await this.#deliver(this.#take_batch(), true));
 		}
 	}
@@ -1521,69 +1536,257 @@ class Session {
 	}
 
 	/**
-	 * Idempotently starts server-side cleanup and returns the shared cleanup operation.
-	 * `#cancelling` doubles as the cancelled flag for source callbacks and the tail.
+	 * Reports whether the session may still discover, observe, or generate work.
 	 *
-	 * @param {unknown} [reason]
-	 * @returns {Promise<void>}
+	 * @returns {boolean}
 	 */
-	#cancel(reason) {
-		if (this.#cancelling) return this.#cancelling;
-		this.#cancelling = this.#cleanup(reason);
-		this.#notify();
-		return this.#cancelling;
+	#is_active() {
+		return this.#status.state === 'preparing' || this.#status.state === 'streaming';
+	}
+
+	/** Returns the exact terminal reason, including a falsy reason. */
+	#terminal_reason() {
+		const status = this.#status;
+		return status.state === 'cancelled' || status.state === 'failed' ? status.reason : undefined;
+	}
+
+	/** Throws the terminal reason when one is present, independently of its truthiness. */
+	#throw_terminal_reason() {
+		const status = this.#status;
+		if ((status.state === 'cancelled' || status.state === 'failed') && status.has_reason) throw status.reason;
 	}
 
 	/**
-	 * Stops all sources, runs every cleanup hook, and records the first resulting failure.
-	 *
-	 * @param {unknown} reason
+	 * Idempotently records successful completion before releasing lifecycle ownership.
+	 * Normal completion never invokes iterator or descriptor cancellation hooks.
 	 */
-	async #cleanup(reason) {
-		this.#signal?.removeEventListener('abort', this.#abort);
-		let failure;
-		for (const source of this.#sources) {
-			if (source.cleaned) continue;
-			source.cleaned = true;
-			source.active = false;
-			if (source.observer) source.observer.active = false;
-			try {
-				await this.#close_sequence(source);
-			} catch (error) {
-				failure ??= error;
-			}
-			try {
-				await source.descriptor.cancel?.();
-			} catch (error) {
-				failure ??= error;
-			}
-		}
-		this.#batch = [];
-		this.#batch_ready = false;
-		this.#failure ??= failure ?? reason;
+	#complete() {
+		if (!this.#is_active()) return;
+		this.#status = { state: 'completed' };
+		this.#release_lifecycle();
+		for (const source of this.#sources) this.#deactivate(source);
 		this.#notify();
 	}
 
 	/**
-	 * Calls a sequence iterator's optional `return()` method at most once.
-	 *
+	 * Stops source callbacks and releases detachable native observer closures.
 	 * @param {Source} source
 	 */
-	async #close_sequence(source) {
+	#deactivate(source) {
+		source.active = false;
+		if (source.observer) {
+			source.observer.active = false;
+			source.observer.dispatch = undefined;
+		}
+	}
+
+	/** Detaches externally owned wakeups and discards batches that can no longer be emitted. */
+	#release_lifecycle() {
+		this.#signal?.removeEventListener('abort', this.#abort);
+		if (this.#flush_handle !== undefined) clearTimeout(this.#flush_handle);
+		this.#flush_handle = undefined;
+		this.#flushing = false;
+		this.#batch = [];
+		this.#batch_ready = false;
+	}
+
+	/**
+	 * Transitions to cancellation before synchronously initiating cleanup for every committed source.
+	 *
+	 * @param {unknown} [reason]
+	 * @param {boolean} [has_reason]
+	 * @returns {Promise<void>}
+	 */
+	#cancel(reason, has_reason = arguments.length !== 0) {
+		if (!this.#is_active()) {
+			const status = this.#status;
+			if (status.state === 'cancelled' && has_reason && !status.has_reason) {
+				status.has_reason = true;
+				status.reason = reason;
+			}
+			return status.state === 'cancelled' || status.state === 'failed' ? status.cleanup : Promise.resolve();
+		}
+		return this.#terminate('cancelled', reason, has_reason);
+	}
+
+	/**
+	 * Makes a generation failure authoritative, waits for cleanup, then throws the exact primary reason.
+	 *
+	 * @param {unknown} error
+	 * @returns {Promise<never>}
+	 */
+	async #throw_failure(error) {
+		const cleanup = this.#is_active()
+			? this.#terminate('failed', error, true)
+			: this.#status.state === 'cancelled' || this.#status.state === 'failed'
+				? this.#status.cleanup
+				: Promise.resolve();
+		await cleanup;
+		this.#throw_terminal_reason();
+		throw error;
+	}
+
+	/**
+	 * Enters a terminal state before callbacks run, starts every close/cancel operation without
+	 * awaiting inside the discovery-order loop, and shares one cleanup completion under reentry.
+	 *
+	 * @param {'cancelled' | 'failed'} state
+	 * @param {unknown} reason
+	 * @param {boolean} has_reason
+	 * @returns {Promise<void>}
+	 */
+	#terminate(state, reason, has_reason) {
+		/** @type {(value?: void | PromiseLike<void>) => void} */
+		let finish = () => {};
+		const cleanup = new Promise((resolve) => { finish = resolve; });
+		/** @type {TerminatingLifecycle} */
+		const status = { state, has_reason, reason, cleanup, operations: [] };
+		this.#status = status;
+		this.#release_lifecycle();
+		this.#notify();
+
+		for (const source of this.#sources) {
+			if (!source.committed) continue;
+			this.#deactivate(source);
+			if (source.acquiring) continue;
+			const close = this.#close_sequence(source);
+			if (close && !status.operations.includes(close)) status.operations.push(close);
+			const cancel = this.#cancel_source(source);
+			if (cancel && !status.operations.includes(cancel)) status.operations.push(cancel);
+		}
+
+		// Reentrant callbacks may finish iterator acquisition after the terminal transition.
+		// Settle in the next microtask so those synchronously initiated operations join cleanup.
+		void Promise.resolve().then(() => this.#settle_cleanup(status)).then(finish);
+		return cleanup;
+	}
+
+	/**
+	 * Selects cleanup failures deterministically after every initiated operation settles.
+	 *
+	 * @param {TerminatingLifecycle} status
+	 */
+	async #settle_cleanup(status) {
+		const operations = status.operations;
+		const results = await Promise.all(operations.map((operation) => operation.result));
+		let primary = -1;
+		if (!status.has_reason) {
+			primary = results.findIndex((result) => !result.ok);
+			if (primary !== -1) {
+				const result = results[primary];
+				if (result.ok) throw new Error('devalue: cleanup result selection failed');
+				status.has_reason = true;
+				status.reason = result.error;
+			}
+		}
+		for (let i = 0; i < results.length; i++) {
+			const result = results[i];
+			if (i !== primary && !result.ok) this.#report_cleanup(operations[i], result.error);
+		}
+		this.#notify();
+	}
+
+	/**
+	 * Starts a sequence iterator's optional `return()` method at most once, without waiting for
+	 * an outstanding pull. Getter, call, and asynchronous failures are immediately observed.
+	 *
+	 * @param {Source} source
+	 * @returns {CleanupOperation | undefined}
+	 */
+	#close_sequence(source) {
+		if (source.close_operation) return source.close_operation;
 		if (source.iterator_closed || !source.iterator) return;
 		source.iterator_closed = true;
-		const method = source.iterator.return;
-		if (typeof method !== 'function') {
-			if (source.pulled) await source.pulled;
-			return;
+		const operation = this.#create_cleanup(source, 'return');
+		source.close_operation = operation;
+		try {
+			const method = source.iterator.return;
+			if (typeof method !== 'function') {
+				operation.settle({ ok: true });
+				return operation;
+			}
+			this.#settle_invocation(operation, method.call(source.iterator));
+		} catch (error) {
+			operation.settle({ ok: false, error });
 		}
-		const returned = Promise.resolve().then(() => method.call(source.iterator));
-    if (source.pulled) {
-      await Promise.all([source.pulled, returned]);
-    }
-    else {
-      await returned;
-    }
+		return operation;
+	}
+
+	/**
+	 * Starts one descriptor cancellation hook at most once.
+	 * @param {Source} source
+	 * @returns {CleanupOperation | undefined}
+	 */
+	#cancel_source(source) {
+		if (source.cancel_operation) return source.cancel_operation;
+		if (source.cancel_started) return;
+		source.cancel_started = true;
+		const operation = this.#create_cleanup(source, 'cancel');
+		source.cancel_operation = operation;
+		try {
+			const cancel = source.descriptor.cancel;
+			if (typeof cancel !== 'function') {
+				operation.settle({ ok: true });
+				return operation;
+			}
+			this.#settle_invocation(operation, cancel.call(source.descriptor));
+		} catch (error) {
+			operation.settle({ ok: false, error });
+		}
+		return operation;
+	}
+
+	/**
+	 * Creates and registers an always-fulfilled cleanup result before invoking user code, making
+	 * getter/callback reentry idempotent and preserving deterministic operation order.
+	 * @param {Source} source
+	 * @param {'return' | 'cancel'} kind
+	 * @returns {CleanupOperation}
+	 */
+	#create_cleanup(source, kind) {
+		/** @type {(result: CleanupResult) => void} */
+		let settle = () => {};
+		const result = new Promise((resolve) => { settle = resolve; });
+		/** @type {CleanupOperation} */
+		const operation = { source, kind, reported: false, result, settle };
+		const status = this.#status;
+		if (status.state === 'cancelled' || status.state === 'failed') status.operations.push(operation);
+		return operation;
+	}
+
+	/**
+	 * Immediately observes an invoked cleanup result and settles its non-rejecting record.
+	 * @param {CleanupOperation} operation
+	 * @param {unknown} result
+	 */
+	#settle_invocation(operation, result) {
+		Promise.resolve(result).then(
+			() => operation.settle({ ok: true }),
+			(error) => operation.settle({ ok: false, error })
+		);
+	}
+
+	/**
+	 * Closes a failed sequence diagnostically without delaying delivery of its generated error.
+	 * @param {Source} source
+	 */
+	#close_failed_sequence(source) {
+		const operation = this.#close_sequence(source);
+		if (!operation) return;
+		void operation.result.then((result) => {
+			if (!result.ok) this.#report_cleanup(operation, result.error);
+		});
+	}
+
+	/**
+	 * Reports a cleanup failure at most once, preserving the source iterable as diagnostic context.
+	 * @param {CleanupOperation} operation
+	 * @param {unknown} error
+	 */
+	#report_cleanup(operation, error) {
+		if (operation.reported) return;
+		operation.reported = true;
+		this.#report(error, operation.source.descriptor.source);
 	}
 
 	/**
@@ -1597,16 +1800,6 @@ class Session {
 		try {
 			this.#onerror?.(error, value);
 		} catch {}
-	}
-
-	/**
-	 * Records an unrecoverable protocol failure and asynchronously cancels the session.
-	 *
-	 * @param {unknown} error
-	 */
-	#fail(error) {
-		this.#failure = error;
-		void this.#cancel(error);
 	}
 
 	/**
@@ -1748,5 +1941,9 @@ function macrotask() {
 }
 
 /** @typedef {{ path: ClientPath, available: number, previous: RetainedReference | undefined }} RetainedReference */
-/** @typedef {{ node: AsyncNode, descriptor: any, type: 'value' | 'sequence' | 'native', immediate: boolean, started: boolean, terminal: boolean, cleaned: boolean, active: boolean, iterator?: AsyncIterator<unknown>, iterator_closed?: boolean, next?: AsyncIterator<unknown>['next'], pulling?: boolean, pulled?: Promise<void>, pulled_resolve?: () => void, observer?: { active: boolean }, early?: ['resolve' | 'reject', unknown] }} Source */
+/** @typedef {{ state: 'preparing' | 'streaming' } | { state: 'completed' } | TerminatingLifecycle} Lifecycle */
+/** @typedef {{ state: 'cancelled' | 'failed', has_reason: boolean, reason: unknown, cleanup: Promise<void>, operations: CleanupOperation[] }} TerminatingLifecycle */
+/** @typedef {{ ok: true } | { ok: false, error: unknown }} CleanupResult */
+/** @typedef {{ source: Source, kind: 'return' | 'cancel', reported: boolean, result: Promise<CleanupResult>, settle: (result: CleanupResult) => void }} CleanupOperation */
+/** @typedef {{ node: AsyncNode, descriptor: any, type: 'value' | 'sequence' | 'native', immediate: boolean, committed: boolean, started: boolean, terminal: boolean, active: boolean, iterator?: AsyncIterator<unknown>, iterator_closed?: boolean, acquiring?: boolean, next?: AsyncIterator<unknown>['next'], pulling?: boolean, observer?: { active: boolean, dispatch?: (type: 'resolve' | 'reject', result: unknown) => void }, early?: ['resolve' | 'reject', unknown], close_operation?: CleanupOperation, cancel_started?: boolean, cancel_operation?: CleanupOperation }} Source */
 /** @typedef {{ source: Source, type: 'resolve' | 'reject' | 'next' | 'complete' | 'error', value: unknown, invalid: boolean }} Event */
