@@ -357,6 +357,158 @@ test('preserves set member identity through a collection sidecar', async () => {
 	assert.is(await root.pending, Array.from(root.set)[0]);
 });
 
+test('retains descendants of Map key value and Set member sidecars', async () => {
+	const pending_key = deferred();
+	const pending_value = deferred();
+	const pending_member = deferred();
+	const key_child = { position: 'key' };
+	const value_child = { position: 'value' };
+	const member_child = { position: 'member' };
+	const key = { nested: [key_child] };
+	const value = { nested: { child: value_child } };
+	const member = { nested: [member_child] };
+	const result = await unevalStream({
+		map: new Map([[key, value]]),
+		set: new Set([member]),
+		pending_key: pending_key.promise,
+		pending_value: pending_value.promise,
+		pending_member: pending_member.promise
+	}, undefined, { id: 'collection-descendants' });
+	const target = client();
+	const root = target.head(result.head);
+	pending_key.resolve(key_child);
+	pending_value.resolve(value_child);
+	pending_member.resolve(member_child);
+	let emitted = result.head;
+	for await (const block of result.tail) {
+		emitted += block;
+		target.block(block);
+	}
+	const revived_key = Array.from(root.map.keys())[0];
+	const revived_value = root.map.get(revived_key);
+	const revived_member = Array.from(root.set)[0];
+	assert.is(await root.pending_key, revived_key.nested[0]);
+	assert.is(await root.pending_value, revived_value.nested.child);
+	assert.is(await root.pending_member, revived_member.nested[0]);
+	assert.is((result.head.match(/s\.c\[\d+\]=/g) ?? []).length, 2, result.head);
+	assert.not.match(emitted, /s\.s\[/);
+	assert.not.match(emitted, /Array\.from\(/);
+});
+
+test('retains collection descendants introduced before repeated outcomes in the same and later batches', async () => {
+	const introduced = deferred();
+	const same_a = deferred();
+	const same_b = deferred();
+	const later = deferred();
+	const shared = { value: 1 };
+	const key = { nested: [shared] };
+	const value = { nested: { shared } };
+	const member = { nested: [shared] };
+	const result = await unevalStream({
+		introduced: introduced.promise,
+		same_a: same_a.promise,
+		same_b: same_b.promise,
+		later: later.promise
+	}, undefined, { id: 'outcome-collection-descendants' });
+	const target = client();
+	const root = target.head(result.head);
+	introduced.resolve({ map: new Map([[key, value]]), set: new Set([member]) });
+	same_a.resolve(shared);
+	same_b.resolve(shared);
+	const first = (await result.tail.next()).value;
+	assert.not.match(first, /s\.s\[/);
+	target.block(first);
+	const collection = await root.introduced;
+	const revived_key = Array.from(collection.map.keys())[0];
+	const revived_value = collection.map.get(revived_key);
+	const revived_member = Array.from(collection.set)[0];
+	assert.is(await root.same_a, revived_key.nested[0]);
+	assert.is(await root.same_a, revived_value.nested.shared);
+	assert.is(await root.same_a, revived_member.nested[0]);
+	assert.is(await root.same_b, await root.same_a);
+	assert.is(target.context.__d['outcome-collection-descendants'].a.length, 2);
+	later.resolve(shared);
+	target.block((await result.tail.next()).value);
+	assert.is(await root.later, await root.same_a);
+});
+
+test('uses a retained collection descendant as a custom async target', async () => {
+	class Task {
+		constructor() {
+			this.ready = deferred();
+		}
+	}
+	const task = new Task();
+	const holder = { nested: [task] };
+	const result = await unevalStream(
+		new Set([holder]),
+		(value, js) => value instanceof Task && ({
+			type: 'async-value',
+			source: value.ready.promise,
+			construct: () => js`({value:void 0})`,
+			resolve: ({ target }, payload) => js`${target}.value=${payload}`,
+			reject: ({ target }, reason) => js`${target}.error=${reason}`
+		}),
+		{ id: 'collection-async-target' }
+	);
+	const target = client();
+	const root = target.head(result.head);
+	const payload = { ready: true };
+	task.ready.resolve(payload);
+	target.block((await result.tail.next()).value);
+	const revived_task = Array.from(root)[0].nested[0];
+	assert.equal({ ...revived_task.value }, payload);
+});
+
+test('retains cyclic shared view and buffer descendants without blanket slots', async () => {
+	const pending_shared = deferred();
+	const pending_view = deferred();
+	const pending_buffer = deferred();
+	const buffer = new Uint8Array([1, 2, 3, 4]).buffer;
+	const view = new Uint16Array(buffer);
+	const shared = { value: 1 };
+	const set = new Set();
+	const holder = { collection: set, nested: [shared, view] };
+	holder.self = holder;
+	set.add(holder);
+	const map_value = { nested: [shared] };
+	const result = await unevalStream({
+		set,
+		map: new Map([[holder, map_value]]),
+		primitive_set: new Set([1, 'two']),
+		primitive_map: new Map([['one', 1], ['two', 2]]),
+		pending_shared: pending_shared.promise,
+		pending_view: pending_view.promise,
+		pending_buffer: pending_buffer.promise
+	}, undefined, { id: 'collection-mixed-descendants' });
+	const target = client();
+	const root = target.head(result.head);
+	pending_shared.resolve(shared);
+	pending_view.resolve(view);
+	pending_buffer.resolve(buffer);
+	let emitted = result.head;
+	for await (const block of result.tail) {
+		emitted += block;
+		target.block(block);
+	}
+	const revived_holder = Array.from(root.set)[0];
+	const revived_map_value = root.map.get(revived_holder);
+	assert.is(revived_holder.self, revived_holder);
+	assert.is(revived_holder.collection, root.set);
+	assert.is(Array.from(root.map.keys())[0], revived_holder);
+	assert.is(await root.pending_shared, revived_holder.nested[0]);
+	assert.is(await root.pending_shared, revived_map_value.nested[0]);
+	assert.is(await root.pending_view, revived_holder.nested[1]);
+	assert.is(await root.pending_buffer, revived_holder.nested[1].buffer);
+	assert.equal(Array.from(root.primitive_set), [1, 'two']);
+	assert.equal(Array.from(root.primitive_map.keys()), ['one', 'two']);
+	assert.is(root.primitive_map.get('one'), 1);
+	assert.is(root.primitive_map.get('two'), 2);
+	assert.is((result.head.match(/s\.c\[\d+\]=/g) ?? []).length, 2, result.head);
+	assert.not.match(emitted, /s\.s\[/);
+	assert.not.match(emitted, /Array\.from\(/);
+});
+
 test('preserves a typed view backing buffer across regions', async () => {
 	const pending = deferred();
 	const view = new Uint8Array([1, 2]);
