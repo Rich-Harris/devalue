@@ -81,7 +81,7 @@ class Session {
 	#started = 0;
 	/** Events collected during the current scheduled flush window. @type {Event[]} */
 	#batch = [];
-	/** Whether the current batch has been finalized and is ready to emit. @type {boolean} */
+	/** Whether the current batch is eligible to emit when the consumer takes it. @type {boolean} */
 	#batch_ready = false;
 	/** Wakes the tail generator when a batch is ready or the lifecycle changes. @type {(() => void) | undefined} */
 	#wake;
@@ -169,9 +169,8 @@ class Session {
 			this.#status = { state: 'streaming' };
 			// start observing the async sources
 			this.#start_sources();
-			// give them a 1-task window in which they can resolve to be batched into the initial body.
-			// Sources settle in microtasks after this point, so always wait at least one macrotask,
-			// then keep waiting while a flush is scheduled so the window matches tail batching.
+			// Give newly started sources the same host-scheduled flush window used by tail
+			// batching. This is an operational scheduling window, not a task-count guarantee.
 			do await macrotask();
 			while (this.#flushing && this.#is_active());
 			if (!this.#is_active()) return await this.#throw_failure(undefined);
@@ -823,7 +822,7 @@ class Session {
 		}
 	}
 
-	/** Finalizes the current events as one batch and wakes the tail. Events are already in observation order. */
+	/** Makes the current ordered events eligible for delivery and wakes the tail. */
 	#flush() {
 		this.#flushing = false;
 		this.#flush_handle = undefined;
@@ -833,7 +832,7 @@ class Session {
 	}
 
 	/**
-	 * Detaches the finalized batch so new events accumulate separately while it is delivered.
+	 * Takes the ready batch. Until this happens, later events may still join it.
 	 *
 	 * @returns {Event[]}
 	 */
@@ -1171,10 +1170,17 @@ class Session {
 					case 'Object': {
 						/** @type {Emission[]} */
 						const embedded = [];
+						let filling = false;
 						for (let i = 0; i < children.length; i++) {
 							const child = children[i];
-							if (available(child)) embedded.push(join_sources([`${literal_key(keys[i])}:`, expression_child(child)]));
-							else fill.push(join_sources([`${name}${prop(keys[i])}=`, expression_child(child)]));
+							if (!filling && available(child)) {
+								embedded.push(join_sources([`${literal_key(keys[i])}:`, expression_child(child)]));
+							} else {
+								// Once one key must wait for a later declaration, every following key is
+								// populated through ordered fills so no available value leapfrogs it.
+								filling = true;
+								fill.push(join_sources([`${name}${prop(keys[i])}=`, expression_child(child)]));
+							}
 						}
 						declarations.push(join_sources([`${name}={`, join_sources(embedded, ','), '}']));
 						break;
@@ -1380,7 +1386,7 @@ class Session {
 	}
 
 	/**
-	 * Generates ordered client operations for a finalized event batch. Emission is
+	 * Generates ordered client operations for a batch taken by the consumer. Emission is
 	 * transactional so a fatal failure publishes none of its provisional graph state.
 	 *
 	 * @param {Event[]} events
@@ -1595,7 +1601,7 @@ class Session {
 	}
 
 	/**
-	 * Creates the one-shot async iterator that renders finalized batches as executable
+	 * Creates the one-shot async iterator that renders ready batches as executable
 	 * blocks and drives sequence backpressure as each batch is dequeued.
 	 *
 	 * @returns {UnevalStreamTail}
@@ -1641,7 +1647,7 @@ class Session {
 	}
 
 	/**
-	 * Yields each finalized batch as an executable block, waiting for sources between
+	 * Yields each ready batch as an executable block, waiting for sources between
 	 * batches. Ends once every source has emitted its terminal operation, or once the session
 	 * is cancelled — after cleanup finishes, so consumers observe cleanup failures.
 	 *

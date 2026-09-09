@@ -166,9 +166,10 @@ export interface AsyncSequenceDescriptor<T = unknown, TReturn = unknown> {
 	type: 'async-sequence';
 	/**
 	 * The server-only sequence. `unevalStream` acquires its async iterator and pulls one value at a
-	 * time, but never serializes the source or iterator themselves.
+	 * time, but never serializes the source or iterator themselves. The third generic is `unknown`:
+	 * generated client updates provide no reverse-channel values to `next(value)`.
 	 */
-	source: AsyncIterable<T>;
+	source: AsyncIterable<T, TReturn, unknown>;
 	/**
 	 * Returns the source expression that synchronously constructs the client sequence before any
 	 * values are pulled from `source`. The native adapter creates a buffered `AsyncIterableIterator`
@@ -267,13 +268,20 @@ export interface UnevalStreamOptions {
 	onerror?: (error: unknown, value: unknown) => void;
 }
 
-/** A one-shot iterator of executable statement blocks. Evaluate every block in yield order. */
+/**
+ * A one-shot iterator of executable statement blocks for finite hydration. Evaluate every block in
+ * yield order. Pulling is bounded per source, but the transport and client may buffer delivered data.
+ */
 export interface UnevalStreamTail extends AsyncIterableIterator<string> {
 	[Symbol.asyncIterator](): UnevalStreamTail;
 	return(): Promise<IteratorResult<string, void>>;
 }
 
-/** Executable source for the initial graph plus the iterator that applies asynchronous updates. */
+/**
+ * Executable source for the initial graph plus the iterator that applies asynchronous updates.
+ * Identity paths and captured graph nodes are retained for the finite session. Inputs and reconstructed
+ * state must remain immutable until the tail completes and every delivered block has been evaluated.
+ */
 export interface UnevalStreamResult {
 	/** Self-contained JavaScript expression, for example `({answer:42})`. */
 	head: string;
