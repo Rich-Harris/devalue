@@ -141,7 +141,10 @@ export interface AsyncValueDescriptor<T = unknown> {
 	 * client `reject` function, and `reasonSource` evaluates to the reason from the server.
 	 */
 	reject(reference: ClientReference, reasonSource: JavaScriptSource): JavaScriptSource;
-	/** Optional server-side cancellation cleanup. */
+	/**
+	 * Optional server-side cancellation cleanup. Devalue invokes this at most once for explicit
+	 * `tail.return()` or AbortSignal cancellation, but not after successful completion.
+	 */
 	cancel?(): void | Promise<void>;
 }
 
@@ -209,8 +212,10 @@ export interface AsyncSequenceDescriptor<T = unknown, TReturn = unknown> {
 	 */
 	error(reference: ClientReference, reasonSource: JavaScriptSource): JavaScriptSource;
 	/**
-	 * Optional server-side cancellation cleanup. This does not generate client source; it runs when
-	 * `tail.return()` or the stream's AbortSignal cancels iteration, after attempting `iterator.return()`.
+	 * Optional server-side cancellation cleanup. This does not generate client source. On explicit
+	 * `tail.return()` or AbortSignal cancellation, devalue initiates `iterator.return()` and then this
+	 * hook, without awaiting one source before notifying the next. Each is invoked at most once. A
+	 * sequence event failure closes the iterator diagnostically but does not invoke this hook by itself.
 	 */
 	cancel?(): void | Promise<void>;
 }
@@ -238,14 +243,18 @@ export interface UnevalStreamOptions {
 	 * A collision-resistant key is generated otherwise.
 	 */
 	id?: string;
-	/** Cancels server-side observation and sequence pulling. */
+	/**
+	 * Cancels server-side observation and sequence pulling. The exact signal reason is authoritative,
+	 * including falsy reasons. Cleanup is cooperative: invoked return/cancel hooks are awaited, but an
+	 * outstanding `next()` is not, and native async generators may queue return behind that pull.
+	 */
 	signal?: AbortSignal;
 	/**
 	 * Diagnostic callback for recoverable failures the stream survives: an asynchronous
 	 * outcome that cannot be serialized (replaced by a generic client-side error; receives the
-	 * failure and the unserializable outcome), or a failed sequence's `return()` throwing
-	 * (receives the failure and the source iterable). Exceptions thrown by the callback are
-	 * ignored; the stream continues either way.
+	 * failure and the unserializable outcome), a failed sequence's nonblocking `return()` failure,
+	 * or cleanup failures secondary to an authoritative cancellation/generation reason (cleanup
+	 * diagnostics receive the failure and source). Exceptions thrown by the callback are ignored.
 	 */
 	onerror?: (error: unknown, value: unknown) => void;
 }

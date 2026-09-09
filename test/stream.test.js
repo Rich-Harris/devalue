@@ -45,12 +45,14 @@ const delay = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function rejects(promise, match) {
 	let error;
+	let did_reject = false;
 	try {
 		await promise;
 	} catch (caught) {
+		did_reject = true;
 		error = caught;
 	}
-	assert.ok(error);
+	assert.is(did_reject, true);
 	if (match instanceof RegExp) assert.match(error.message, match);
 	else if (match !== undefined) assert.is(error, match);
 	return error;
