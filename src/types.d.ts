@@ -91,7 +91,9 @@ export interface ClientReference {
 
 /**
  * Describes how to serialize an asynchronous value. `source` is the value
- * represented as a `Promise`.
+ * represented as a `Promise`. The built-in native Promise adapter immediately attaches a no-op
+ * rejection observer to its reconstructed Promise, but returns that original Promise unchanged so
+ * application handlers still receive the original rejection. Custom descriptors are not observed.
  */
 export interface AsyncValueDescriptor<T = unknown> {
 	type: 'async-value';
@@ -154,7 +156,11 @@ export interface AsyncValueDescriptor<T = unknown> {
  * Describes how to serialize an asynchronous sequence. The native AsyncIterable adapter constructs
  * a buffered client `AsyncIterableIterator`, captures a private function that updates its buffer,
  * then calls that function as the server iterator yields, returns, or throws. Custom descriptors can
- * use the same lifecycle with any synchronous client representation.
+ * use the same lifecycle with any synchronous client representation. The native adapter delivers
+ * buffered yields FIFO, then delivers the server return value or exact error once; subsequent reads
+ * complete with `undefined`. Local `return(value)` and `throw(reason)` discard buffered and terminal
+ * server state, settle pending reads with done/undefined or the exact reason respectively, and ignore
+ * later updates. They cannot close the server source because generated blocks have no reverse channel.
  */
 export interface AsyncSequenceDescriptor<T = unknown, TReturn = unknown> {
 	type: 'async-sequence';

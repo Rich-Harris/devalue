@@ -86,6 +86,8 @@ test('renders helper definitions before structured uses', () => {
 	const rendered = render_stream_source(source, source_helpers(source));
 	assert.ok(rendered.indexOf('s.w=') < rendered.indexOf('s.w(12)'));
 	assert.ok(rendered.indexOf('s.r=') < rendered.indexOf('s.r(12'));
+	assert.is((rendered.match(/s\.w=/g) ?? []).length, 1);
+	assert.is((rendered.match(/\.catch\(\(\)=>\{\}\)/g) ?? []).length, 1);
 });
 
 test('groups capture assignments', () => {
