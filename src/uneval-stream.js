@@ -10,14 +10,38 @@
  * } from './types.js'
  * @import { AsyncNode, CapturedGraph, CapturedNode, Child, ClientPath, ViewKind } from './graph.js'
  * @import { JavaScriptSource } from './javascript-source.js'
+ * @import { Emission } from './stream-source.js'
  */
 
 import { DevalueError, is_primitive, stringify_primitive, stringify_string } from './utils.js';
 import { child, create_captured_graph, discover, is_node, roll_back } from './graph.js';
-import { SOURCE, create_source, is_source, js, raw_source } from './javascript-source.js';
+import { is_source, js, raw_source } from './javascript-source.js';
+import {
+	RUNTIMES,
+	append_reference,
+	assert_descriptor_source,
+	capture_source,
+	count_source,
+	definitions_source,
+	describe_received,
+	expression_source,
+	join_sources,
+	map_source,
+	outcome_source,
+	promise_source,
+	reference_source,
+	reference_length,
+	render_reference,
+	render_stream_source,
+	runtime_source,
+	select_outcome_source,
+	source_helpers,
+	source_instructions,
+	source_values,
+	template_source
+} from './stream-source.js';
 
 const promise_then = Promise.prototype.then;
-const TOKEN_PATTERN = /"\d+"/g;
 
 const generic_error = js`new Error("devalue: failed to serialize asynchronous value")`;
 
@@ -77,12 +101,6 @@ class Session {
 	#slot = 0;
 	/** Next client collection index used for a retained Map or Set sidecar. @type {number} */
 	#collection = 0;
-	/** Next collision-proof placeholder id shared by every replacement phase. @type {number} */
-	#token = 0;
-	/** @type {Map<string, keyof typeof RUNTIMES>} */
-	#runtime_tokens = new Map();
-	/** @type {Map<string, number>} */
-	#promise_tokens = new Map();
 	/** Stable AbortSignal listener that forwards cancellation. @type {() => void} */
 	#abort;
 	/** Canonical captured node for the initial graph root. @type {CapturedNode | undefined} */
@@ -123,7 +141,10 @@ class Session {
 		signal?.addEventListener('abort', this.#abort, { once: true });
 	}
 
-	/** @param {unknown} value @returns {Promise<UnevalStreamResult>} */
+	/**
+	 * @param {unknown} value
+	 * @returns {Promise<UnevalStreamResult>}
+	 */
 	async serialize(value) {
 		try {
 			// walk the graph and capture the synchronous values and the first layer of async sources
@@ -136,7 +157,7 @@ class Session {
 		}
 
 		if (this.#sources.length === 0) {
-			return { head: this.#emit_region(value, false).source, tail: empty_tail(), id: this.#id };
+			return { head: render_stream_source(this.#emit_region(value, false)), tail: empty_tail(), id: this.#id };
 		}
 
 		// start observing the async sources
@@ -150,13 +171,18 @@ class Session {
 
 		try {
 			const head_region = this.#emit_region(value, true);
-			this.#assign_references(value, { root: 's.a[0]', segments: [] }, new Map());
+			this.#assign_references(value, { kind: 'anchor', index: 0, segments: [] }, new Map());
 			// anything that settled within the window is folded into the head rather than shipped as a block
-			const operations = this.#batch_ready ? await this.#deliver(this.#take_batch(), false) : '';
+			const operations = this.#batch_ready
+				? await this.#deliver(this.#take_batch(), false)
+				: undefined;
 
 			// if everything resolved in 1 task, then we ended up with a single batch, so we don't need to do anything else
 			if (this.#active === 0 && this.#batch.length === 0) {
-				return { head: this.#wrap_head(head_region, operations + this.#cleanup_source()), tail: empty_tail(), id: this.#id };
+				const final_operations = operations
+					? join_sources([operations, this.#cleanup_source()], ';')
+					: this.#cleanup_source();
+				return { head: this.#wrap_head(head_region, final_operations), tail: empty_tail(), id: this.#id };
 			}
 
 			this.#emit_dispatch = true;
@@ -168,64 +194,16 @@ class Session {
 	}
 
 	/**
-	 * Returns a placeholder for a session helper (`s.f`, `s.w`, `s.r`, `s.v`). The placeholder is
-	 * replaced — and the helper's definition shipped, at most once per session — when a
-	 * finished block is assembled, so definitions always precede uses in evaluation order
-	 * regardless of hoisting or discovery order.
+	 * Collects helpers reachable from a finished structured block, marks only those helpers
+	 * as emitted, and renders the block once with definitions at its explicit prelude point.
 	 *
-	 * @param {keyof typeof RUNTIMES} key
+	 * @param {Emission} source
 	 * @returns {string}
 	 */
-	#runtime_token(key) {
-		const token = this.#placeholder();
-		this.#runtime_tokens.set(token, key);
-		return token;
-	}
-
-	/**
-	 * Returns a placeholder for a native pending-promise construct. At block assembly it
-	 * is replaced with a call to the shared `s.w` helper.
-	 *
-	 * @param {number} pending
-	 * @returns {string}
-	 */
-	#promise_token(pending) {
-		const token = this.#placeholder();
-		this.#promise_tokens.set(token, pending);
-		return token;
-	}
-
-	/**
-	 * Replaces runtime and promise placeholders in finished block source, returning the
-	 * helper definitions that must be evaluated before it. Definitions are emitted at most
-	 * once per session.
-	 *
-	 * @param {string} source
-	 * @returns {{ defs: string[], source: string }}
-	 */
-	#resolve_runtime_declarations(source) {
-		/** @type {string[]} */
-		const defs = [];
-		if (this.#runtime_tokens.size === 0 && this.#promise_tokens.size === 0) return { defs, source };
-		/** @param {keyof typeof RUNTIMES} key */
-		const define = (key) => {
-			const emitted = this.#runtimes_emitted;
-			if (emitted[key]) return;
-			emitted[key] = true;
-			defs.push(`s.${key}=${RUNTIMES[key]}`);
-		};
-		const resolved = source.replace(TOKEN_PATTERN, (token) => {
-			const pending = this.#promise_tokens.get(token);
-			if (pending !== undefined) {
-				define('w');
-				return `s.w(${pending})`;
-			}
-			const key = this.#runtime_tokens.get(token);
-			if (!key) return token;
-			define(key);
-			return `s.${key}`;
-		});
-		return { defs, source: resolved };
+	#render_final(source) {
+		const definitions = source_helpers(source).filter((key) => !this.#runtimes_emitted[key]);
+		for (const key of definitions) this.#runtimes_emitted[key] = true;
+		return render_stream_source(source, definitions);
 	}
 
 	/**
@@ -328,21 +306,18 @@ class Session {
 				this.#new_custom.push(node);
 				return true;
 			}
-			if (result !== undefined && result !== null && result !== false) {
-				if (typeof result !== 'object' || !Object.hasOwn(result, 'type')) {
-					throw new TypeError('Invalid unevalStream replacer result');
-				}
-				if (result.type === 'async-value') {
-					this.#validate_value_descriptor(result);
-					this.#add_source(node, result, 'value');
-					return true;
-				}
-				if (result.type === 'async-sequence') {
-					this.#validate_sequence_descriptor(result);
-					this.#add_source(node, result, 'sequence');
-					return true;
-				}
-				throw new TypeError('Invalid unevalStream replacer result');
+			if (result === undefined || result === null || result === false) {
+				// Explicitly the complete fallback set. Every other result is validated below.
+			} else if (typeof result === 'object' && Object.hasOwn(result, 'type') && result.type === 'async-value') {
+				this.#validate_value_descriptor(result);
+				this.#add_source(node, result, 'value');
+				return true;
+			} else if (typeof result === 'object' && Object.hasOwn(result, 'type') && result.type === 'async-sequence') {
+				this.#validate_sequence_descriptor(result);
+				this.#add_source(node, result, 'sequence');
+				return true;
+			} else {
+				throw new TypeError(`Invalid unevalStream replacer result: received ${describe_received(result)}. Return a js tagged template, a descriptor with its own type of "async-value" or "async-sequence", or undefined, null, or false to serialize normally. The replacer must be synchronous; Promise results are not supported.`);
 			}
 		}
 
@@ -406,13 +381,15 @@ class Session {
 		const pending = this.#pending;
 		/** @param {JavaScriptSource} expression */
 		const control = (expression) => {
-			if (captured) throw new TypeError('devalue: capture may only be called once');
-			if (!is_source(expression)) throw new TypeError('Invalid async descriptor capture');
+			if (captured) throw new TypeError('devalue: capture may only be called once per async descriptor construct(); capture one js expression containing all private controls, such as js`[resolve,reject]`');
+			if (!is_source(expression)) throw new TypeError(`Invalid async descriptor capture: capture() received ${describe_received(expression)}. Pass an expression built with the js tagged template, not a raw value or source string.`);
+			assert_descriptor_source(expression, 'async descriptor capture()');
 			captured = true;
-			return hole_source({ type: 'capture', pending, source: expression });
+			return capture_source(pending, expression);
 		};
 		const source = descriptor.construct(control);
-		if (!is_source(source)) throw new TypeError('Invalid async descriptor construct result');
+		if (!is_source(source)) throw new TypeError(`Invalid async descriptor construct result: construct() returned ${describe_received(source)}. It must synchronously return a js tagged template representing the client construction expression.`);
+		assert_descriptor_source(source, 'async descriptor construct()');
 		this.#pending = pending + 1;
 		// `node` is reserved but unclassified; this call classifies it, so the cast records
 		// the mutation that TypeScript cannot follow.
@@ -442,7 +419,10 @@ class Session {
 		else if (source) source.early = [type, result];
 	}
 
-	/** @param {Promise<unknown>} promise @returns {AsyncValueDescriptor & { manages_pending: true }} */
+	/**
+	 * @param {Promise<unknown>} promise
+	 * @returns {AsyncValueDescriptor & { manages_pending: true }}
+	 */
 	#native_descriptor(promise) {
 		let pending = -1;
 		/**
@@ -453,7 +433,7 @@ class Session {
 		const settle = (reference, which, value) => {
 			const remaining = this.#native_pending--;
 			if (this.#runtimes_emitted.r || remaining >= 3) {
-				return js`${raw_source(this.#runtime_token('r'))}(${pending},${which},${value})`;
+				return js`${runtime_source('r')}(${pending},${which},${value})`;
 			}
 			return js`${reference.control}[${which}](${value});delete ${reference.control}`;
 		};
@@ -464,19 +444,22 @@ class Session {
 			construct: (capture) => {
 				capture(js`[a,b]`);
 				pending = this.#pending;
-				return raw_source(this.#promise_token(pending));
+				return promise_source(pending);
 			},
 			resolve: (reference, value) => settle(reference, 0, value),
 			reject: (reference, reason) => settle(reference, 1, reason)
 		};
 	}
 
-	/** @param {object} source @returns {AsyncSequenceDescriptor} */
+	/**
+	 * @param {object} source
+	 * @returns {AsyncSequenceDescriptor}
+	 */
 	#native_sequence_descriptor(source) {
 		return {
 			type: 'async-sequence',
 			source: /** @type {AsyncIterable<unknown, unknown, unknown>} */ (source),
-			construct: (capture) => js`${raw_source(this.#runtime_token('f'))}(g=>{${capture(js`g`)}})`,
+			construct: (capture) => js`${runtime_source('f')}(g=>{${capture(js`g`)}})`,
 			next: ({ control }, value) => js`${control}(0,${value})`,
 			complete: ({ control }, value) => js`${control}(1,${value})`,
 			error: ({ control }, reason) => js`${control}(2,${reason})`
@@ -489,14 +472,17 @@ class Session {
 	 * @param {any} descriptor
 	 */
 	#validate_value_descriptor(descriptor) {
-		if ((typeof descriptor.source !== 'object' || descriptor.source === null) && typeof descriptor.source !== 'function') {
-			throw new TypeError('Invalid async-value source');
+		const source = descriptor.source;
+		if ((typeof source !== 'object' || source === null) && typeof source !== 'function') {
+			throw new TypeError(`Invalid async-value source: received ${describe_received(source)}. The source must be a Promise or a Promise-like object or function with a callable then method.`);
 		}
 		for (const key of ['construct', 'resolve', 'reject']) {
-			if (typeof descriptor[key] !== 'function') throw new TypeError(`Invalid async-value ${key}`);
+			const method = descriptor[key];
+			if (typeof method !== 'function') throw new TypeError(`Invalid async-value ${key}: received ${describe_received(method)}. The descriptor must provide a ${key}() function.`);
 		}
-		if (descriptor.cancel !== undefined && typeof descriptor.cancel !== 'function') {
-			throw new TypeError('Invalid async-value cancel');
+		const cancel = descriptor.cancel;
+		if (cancel !== undefined && typeof cancel !== 'function') {
+			throw new TypeError(`Invalid async-value cancel: received ${describe_received(cancel)}. Omit cancel or provide a cleanup function.`);
 		}
 	}
 
@@ -506,14 +492,17 @@ class Session {
 	 * @param {any} descriptor
 	 */
 	#validate_sequence_descriptor(descriptor) {
-		if ((typeof descriptor.source !== 'object' || descriptor.source === null) && typeof descriptor.source !== 'function') {
-			throw new TypeError('Invalid async-sequence source');
+		const source = descriptor.source;
+		if ((typeof source !== 'object' || source === null) && typeof source !== 'function') {
+			throw new TypeError(`Invalid async-sequence source: received ${describe_received(source)}. The source must be an async iterable with a callable Symbol.asyncIterator method.`);
 		}
 		for (const key of ['construct', 'next', 'complete', 'error']) {
-			if (typeof descriptor[key] !== 'function') throw new TypeError(`Invalid async-sequence ${key}`);
+			const method = descriptor[key];
+			if (typeof method !== 'function') throw new TypeError(`Invalid async-sequence ${key}: received ${describe_received(method)}. The descriptor must provide a ${key}() function.`);
 		}
-		if (descriptor.cancel !== undefined && typeof descriptor.cancel !== 'function') {
-			throw new TypeError('Invalid async-sequence cancel');
+		const cancel = descriptor.cancel;
+		if (cancel !== undefined && typeof cancel !== 'function') {
+			throw new TypeError(`Invalid async-sequence cancel: received ${describe_received(cancel)}. Omit cancel or provide a cleanup function.`);
 		}
 	}
 
@@ -712,7 +701,7 @@ class Session {
 	 *
 	 * @param {Event[]} events
 	 * @param {boolean} block whether to wrap the operations as a standalone tail block
-	 * @returns {Promise<string>}
+	 * @returns {Promise<Emission>}
 	 */
 	async #deliver(events, block) {
 		let emitted;
@@ -733,7 +722,7 @@ class Session {
 		}
 		this.#start_unstarted();
 		this.#consume(events);
-		return emitted.source;
+		return block ? this.#render_final(emitted.source) : emitted.source;
 	}
 
 	/**
@@ -742,9 +731,14 @@ class Session {
 	 * @param {unknown} value
 	 * @param {boolean} persistent
 	 * @param {Set<CapturedNode>} [references]
-	 * @returns {{ source: string, tokens: Map<string, { node: CapturedNode, reference: ClientPath }> }}
+	 * @returns {Emission}
 	 */
 	#emit_region(value, persistent, references) {
+		// A primitive region has neither graph planning nor unresolved source dependencies.
+		if (is_primitive(value)) {
+			if (typeof value === 'symbol') throw this.#error('Cannot stringify a Symbol primitive', value);
+			return stringify_primitive(value);
+		}
 		const retained_references = this.#references;
 		const identities = this.#graph.identities;
 		const region_id = ++this.#region_id;
@@ -873,43 +867,40 @@ class Session {
 		let name_count = 0;
 		for (const node of order) if (node.hoisted) node.name = `v${name_count++}`;
 
-		/** @type {string[]} */
+		/** @type {Emission[]} */
 		const fill = [];
-		/** @type {string[]} */
+		/** @type {Emission[]} */
 		const sidecars = [];
-		/** @type {string[]} */
+		/** @type {Emission[]} */
 		const slots = [];
-		const tokens = new Map();
 		/**
 		 * Renders a raw value interpolated by a custom replacer template.
 		 *
 		 * @param {unknown} thing
-		 * @returns {string}
+		 * @returns {Emission}
 		 */
 		const expression = (thing) => {
-			if (is_primitive(thing)) return stringify_primitive(thing);
+			if (is_primitive(thing)) {
+				if (typeof thing === 'symbol') throw this.#error('Cannot stringify a Symbol primitive', thing);
+				return stringify_primitive(thing);
+			}
 			const node = identities.get(/** @type {object} */ (thing));
-			if (!node) throw this.#error('Cannot stringify value', thing);
+			if (!node) throw this.#error('Cannot stringify value: a custom template hole was not discovered in the captured graph; do not change template holes after the replacer returns', thing);
 			return expression_node(node);
 		};
 		/**
 		 * @param {CapturedNode} node
-		 * @returns {string}
+		 * @returns {Emission}
 		 */
 		const expression_node = (node) => {
 			const retained = retained_references.get(node);
 			if (retained && node.region_id !== region_id) {
-				if (references) {
-					references.add(node);
-					const token = this.#placeholder();
-					tokens.set(token, { node, reference: retained });
-					return token;
-				}
-				return render_reference(retained);
+				references?.add(node);
+				return reference_source(node, retained);
 			}
 			if (node.region_id === region_id && node.name) return node.name;
 			// `rendering` guards against unexpected re-entry while expanding inline.
-			if (node.rendering) throw this.#error('Cannot stringify value', node.value);
+			if (node.rendering) throw this.#error('Cannot stringify value: inline construction re-entered the same node without a declared reference (internal emitter error)', node.value);
 			node.rendering = true;
 			try {
 				return inline(node);
@@ -918,57 +909,63 @@ class Session {
 			}
 		};
 		/** @param {Child} child */
-		const expression_child = (child) => is_node(child) ? expression_node(child) : stringify_primitive(child);
+		const expression_child = (child) => {
+			if (is_node(child)) return expression_node(child);
+			if (typeof child === 'symbol') throw this.#error('Cannot stringify a Symbol primitive', child);
+			return stringify_primitive(child);
+		};
 
 		/** @param {Child[]} children */
-		const set_literal = (children) => children.length ? `new Set([${children.map(expression_child).join(',')}])` : 'new Set';
+		const set_literal = (children) => children.length
+			? join_sources(['new Set([', join_sources(children.map(expression_child), ','), '])'])
+			: 'new Set';
 		/** @param {Child[]} children */
 		const map_literal = (children) => {
 			if (children.length === 0) return 'new Map';
-			let result = 'new Map([';
+			/** @type {Emission[]} */
+			const entries = [];
 			for (let i = 0; i < children.length; i += 2) {
-				if (i) result += ',';
-				result += `[${expression_child(children[i])},${expression_child(children[i + 1])}]`;
+				entries.push(join_sources(['[', expression_child(children[i]), ',', expression_child(children[i + 1]), ']']));
 			}
-			return result + '])';
+			return join_sources(['new Map([', join_sources(entries, ','), '])']);
 		};
 
 		/**
 		 * Emits the full construction of a single-use node at its use site.
 		 *
 		 * @param {CapturedNode} node
-		 * @returns {string}
+		 * @returns {Emission}
 		 */
 		const inline = (node) => {
 			const children = node.children;
 			switch (node.kind) {
 				case 'Array':
-					return `[${children.map(expression_child).join(',')}]`;
+					return join_sources(['[', join_sources(children.map(expression_child), ','), ']']);
 				case 'Object': {
 					const keys = node.keys;
-					let result = '{';
+					/** @type {Emission[]} */
+					const properties = [];
 					for (let i = 0; i < keys.length; i++) {
-						if (i) result += ',';
-						result += `${literal_key(keys[i])}:${expression_child(children[i])}`;
+						properties.push(join_sources([`${literal_key(keys[i])}:`, expression_child(children[i])]));
 					}
-					return result + '}';
+					return join_sources(['{', join_sources(properties, ','), '}']);
 				}
 				case 'Set':
 					return set_literal(children);
 				case 'Map':
 					return map_literal(children);
 				case 'Async':
-					return render_descriptor_source(node.data.source);
+					return expression_source(node.data.source);
 				case 'Custom':
-					return render_source(node.data, expression);
+					return expression_source(map_source(node.data, expression));
 				default:
 					return scalar(node, expression_child);
 			}
 		};
 
-		/** @type {string[]} */
+		/** @type {Emission[]} */
 		const early_declarations = [];
-		/** @type {string[]} */
+		/** @type {Emission[]} */
 		const declarations = [];
 		for (const node of order) {
 			const name = node.name;
@@ -979,23 +976,23 @@ class Session {
 				switch (node.kind) {
 					case 'Array':
 						early_declarations.push(`${name}=Array(${node.data})`);
-						for (let i = 0; i < keys.length; i++) fill.push(`${name}[${keys[i]}]=${expression_child(children[i])}`);
+						for (let i = 0; i < keys.length; i++) fill.push(join_sources([`${name}[${keys[i]}]=`, expression_child(children[i])]));
 						break;
 					case 'Object':
 					case 'NullObject':
 						early_declarations.push(`${name}=${node.kind === 'NullObject' ? 'Object.create(null)' : '{}'}`);
-						for (let i = 0; i < keys.length; i++) fill.push(`${name}${prop(keys[i])}=${expression_child(children[i])}`);
+						for (let i = 0; i < keys.length; i++) fill.push(join_sources([`${name}${prop(keys[i])}=`, expression_child(children[i])]));
 						break;
 					case 'Set':
 						early_declarations.push(`${name}=new Set`);
-						for (let i = 0; i < children.length; i++) fill.push(`${name}.add(${expression_child(children[i])})`);
+						for (let i = 0; i < children.length; i++) fill.push(join_sources([`${name}.add(`, expression_child(children[i]), ')']));
 						break;
 					case 'Map':
 						early_declarations.push(`${name}=new Map`);
-						for (let i = 0; i < children.length; i += 2) fill.push(`${name}.set(${expression_child(children[i])},${expression_child(children[i + 1])})`);
+						for (let i = 0; i < children.length; i += 2) fill.push(join_sources([`${name}.set(`, expression_child(children[i]), ',', expression_child(children[i + 1]), ')']));
 						break;
 					default:
-						throw this.#error('Cannot stringify value', node.value);
+						throw this.#error(`Cannot stringify value: a ${node.kind} node was scheduled for empty construction, but only mutable containers support it (internal emitter error)`, node.value);
 				}
 			} else if (name) {
 				// A child can be embedded in this declaration if its expansion never reaches
@@ -1007,58 +1004,61 @@ class Session {
 					case 'Array': {
 						if (is_sparse(node)) {
 							declarations.push(`${name}=Array(${node.data})`);
-							for (let i = 0; i < keys.length; i++) fill.push(`${name}[${keys[i]}]=${expression_child(children[i])}`);
+							for (let i = 0; i < keys.length; i++) fill.push(join_sources([`${name}[${keys[i]}]=`, expression_child(children[i])]));
 							break;
 						}
+						/** @type {Emission[]} */
 						const parts = [];
 						for (let i = 0; i < children.length; i++) {
 							const child = children[i];
 							if (available(child)) parts.push(expression_child(child));
 							else {
 								parts.push('');
-								fill.push(`${name}[${keys[i]}]=${expression_child(child)}`);
+								fill.push(join_sources([`${name}[${keys[i]}]=`, expression_child(child)]));
 							}
 						}
 						// A trailing elision needs one extra comma to preserve length.
-						declarations.push(`${name}=[${parts.join(',')}${parts.length && parts[parts.length - 1] === '' ? ',' : ''}]`);
+						const trailing = parts.length && !available(children[children.length - 1]) ? ',' : '';
+						declarations.push(join_sources([`${name}=[`, join_sources(parts, ','), `${trailing}]`]));
 						break;
 					}
 					case 'Object': {
+						/** @type {Emission[]} */
 						const embedded = [];
 						for (let i = 0; i < children.length; i++) {
 							const child = children[i];
-							if (available(child)) embedded.push(`${literal_key(keys[i])}:${expression_child(child)}`);
-							else fill.push(`${name}${prop(keys[i])}=${expression_child(child)}`);
+							if (available(child)) embedded.push(join_sources([`${literal_key(keys[i])}:`, expression_child(child)]));
+							else fill.push(join_sources([`${name}${prop(keys[i])}=`, expression_child(child)]));
 						}
-						declarations.push(`${name}={${embedded.join(',')}}`);
+						declarations.push(join_sources([`${name}={`, join_sources(embedded, ','), '}']));
 						break;
 					}
 					case 'NullObject': {
 						declarations.push(`${name}=Object.create(null)`);
-						for (let i = 0; i < keys.length; i++) fill.push(`${name}${prop(keys[i])}=${expression_child(children[i])}`);
+						for (let i = 0; i < keys.length; i++) fill.push(join_sources([`${name}${prop(keys[i])}=`, expression_child(children[i])]));
 						break;
 					}
 					case 'Set': {
 						// Insertion order is observable, so embed only when every member is ready.
 						if (children.every(available)) {
-							declarations.push(`${name}=${set_literal(children)}`);
+							declarations.push(join_sources([`${name}=`, set_literal(children)]));
 						} else {
 							declarations.push(`${name}=new Set`);
-							for (let i = 0; i < children.length; i++) fill.push(`${name}.add(${expression_child(children[i])})`);
+							for (let i = 0; i < children.length; i++) fill.push(join_sources([`${name}.add(`, expression_child(children[i]), ')']));
 						}
 						break;
 					}
 					case 'Map': {
 						if (children.every(available)) {
-							declarations.push(`${name}=${map_literal(children)}`);
+							declarations.push(join_sources([`${name}=`, map_literal(children)]));
 						} else {
 							declarations.push(`${name}=new Map`);
-							for (let i = 0; i < children.length; i += 2) fill.push(`${name}.set(${expression_child(children[i])},${expression_child(children[i + 1])})`);
+							for (let i = 0; i < children.length; i += 2) fill.push(join_sources([`${name}.set(`, expression_child(children[i]), ',', expression_child(children[i + 1]), ')']));
 						}
 						break;
 					}
 					default:
-						declarations.push(`${name}=${inline(node)}`);
+						declarations.push(join_sources([`${name}=`, inline(node)]));
 				}
 			}
 			if (persistent && (node.kind === 'Set' || node.kind === 'Map')) {
@@ -1072,9 +1072,9 @@ class Session {
 				}
 				if (elements.length) {
 					const index = this.#collection++;
-					sidecars.push(`s.c[${index}]=[${elements.map(expression_node).join(',')}]`);
+					sidecars.push(join_sources([`s.c[${index}]=[`, join_sources(elements.map(expression_node), ','), ']']));
 					for (let i = 0; i < elements.length; i++) {
-						this.#reference_node(elements[i], { root: `s.c[${index}]`, segments: [`[${i}]`] });
+						this.#reference_node(elements[i], { kind: 'collection', index, segments: [`[${i}]`] });
 					}
 				}
 			}
@@ -1087,20 +1087,21 @@ class Session {
 				const index = this.#slot++;
 				slots.push(`s.s[${index}]=${node.name}`);
 				/** @type {ClientPath} */
-				const reference = { root: `s.s[${index}]`, segments: [] };
+				const reference = { kind: 'slot', index, segments: [] };
 				this.#reference_node(node, reference);
 				this.#assign_references(node.value, reference, new Map());
 			}
 		}
 		const all_declarations = early_declarations.concat(declarations);
 		const statements = [
-			...(all_declarations.length ? [`let ${all_declarations.join(',')}`] : []),
+			...(all_declarations.length ? [join_sources(['let ', join_sources(all_declarations, ',')])] : []),
 			...fill,
 			...sidecars,
 			...slots
 		];
-		const body = [...statements, `return ${root}`].join(';');
-		return { source: statements.length ? `(()=>{${body}})()` : root, tokens };
+		return statements.length
+			? join_sources(['(()=>{', join_sources([...statements, join_sources(['return ', root])], ';'), '})()'])
+			: root;
 	}
 
 	/**
@@ -1121,13 +1122,20 @@ class Session {
 	 * was created, or else the node's shortest committed path. Every node that reaches
 	 * a batch has been anchored by an earlier region, so a miss is an internal error.
 	 *
-	 * @param {ReferenceHole} hole
+	 * @param {import('./stream-source.js').ReferenceInstruction} hole
 	 * @returns {ClientPath}
 	 */
 	#resolve_reference(hole) {
-		const reference = hole.reference ?? this.#references.get(hole.node);
-		if (!reference) throw this.#error('Cannot stringify value', hole.node.value);
+		const reference = hole.path ?? this.#references.get(hole.node);
+		if (!reference) throw this.#error('Cannot stringify value: a client identity has no retained anchor, slot, or collection path before operation generation (internal emitter error)', hole.node.value);
 		return reference;
+	}
+
+	/** Resolves every reachable structured reference before final rendering. @param {Emission} source */
+	#resolve_references(source) {
+		for (const instruction of source_instructions(source)) {
+			if (instruction.type === 'reference') instruction.path = this.#resolve_reference(instruction);
+		}
 	}
 
 	/**
@@ -1174,26 +1182,22 @@ class Session {
 	 * Wraps the head region with client table and session initialization, folding any
 	 * pre-head operations (initial batches, cleanup) into the same closure.
 	 *
-	 * @param {{ source: string }} region
-	 * @param {string} [operations]
+	 * @param {Emission} region
+	 * @param {Emission} [operations]
 	 * @returns {string}
 	 */
-	#wrap_head(region, operations = '') {
+	#wrap_head(region, operations) {
 		const scope = this.#scope;
 		const id = stringify_string(this.#id);
 		// The dispatch helper is only defined when a tail exists; every tail block calls
 		// it to receive `s`/`n`, replacing a longer per-block lookup preamble.
 		const dispatch = this.#emit_dispatch ? ';s.b=f=>f(s,n)' : '';
-		const table = `let n=${scope}||(${scope}={__proto__:null}),s=n[${id}]={a:[],s:[],c:[],p:[]}${dispatch}`;
-		// Resolve in evaluation order: the root region runs before folded operations.
-		const resolved_region = this.#resolve_runtime_declarations(region.source);
-		const resolved_operations = this.#resolve_runtime_declarations(operations);
-		const defs = resolved_region.defs.concat(resolved_operations.defs);
-		const prelude = defs.length ? `;${defs.join(';')}` : '';
-		operations = resolved_operations.source;
-		if (!operations) return `(()=>{${table}${prelude};return s.a[0]=${resolved_region.source}})()`;
-		if (!operations.endsWith(';')) operations += ';';
-		return `(()=>{${table}${prelude};let r=s.a[0]=${resolved_region.source};${operations}return r})()`;
+		const table = `let n=${scope}||(${scope}={__proto__:null}),s=n[${id}]={a:[],s:[],c:[],p:[]}${dispatch};`;
+		const definitions = definitions_source();
+		const source = operations === undefined
+			? join_sources(['(()=>{', table, definitions, ';return s.a[0]=', region, '})()'])
+			: join_sources(['(()=>{', table, definitions, ';let r=s.a[0]=', region, ';', operations, ';return r})()']);
+		return this.#render_final(source);
 	}
 
 	/**
@@ -1212,11 +1216,11 @@ class Session {
 	 *
 	 * @param {Event[]} events
 	 * @param {boolean} block
-	 * @returns {{ source: string, close: Source[] }}
+	 * @returns {{ source: Emission, close: Source[] }}
 	 */
 	#emit_batch(events, block = true) {
 		const prefix = block ? `;${this.#scope}[${stringify_string(this.#id)}].b((s,n)=>{` : '';
-		/** @type {JavaScriptSource[]} */
+		/** @type {Emission[]} */
 		const operations = [];
 		/** @type {Set<CapturedNode>} */
 		const references = new Set();
@@ -1226,7 +1230,7 @@ class Session {
 			const source = event.source;
 			const node = source.node;
 			references.add(node);
-			const target = source_reference(node, this.#references.get(node));
+			const target = reference_source(node, this.#references.get(node));
 			const control = node.data.captured ? raw_source(`s.p[${node.data.pending}]`) : undefined;
 			const reference = {
 				target,
@@ -1234,22 +1238,16 @@ class Session {
 			};
 			/** @type {JavaScriptSource} */
 			let value_source;
-			/** @type {{ source: OutcomeHole, write: string, folded: string } | undefined} */
+			/** @type {{ source: JavaScriptSource, write: Emission } | undefined} */
 			let anchor;
 			if (!event.invalid) {
 				// Persistent: async outcomes must retain Map/Set element and opaque custom
 				// child identities for future regions, exactly like the head region.
 				const region = this.#emit_region(event.value, true, references);
-				value_source = region_source(region);
-				const rendered_region = render_fragment(value_source, (value) => {
-					if (is_internal_hole(value) && value.type === 'reference') {
-						return render_reference(this.#resolve_reference(value));
-					}
-					return render_fragment_hole(value);
-				});
+				this.#resolve_references(region);
 				if (!is_primitive(event.value)) {
 					const index = this.#anchor++;
-					this.#assign_references(event.value, { root: `s.a[${index}]`, segments: [] }, new Map());
+					this.#assign_references(event.value, { kind: 'anchor', index, segments: [] }, new Map());
 					const name = `s.a[${index}]`;
 					// Implicit anchoring: anchor indices are allocated monotonically and every
 					// allocated index is written exactly once in allocation order, so once the
@@ -1258,15 +1256,17 @@ class Session {
 					// writes before the switch keep `s.a` dense, so mixing both forms is safe.
 					const use_helper = this.#runtimes_emitted.v || index > 5;
 					const write = use_helper
-						? `${this.#runtime_token('v')}(${rendered_region})`
-						: `${name}=${rendered_region}`;
+						? join_sources([runtime_source('v'), '(', region, ')'])
+						: join_sources([name, '=', region]);
 					// Defer the anchor write: when the operation uses the value exactly
 					// once, the write is folded into that use site. A helper call is a
 					// primary expression; only the assignment form needs parentheses.
-					/** @type {OutcomeHole} */
-					const outcome = { type: 'outcome', source: value_source, anchored: name, folded: use_helper ? write : `(${write})` };
-					anchor = { source: outcome, write, folded: outcome.folded };
-					value_source = hole_source(outcome);
+					const folded = use_helper ? write : join_sources(['(', write, ')']);
+					const outcome = outcome_source(region, name, folded);
+					anchor = { source: outcome, write };
+					value_source = outcome;
+				} else {
+					value_source = template_source(region);
 				}
 			} else {
 				value_source = generic_error;
@@ -1279,12 +1279,13 @@ class Session {
 				else if (event.type === 'next') operation = source.descriptor.next(reference, value_source);
 				else if (event.type === 'complete') operation = source.descriptor.complete(reference, value_source);
 				else operation = source.descriptor.error(reference, value_source);
-				if (!is_source(operation)) throw new TypeError('Invalid async descriptor operation');
+				if (!is_source(operation)) throw new TypeError(`Invalid async descriptor operation: ${event.type}() returned ${describe_received(operation)}. It must synchronously return a js tagged template containing client statements; use js\`\` for an empty operation.`);
+				assert_descriptor_source(operation, `async descriptor ${event.type}()`);
 				if (anchor) {
-					if (count_source(operation, anchor.source) === 1) anchor.source.render = anchor.folded;
+					if (count_source(operation, anchor.source) === 1) select_outcome_source(anchor.source, 'folded');
 					else {
-						operations.push(raw_source(anchor.write));
-						anchor.source.render = anchor.source.anchored;
+						operations.push(anchor.write);
+						select_outcome_source(anchor.source, 'anchored');
 					}
 				}
 				operations.push(operation);
@@ -1293,11 +1294,12 @@ class Session {
 					this.#report(error, event.value);
 					// The outcome's identities were assigned anchor references, so the anchor
 					// must still ship even though the operation falls back to a generic error.
-					if (anchor) operations.push(raw_source(anchor.write));
+					if (anchor) operations.push(anchor.write);
 					const fallback = source.type === 'sequence'
 						? source.descriptor.error(reference, generic_error)
 						: source.descriptor.reject(reference, generic_error);
-					if (!is_source(fallback)) throw new TypeError('Invalid async descriptor operation');
+					if (!is_source(fallback)) throw new TypeError(`Invalid async descriptor operation: fallback ${source.type === 'sequence' ? 'error' : 'reject'}() returned ${describe_received(fallback)}. It must synchronously return a js tagged template containing client statements; use js\`\` for an empty operation.`);
+					assert_descriptor_source(fallback, source.type === 'sequence' ? 'async descriptor fallback error()' : 'async descriptor fallback reject()');
 					operations.push(fallback);
 					event.type = source.type === 'sequence' ? 'error' : 'reject';
 				} else {
@@ -1305,7 +1307,7 @@ class Session {
 				}
 			}
 			if (event.type !== 'next' && node.data.captured && !source.descriptor.manages_pending) {
-				operations.push(raw_source(`delete s.p[${node.data.pending}]`));
+				operations.push(`delete s.p[${node.data.pending}]`);
 			}
 			if (event.type !== 'next') {
 				this.#active--;
@@ -1316,24 +1318,20 @@ class Session {
 		if (block && this.#active === 0 && this.#batch.length === 0) {
 			rendered.push(this.#cleanup_source());
 		}
-		let body = rendered.join(';');
-		if (block) {
-			// Standalone blocks are final output; resolve helper placeholders here so every
-			// definition is evaluated in the same block as (and before) its first use.
-			// Head-folded operations are resolved later by wrap_head instead.
-			const resolved = this.#resolve_runtime_declarations(body);
-			body = resolved.defs.length ? `${resolved.defs.join(';')};${resolved.source}` : resolved.source;
-		}
-		return { source: prefix + body + (block ? '})' : rendered.length ? ';' : ''), close };
+		const body = join_sources(rendered, ';');
+		const structured = block
+			? join_sources([prefix, definitions_source(), ';', body, '})'])
+			: rendered.length ? join_sources([';', body]) : '';
+		return { source: structured, close };
 	}
 
 	/**
 	 * Creates persistent client-slot aliases for repeated long paths when profitable in
 	 * this batch, then retains those aliases as the nodes' shortest references.
 	 *
-	 * @param {JavaScriptSource[]} operations
+	 * @param {Emission[]} operations
 	 * @param {Set<CapturedNode>} references
-	 * @returns {string[]}
+	 * @returns {Emission[]}
 	 */
 	#render_operations(operations, references) {
 		/** @type {Map<CapturedNode, number>} */
@@ -1341,11 +1339,11 @@ class Session {
 		/** @type {Map<CapturedNode, ClientPath>} */
 		const imported_references = new Map();
 		for (const operation of operations) {
-			for (const value of source_holes(operation)) {
-				if (!is_internal_hole(value) || value.type !== 'reference') continue;
+			for (const value of source_instructions(operation)) {
+				if (value.type !== 'reference') continue;
 				uses.set(value.node, (uses.get(value.node) ?? 0) + 1);
-				if (value.reference && !imported_references.has(value.node)) {
-					imported_references.set(value.node, value.reference);
+				if (value.path && !imported_references.has(value.node)) {
+					imported_references.set(value.node, value.path);
 				}
 			}
 		}
@@ -1353,53 +1351,33 @@ class Session {
 		const candidates = [];
 		for (const node of references) {
 			const reference = this.#references.get(node);
-			if (!reference || reference.root.startsWith('s.s[')) continue;
+			if (!reference || reference.kind === 'slot') continue;
 			const path = render_reference(imported_references.get(node) ?? reference);
 			const count = uses.get(node) ?? 0;
 			if (count < 2) continue;
 			candidates.push({ node, path, uses: count });
 		}
 		candidates.sort((a, b) => b.path.length - a.path.length);
-		/** @type {Map<CapturedNode, string>} */
+		/** @type {Map<CapturedNode, ClientPath>} */
 		const aliases = new Map();
 		/** @type {string[]} */
 		const prefix = [];
 		for (const { node, path, uses } of candidates) {
-			const slot = `s.s[${this.#slot}]`;
-			if (`${slot}=${path};`.length + slot.length * uses >= path.length * uses) continue;
+			const reference = { kind: /** @type {const} */ ('slot'), index: this.#slot, segments: [] };
+			const slot = render_reference(reference);
+			if (reference_length(reference) + 1 + path.length + 1 + reference_length(reference) * uses >= path.length * uses) continue;
 			this.#slot++;
 			prefix.push(`${slot}=${path}`);
-			aliases.set(node, slot);
-			this.#references.set(node, { root: slot, segments: [] });
+			aliases.set(node, reference);
+			this.#references.set(node, reference);
 		}
-		/**
-		 * @param {unknown} value
-		 * @returns {string}
-		 */
-		const render = (value) => {
-			if (is_internal_hole(value)) {
-				if (value.type === 'reference') {
-					return aliases.get(value.node) ?? render_reference(this.#resolve_reference(value));
-				}
-				if (value.type === 'capture') {
-					const source = render_fragment(value.source, render);
-					return `s.p[${value.pending}]=${needs_parentheses(source) ? `(${source})` : source}`;
-				}
-				return value.render ?? render_fragment(value.source, render);
+		for (const operation of operations) {
+			for (const instruction of source_instructions(operation)) {
+				if (instruction.type !== 'reference') continue;
+				instruction.path = aliases.get(instruction.node) ?? this.#resolve_reference(instruction);
 			}
-			return render_fragment_hole(value);
-		};
-		return prefix.concat(operations.map((operation) => render_fragment(operation, render)));
-	}
-
-	/**
-	 * Returns a quoted numeric source token. A real string containing the same quote
-	 * characters escapes them when serialized, so it cannot contain this exact source.
-	 *
-	 * @returns {string}
-	 */
-	#placeholder() {
-		return `"${this.#token++}"`;
+		}
+		return /** @type {Emission[]} */ (prefix).concat(operations);
 	}
 
 	/**
@@ -1464,7 +1442,7 @@ class Session {
 				return;
 			}
 			if (this.#active === 0) return;
-			yield await this.#deliver(this.#take_batch(), true);
+			yield /** @type {string} */ (await this.#deliver(this.#take_batch(), true));
 		}
 	}
 
@@ -1587,8 +1565,8 @@ class Session {
  * Emits a constructor expression for a captured non-container built-in.
  *
  * @param {CapturedNode} node
- * @param {(child: Child) => string} expression
- * @returns {string}
+ * @param {(child: Child) => Emission} expression
+ * @returns {Emission}
  */
 function scalar(node, expression) {
 	switch (node.kind) {
@@ -1611,7 +1589,7 @@ function scalar(node, expression) {
 			// Native TypedArray join; avoids materializing a JS number array first.
 			return `new Uint8Array([${node.data.toString()}]).buffer`;
 		case 'DataView': {
-			return `new DataView(${expression(node.children[0])},${node.data.byteOffset},${node.data.byteLength})`;
+			return join_sources(['new DataView(', expression(node.children[0]), `,${node.data.byteOffset},${node.data.byteLength})`]);
 		}
 		case 'Temporal.Duration':
 		case 'Temporal.Instant':
@@ -1624,7 +1602,7 @@ function scalar(node, expression) {
 			return `${node.kind}.from(${stringify_string(node.data)})`;
 		default:
 			if (is_view(node)) {
-				return `new ${node.kind}(${expression(node.children[0])},${node.data.byteOffset},${node.data.length})`;
+				return join_sources([`new ${node.kind}(`, expression(node.children[0]), `,${node.data.byteOffset},${node.data.length})`]);
 			}
 			throw new Error(`Unknown stream node ${node.kind}`);
 	}
@@ -1676,157 +1654,6 @@ function prop(key) {
 }
 
 /**
- * Wraps a single internal hole as a source with no surrounding text.
- *
- * @param {InternalHole} hole
- * @returns {JavaScriptSource}
- */
-function hole_source(hole) {
-	return create_source(['', ''], [hole]);
-}
-
-/** @param {CapturedNode} node @param {ClientPath | undefined} reference @returns {JavaScriptSource} */
-function source_reference(node, reference) {
-	return hole_source({ type: 'reference', node, reference });
-}
-
-/** @param {{ source: string, tokens: Map<string, { node: CapturedNode, reference: ClientPath }> }} region */
-function region_source(region) {
-	if (region.tokens.size === 0) return raw_source(region.source);
-	/** @type {string[]} */
-	const strings = [];
-	/** @type {ReferenceHole[]} */
-	const values = [];
-	let index = 0;
-	for (const match of region.source.matchAll(TOKEN_PATTERN)) {
-		const token = match[0];
-		const reference = region.tokens.get(token);
-		if (!reference) continue;
-		strings.push(region.source.slice(index, match.index));
-		values.push({ type: 'reference', ...reference });
-		index = match.index + token.length;
-	}
-	strings.push(region.source.slice(index));
-	return create_source(strings, values);
-}
-
-/**
- * Returns ordinary value holes reachable through nested source fragments.
- *
- * @param {JavaScriptSource} source
- * @returns {unknown[]}
- */
-function source_values(source) {
-	/** @type {unknown[]} */
-	const values = [];
-	for (const value of source[SOURCE].values) {
-		if (is_source(value)) values.push(...source_values(value));
-		else if (!is_internal_hole(value)) values.push(value);
-	}
-	return values;
-}
-
-/**
- * Returns every hole reachable through nested source fragments, descending into outcomes.
- *
- * @param {JavaScriptSource} source
- * @returns {unknown[]}
- */
-function source_holes(source) {
-	/** @type {unknown[]} */
-	const values = [];
-	for (const value of source[SOURCE].values) {
-		if (is_source(value)) values.push(...source_holes(value));
-		else if (is_internal_hole(value) && value.type === 'outcome') values.push(...source_holes(value.source));
-		else values.push(value);
-	}
-	return values;
-}
-
-/** @param {JavaScriptSource} source @param {unknown} target */
-function count_source(source, target) {
-	let count = 0;
-	for (const value of source[SOURCE].values) {
-		if (value === target) count++;
-		else if (is_source(value)) count += count_source(value, target);
-	}
-	return count;
-}
-
-/**
- * @param {JavaScriptSource} source
- * @param {(value: unknown) => string} render
- * @returns {string}
- */
-function render_fragment(source, render) {
-	const { strings, values } = source[SOURCE];
-	let result = strings[0];
-	for (let i = 0; i < values.length; i++) {
-		const value = values[i];
-		result += is_source(value) ? render_fragment(value, render) : render(value);
-		result += strings[i + 1];
-	}
-	return result;
-}
-
-/**
- * Renders a user-interpolated hole. Internal holes are handled by the caller before
- * reaching here, so anything non-primitive is an invalid interpolation.
- *
- * @param {unknown} value
- */
-function render_fragment_hole(value) {
-	if (is_primitive(value)) return stringify_primitive(value);
-	throw new TypeError('Invalid JavaScript source interpolation');
-}
-
-/**
- * @param {unknown} value
- * @returns {value is InternalHole}
- */
-function is_internal_hole(value) {
-	if (typeof value !== 'object' || value === null || !('type' in value)) return false;
-	const type = value.type;
-	return type === 'reference' || type === 'capture' || type === 'outcome';
-}
-
-/** @param {JavaScriptSource} source @param {(value: unknown) => string} expression */
-function render_source(source, expression) {
-	return render_fragment(source, (value) => expression(value));
-}
-
-/**
- * @param {JavaScriptSource} source
- * @returns {string}
- */
-function render_descriptor_source(source) {
-	return render_fragment(source, (value) => {
-		if (is_internal_hole(value) && value.type === 'capture') {
-			const captured = render_descriptor_source(value.source);
-			return `s.p[${value.pending}]=${needs_parentheses(captured) ? `(${captured})` : captured}`;
-		}
-		if (is_primitive(value)) return stringify_primitive(value);
-		throw new TypeError('Invalid JavaScript source interpolation');
-	});
-}
-
-/** Bare identifiers and bracketed identifier lists, e.g. `g` or `[a,b]`. */
-const SAFE_CAPTURE_EXPRESSION = /^(?:[A-Za-z_$][\w$]*|\[[A-Za-z_$][\w$]*(?:,[A-Za-z_$][\w$]*)*\])$/;
-
-/**
- * Reports whether a captured expression must be parenthesized before being assigned.
- * Parentheses never change the meaning of a well-formed expression, so anything that is
- * not provably safe (the only under-wrapping hazard is a top-level comma, but classifying
- * arbitrary JavaScript requires a parser) is wrapped.
- *
- * @param {string} expression
- * @returns {boolean}
- */
-function needs_parentheses(expression) {
-	return !SAFE_CAPTURE_EXPRESSION.test(expression);
-}
-
-/**
  * Emits the shortest safe object-literal key for a string key.
  *
  * @param {string} key
@@ -1835,63 +1662,6 @@ function needs_parentheses(expression) {
 function literal_key(key) {
 	return /^[_$a-zA-Z][_$a-zA-Z0-9]*$/.test(key) ? key : stringify_string(key);
 }
-
-/**
- * Returns a structured client reference with one additional path segment.
- *
- * @param {ClientPath} reference
- * @param {string} segment
- * @returns {ClientPath}
- */
-function append_reference(reference, segment) {
-	return { root: reference.root, segments: [...reference.segments, segment] };
-}
-
-/**
- * Renders a structured client reference as executable source.
- *
- * @param {ClientPath} reference
- * @returns {string}
- */
-function render_reference(reference) {
-	return reference.root + reference.segments.join('');
-}
-
-/**
- * Computes the rendered length of a structured client reference without allocating it.
- *
- * @param {ClientPath} reference
- * @returns {number}
- */
-function reference_length(reference) {
-	let length = reference.root.length;
-	for (const segment of reference.segments) length += segment.length;
-	return length;
-}
-
-/**
- * The shared client queue runtime backing every reconstructed native AsyncIterable.
- * A session ships this text once; later sequences reference `s.f` directly.
- */
-const SEQUENCE_RUNTIME = '(c)=>{let q=[],w=[],d=0,e,r=(d,v)=>({done:!!d,value:v}),a,f=()=>{while(w.length&&(q.length||d)){a=w.shift();q.length?a[0](r(0,q.shift())):d<2?a[0](r(1,e)):a[1](e)}},g=(o,v)=>d||(o?(d=o,e=v):q.push(v),f());c(g);return{[Symbol.asyncIterator](){return this},async next(){if(q.length)return r(0,q.shift());if(d>1)throw e;return d?r(1,e):new Promise((a,b)=>w.push([a,b]))},async return(v){d||(d=1,e=v,q.length=0,f());return r(1,v)},async throw(v){d||(d=2,e=v,q.length=0,f());throw v}}}';
-
-/**
- * Session helper definitions, shipped at most once per session, always in the same block
- * as (and ahead of) their first use. `w` ships with the first assembled native Promise,
- * while `r` waits until three settlements are in play and `v` until six anchors
- * have been allocated, and `f` with the first sequence (whose reconstruction is
- * impossible without it).
- */
-const RUNTIMES = {
-	/** Shared buffered-iterator runtime for reconstructed native AsyncIterables. */
-	f: SEQUENCE_RUNTIME,
-	/** Creates a pending promise whose settlement functions are parked in `s.p`. */
-	w: 'i=>new Promise((a,b)=>{s.p[i]=[a,b]})',
-	/** Settles a parked pending promise (`j` selects resolve/reject) and frees its slot. */
-	r: '(i,j,v)=>(s.p[i][j](v),delete s.p[i])',
-	/** Anchors a value at the next positional index (mirrors the server's counter). */
-	v: 'v=>(s.a.push(v),v)'
-};
 
 const ID_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 
@@ -1919,19 +1689,3 @@ function macrotask() {
 
 /** @typedef {{ node: AsyncNode, descriptor: any, type: 'value' | 'sequence' | 'native', started: boolean, terminal: boolean, cleaned: boolean, active: boolean, iterator?: AsyncIterator<unknown>, iterator_closed?: boolean, next?: AsyncIterator<unknown>['next'], pulling?: boolean, pulled?: Promise<void>, pulled_resolve?: () => void, observer?: { active: boolean }, early?: ['resolve' | 'reject', unknown] }} Source */
 /** @typedef {{ source: Source, type: 'resolve' | 'reject' | 'next' | 'complete' | 'error', value: unknown, invalid: boolean }} Event */
-/**
- * A source hole that refers to a captured identity on the client. `reference` is the path
- * fixed at creation, or undefined to resolve the node's shortest committed path at render time.
- * @typedef {{ type: 'reference', node: CapturedNode, reference: ClientPath | undefined }} ReferenceHole
- */
-/**
- * A source hole produced by a descriptor's `capture` callback; renders as an assignment
- * that stashes `source` into the pending-control table.
- * @typedef {{ type: 'capture', pending: number, source: JavaScriptSource }} CaptureHole
- */
-/**
- * A source hole wrapping an async outcome's region. `render` is filled during batch emission
- * once it is known whether the anchor write is folded into the single use site.
- * @typedef {{ type: 'outcome', source: JavaScriptSource, anchored: string, folded: string, render?: string }} OutcomeHole
- */
-/** Holes injected by the stream itself, as opposed to user values interpolated by a replacer. @typedef {ReferenceHole | CaptureHole | OutcomeHole} InternalHole */

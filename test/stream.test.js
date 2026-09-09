@@ -53,6 +53,7 @@ async function rejects(promise, match) {
 	assert.ok(error);
 	if (match instanceof RegExp) assert.match(error.message, match);
 	else if (match !== undefined) assert.is(error, match);
+	return error;
 }
 
 test('serializes synchronous primitives and graphs', async () => {
@@ -346,6 +347,199 @@ test('serializes primitive holes in custom source', async () => {
 	assert.is(root[0], undefined);
 });
 
+test('preserves instruction-shaped objects as synchronous replacer data', async () => {
+	class Wrapper { constructor(value) { this.value = value; } }
+	for (const value of [
+		{ type: 'reference', value: 1 },
+		{ type: 'capture', value: 2 },
+		{ type: 'outcome', value: 3 }
+	]) {
+		const { root } = await drain(await unevalStream(
+			new Wrapper(value),
+			(item, js) => item instanceof Wrapper && js`({value:${item.value}})`
+		));
+		assert.is(root.value.type, value.type);
+		assert.is(root.value.value, value.value);
+	}
+	const inherited = { value: 4 };
+	Object.defineProperty(Object.prototype, 'type', { value: 'outcome', configurable: true });
+	try {
+		const { root } = await drain(await unevalStream(
+			new Wrapper(inherited),
+			(item, js) => item instanceof Wrapper && js`({value:${item.value}})`
+		));
+		assert.is(root.value.value, 4);
+		assert.is(Object.hasOwn(root.value, 'type'), false);
+	} finally {
+		delete Object.prototype.type;
+	}
+});
+
+test('fails closed on instruction-shaped descriptor holes', async () => {
+	for (const value of [
+		{ type: 'reference' },
+		{ type: 'capture' },
+		{ type: 'outcome' },
+		Object.create({ type: 'capture' })
+	]) {
+		await rejects(unevalStream({}, (_value, js) => ({
+			type: 'async-value',
+			source: new Promise(() => {}),
+			construct: () => js`${value}`,
+			resolve: () => js``,
+			reject: () => js``
+		})), /construct\(\), template hole 1: received an object.*temporary implementation restriction.*remove this blanket rejection when Plan 007/);
+	}
+});
+
+test('rejects Symbols in descriptor construct capture and operation phases', async () => {
+	for (const [phase, construct] of [
+		['construct', (_capture, js) => js`${Symbol('construct')}`],
+		['capture', (capture, js) => capture(js`${Symbol('capture')}`)]
+	]) {
+		const error = await rejects(unevalStream({}, (_value, js) => ({
+			type: 'async-value', source: new Promise(() => {}),
+			construct: (capture) => construct(capture, js),
+			resolve: () => js``, reject: () => js``
+		})), /received a Symbol.*Symbol values cannot be serialized as data/);
+		assert.instance(error, TypeError);
+		assert.ok(error.message.includes(`${phase}(), template hole 1`));
+	}
+
+	const pending = deferred();
+	const reports = [];
+	const result = await unevalStream({}, (_value, js) => ({
+		type: 'async-value', source: pending.promise, construct: () => js`({})`,
+		resolve: () => js`${Symbol('operation')}`,
+		reject: () => js`${Symbol('fallback')}`
+	}), { id: 'symbol-operation', onerror: (error) => reports.push(error) });
+	client().head(result.head);
+	pending.resolve(1);
+	await rejects(result.tail.next(), /fallback reject\(\), template hole 1: received a Symbol/);
+	assert.is(reports.length, 1);
+	assert.match(reports[0].message, /resolve\(\), template hole 1: received a Symbol/);
+});
+
+test('accepts exactly the synchronous replacer fallback set', async () => {
+	for (const fallback of [undefined, null, false]) {
+		const { root } = await drain(await unevalStream({ value: 1 }, () => fallback));
+		assert.is(root.value, 1);
+	}
+	for (const invalid of ['', 'x', 0, 1, true, Promise.resolve(), () => {}, {}, []]) {
+		const error = await rejects(unevalStream({}, () => invalid), /Invalid unevalStream replacer result: received/);
+		assert.instance(error, TypeError);
+		assert.match(error.message, /js tagged template.*async-value.*async-sequence.*undefined, null, or false/);
+		assert.match(error.message, /must be synchronous; Promise results are not supported/);
+		if (invalid === 0) assert.match(error.message, /received a number \(0\)/);
+	}
+});
+
+test('explains raw values returned from construction and passed to capture', async () => {
+	for (const invalid of [undefined, null, false, 0, 'source', {}, () => {}, Promise.resolve()]) {
+		for (const phase of ['capture', 'construct']) {
+			const error = await rejects(unevalStream({}, (_value, js) => ({
+				type: 'async-value', source: new Promise(() => {}),
+				construct: (capture) => phase === 'capture' ? capture(invalid) : invalid,
+				resolve: () => js``, reject: () => js``
+			})), /js tagged template/);
+			assert.instance(error, TypeError);
+			assert.ok(error.message.includes(`${phase}() ${phase === 'capture' ? 'received' : 'returned'}`));
+		}
+	}
+});
+
+test('reports the unsupported operation hole and recovers through the documented fallback', async () => {
+	const pending = deferred();
+	const reports = [];
+	const job = {};
+	const result = await unevalStream(job, (value, js) => value === job && ({
+		type: 'async-value', source: pending.promise, construct: () => js`({})`,
+		resolve: ({ target }) => js`${target}.value=${js`${{ type: 'reference' }}`}`,
+		reject: ({ target }, reason) => js`${target}.error=${reason}`
+	}), { onerror: (error, value) => reports.push([error, value]) });
+	const target = client();
+	const root = target.head(result.head);
+	pending.resolve(7);
+	target.block((await result.tail.next()).value);
+	assert.is(reports.length, 1);
+	assert.instance(reports[0][0], TypeError);
+	assert.match(reports[0][0].message, /resolve\(\), template hole 1: received an object.*supplied target\/control\/value source fragments/);
+	assert.is(reports[0][1], 7);
+	assert.match(root.error.message, /failed to serialize asynchronous value/);
+	assert.equal(await result.tail.next(), { done: true, value: undefined });
+});
+
+test('names each invalid operation callback and its fallback without changing error boundaries', async () => {
+	for (const phase of ['resolve', 'reject', 'next', 'complete', 'error']) {
+		const pending = deferred();
+		const reports = [];
+		const sequence = ['next', 'complete', 'error'].includes(phase);
+		const job = {};
+		const result = await unevalStream(job, (value, js) => value === job && ({
+			type: sequence ? 'async-sequence' : 'async-value',
+			source: sequence ? {
+				[Symbol.asyncIterator]() { return this; },
+				next() { return pending.promise; },
+				return() { return { done: true }; }
+			} : pending.promise,
+			construct: () => js`({})`,
+			resolve: () => 0, reject: () => null,
+			next: () => 0, complete: () => 0, error: () => null
+		}), { onerror: (error) => reports.push(error) });
+		client().head(result.head);
+		const terminal_error = phase === 'reject' || phase === 'error';
+		if (terminal_error) pending.reject('reason');
+		else pending.resolve(sequence ? { done: phase === 'complete', value: 1 } : 1);
+		const error = await rejects(result.tail.next(), /must synchronously return a js tagged template.*empty operation/);
+		assert.instance(error, TypeError);
+		if (terminal_error) {
+			assert.ok(error.message.includes(`${phase}() returned null`));
+			assert.is(reports.length, 0);
+		} else {
+			assert.ok(error.message.includes(`fallback ${sequence ? 'error' : 'reject'}() returned null`));
+			assert.is(reports.length, 1);
+			assert.ok(reports[0].message.includes(`${phase}() returned a number (0)`));
+		}
+	}
+});
+
+test('preserves synchronous custom replacement expression boundaries', async () => {
+	class Wrapper { constructor(kind) { this.kind = kind; } }
+	const cases = [
+		['comma', (js) => js`1,2`, 2],
+		['conditional', (js) => js`true?3:4`, 3],
+		['object', (js) => js`{value:5}`, { value: 5 }],
+		['nested partial', (js) => js`[${js`1,2`}]`, [1, 2]],
+		['partial nested', (js) => js`${js`Math.max(`}${js`6,7`})`, 7],
+		['escaped data', (js) => js`${'</script>'}`, '</script>']
+	];
+	for (const [kind, source, expected] of cases) {
+		const { root } = await drain(await unevalStream(new Wrapper(kind), (value, js) =>
+			value instanceof Wrapper && source(js)
+		));
+		if (typeof expected === 'object') assert.equal(JSON.parse(JSON.stringify(root)), expected);
+		else assert.is(root, expected);
+	}
+	const { root } = await drain(await unevalStream(
+		{
+			array: [new Wrapper('array boundary')],
+			object: { value: new Wrapper('object boundary') },
+			argument: new Wrapper('argument boundary')
+		},
+		(value, js) => value instanceof Wrapper && js`1,2`
+	));
+	assert.equal(Array.from(root.array), [2]);
+	assert.is(root.object.value, 2);
+	assert.is(root.argument, 2);
+
+	class Container { constructor(child) { this.child = child; } }
+	const embedded = await drain(await unevalStream(new Container(new Wrapper('object child')), (value, js) => {
+		if (value instanceof Container) return js`(x=>x)(${value.child})`;
+		if (value instanceof Wrapper) return js`{value:8}`;
+	}));
+	assert.equal({ ...embedded.root }, { value: 8 });
+});
+
 test('preserves replacement metacharacters in descriptor capture expressions', async () => {
 	for (const text of ['$&', '$`', "$'", '$$']) {
 		const result = await unevalStream({}, (_value, js) => ({
@@ -429,6 +623,30 @@ test('does not replace protocol alias text that resembles a custom token', async
 		return js`({text:${text},value:${value.value}})`;
 	}, { id: 'collision' }));
 	assert.is(root.text, text);
+});
+
+test('round-trips numeric strings keys ids and former token literals in every phase', async () => {
+	class Literal {}
+	const synchronous = await unevalStream(
+		{ '0': '0', '1': '1', '12': '12', '001': '001', literal: new Literal() },
+		(value, js) => value instanceof Literal && js`"0"`
+	);
+	const sync_root = client().head(synchronous.head);
+	assert.equal(JSON.parse(JSON.stringify(sync_root)), { '0': '0', '1': '1', '12': '12', '001': '001', literal: '0' });
+
+	const folded = await unevalStream(Promise.resolve('0'), undefined, { id: '12' });
+	assert.is(await client().head(folded.head), '0');
+
+	const pending = deferred();
+	const object = deferred();
+	const tail = await unevalStream({ '00': pending.promise, object: object.promise }, undefined, { id: '0' });
+	const target = client();
+	const root = target.head(tail.head);
+	pending.resolve('0');
+	object.resolve({ '1': '12', value: '001' });
+	target.block((await tail.tail.next()).value);
+	assert.is(await root['00'], '0');
+	assert.equal(JSON.parse(JSON.stringify(await root.object)), { '1': '12', value: '001' });
 });
 
 test('rejects atomic custom cycles clearly', async () => {
@@ -1022,12 +1240,12 @@ test('guards native sequence adapter structure and size', async () => {
 	assert.ok(runtime, result.head);
 	const construct = result.head.match(/s\.f\(g=>\{[^}]*\}\)/)?.[0];
 	assert.ok(construct, result.head);
-	const message = `runtime=${runtime.length} head=${result.head.length}`;
+	// Structured capture grouping changed this fixture from raw/gzip 638/395 to 644/397.
+	const message = `runtime=${runtime.length} head=${result.head.length} gzip=${gzipSync(result.head).length}`;
 	assert.ok(result.head.indexOf(runtime) < result.head.indexOf(construct), message);
 	assert.not.match(runtime, /Promise\.(?:resolve|reject)/, message);
 	assert.is((runtime.match(/new Promise/g) ?? []).length, 1, message);
-	assert.match(construct, /s\.p\[0\]=g\}/, message);
-	assert.not.match(construct, /s\.p\[0\]=\(/, message);
+	assert.match(construct, /\(s\.p\[0\]=\(g\)\)\}/, message);
 	assert.ok(runtime.length + construct.length < 650, message);
 	// the queue runtime is shared: both sequences call s.f but its definition ships once
 	const two = await unevalStream(
@@ -1066,7 +1284,24 @@ test('validates replacer results and descriptor shapes synchronously', async () 
 			? { type, source: {}, construct: () => ({}), resolve() {}, reject() {} }
 			: { type, source: {}, construct: () => ({}), next() {}, complete() {}, error() {} };
 		delete descriptor[missing];
-		await rejects(unevalStream({}, () => descriptor), new RegExp(`Invalid ${type} ${missing}`));
+		const error = await rejects(unevalStream({}, () => descriptor), new RegExp(`Invalid ${type} ${missing}: received undefined`));
+		assert.ok(error.message.includes(`must provide a ${missing}() function`));
+	}
+});
+
+test('explains descriptor source and cleanup field requirements', async () => {
+	for (const type of ['async-value', 'async-sequence']) {
+		for (const field of ['source', 'cancel']) {
+			const error = await rejects(unevalStream({}, (_value, js) => ({
+				type, source: {}, construct: () => js`({})`,
+				resolve() {}, reject() {}, next() {}, complete() {}, error() {},
+				[field]: null
+			})), new RegExp(`Invalid ${type} ${field}: received null`));
+			assert.instance(error, TypeError);
+			assert.match(error.message, field === 'cancel'
+				? /Omit cancel or provide a cleanup function/
+				: type === 'async-value' ? /Promise-like.*callable then method/ : /async iterable.*Symbol.asyncIterator/);
+		}
 	}
 });
 
