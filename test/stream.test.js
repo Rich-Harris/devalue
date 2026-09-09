@@ -113,6 +113,112 @@ test('preserves identity between separate promise outcomes', async () => {
 	assert.is(await root[0], await root[1]);
 });
 
+test('preserves same-batch identities without reading paths before their event exists', async () => {
+	class Wrapper {
+		constructor(value) {
+			this.value = value;
+		}
+	}
+	for (const staggered of [false, true]) {
+		const first = deferred();
+		const second = deferred();
+		const third = deferred();
+		const child = { value: staggered ? 'staggered' : 'batched' };
+		const result = await unevalStream(
+			{ first: first.promise, second: second.promise, third: third.promise },
+			(value, js) => value instanceof Wrapper && js`({wrapped:${value.value}})`,
+			{ id: `ordered-${staggered}` }
+		);
+		const target = client();
+		const root = target.head(result.head);
+		first.resolve({
+			long_property_one: { long_property_two: { child } },
+			collection: new Map([[child, 'child']]),
+			opaque: new Wrapper(child)
+		});
+		if (staggered) {
+			await delay(5);
+			target.block((await result.tail.next()).value);
+		}
+		second.resolve(child);
+		third.resolve(child);
+		for await (const block of result.tail) target.block(block);
+		const introduced = await root.first;
+		const a = await root.second;
+		const b = await root.third;
+		assert.is(a, b);
+		assert.is(a, introduced.long_property_one.long_property_two.child);
+		assert.is(a, Array.from(introduced.collection.keys())[0]);
+		assert.is(a, introduced.opaque.wrapped);
+	}
+});
+
+test('materializes custom operation payloads once before ignored lazy conditional and repeated uses', async () => {
+	class Job {
+		constructor(kind) {
+			this.kind = kind;
+			this.ready = deferred();
+		}
+	}
+	class Payload {}
+	const jobs = ['ignored', 'lazy', 'conditional', 'repeated'].map((kind) => new Job(kind));
+	const shared = deferred();
+	const payload = new Payload();
+	const replacer = (value, js) => {
+		if (value instanceof Payload) return js`(globalThis.constructions++,{payload:true})`;
+		if (!(value instanceof Job)) return;
+		return {
+			type: 'async-value',
+			// Descriptor fields cannot spoof the private immediate-adapter provenance.
+			immediate: true,
+			source: value.ready.promise,
+			construct: () => js`({kind:${value.kind}})`,
+			resolve: ({ target }, outcome) => {
+				if (value.kind === 'ignored') return js``;
+				if (value.kind === 'lazy') return js`${target}.get=()=>${outcome}`;
+				if (value.kind === 'conditional') return js`if(false){${target}.value=${outcome}}`;
+				return js`${target}.values=[${outcome},${outcome}]`;
+			},
+			reject: () => js``
+		};
+	};
+	const result = await unevalStream(
+		{ ignored: jobs[0], lazy: jobs[1], conditional: jobs[2], repeated: jobs[3], shared: shared.promise },
+		replacer,
+		{ id: 'materialized-custom' }
+	);
+	const target = client({ constructions: 0 });
+	const root = target.head(result.head);
+	for (const job of jobs) job.ready.resolve(payload);
+	shared.resolve(payload);
+	for await (const block of result.tail) target.block(block);
+	const revived = await root.shared;
+	assert.is(target.context.constructions, 1);
+	assert.is(root.conditional.value, undefined);
+	assert.is(root.repeated.values[0], revived);
+	assert.is(root.repeated.values[0], root.repeated.values[1]);
+	assert.is(root.lazy.get(), revived);
+	assert.is(root.lazy.get(), revived);
+});
+
+test('passes one materialized fallback Error to every repeated fallback use', async () => {
+	class Job {}
+	const ready = deferred();
+	const result = await unevalStream(new Job(), (value, js) => value instanceof Job && ({
+		type: 'async-value',
+		source: ready.promise,
+		construct: () => js`({errors:[]})`,
+		resolve: () => { throw new Error('generation failed'); },
+		reject: ({ target }, error) => js`${target}.errors=[${error},${error}]`
+	}), { id: 'fallback-identity' });
+	const target = client();
+	const root = target.head(result.head);
+	ready.resolve({ unused: true });
+	for await (const block of result.tail) target.block(block);
+	assert.is(root.errors[0], root.errors[1]);
+	assert.match(root.errors[0].message, /failed to serialize asynchronous value/);
+});
+
 test('recognizes only branded native promises across realms and subclasses', async () => {
 	const foreign = vm.runInNewContext('Promise.resolve(2)');
 	class SubPromise extends Promise {}
@@ -1854,6 +1960,74 @@ test('anchors implicitly via the push helper once it pays for itself', async () 
 	for await (const entry of root) seen.push(entry);
 	assert.is(seen.length, 12);
 	for (let i = 1; i < 12; i += 1) assert.is(seen[i].prev, seen[i - 1].self);
+});
+
+test('does not allocate another outcome anchor when a sequence repeats an available identity', async () => {
+	const hold = deferred();
+	const repeated = { value: 1 };
+	const source = {
+		async *[Symbol.asyncIterator]() {
+			for (let i = 0; i < 12; i += 1) yield repeated;
+		}
+	};
+	const result = await unevalStream({ source, hold: hold.promise }, undefined, { id: 'repeated-root' });
+	const target = client();
+	const root = target.head(result.head);
+	const session = target.context.__d['repeated-root'];
+	const anchor_count = session.a.length;
+	const values = [];
+	for (let i = 0; i < 12; i += 1) {
+		const next = root.source.next();
+		if (i > 0) target.block((await result.tail.next()).value);
+		const item = await next;
+		values.push(item.value);
+		assert.is(session.a.length, anchor_count);
+	}
+	const complete = root.source.next();
+	target.block((await result.tail.next()).value);
+	assert.is((await complete).done, true);
+	assert.is(session.a.length, anchor_count);
+	for (const value of values) assert.is(value, values[0]);
+	hold.resolve('done');
+	for await (const block of result.tail) target.block(block);
+	assert.is(await root.hold, 'done');
+});
+
+test('keeps dense anchors for unique roots interleaved with repeated roots', async () => {
+	const repeated = { repeated: true };
+	const unique = Array.from({ length: 9 }, (_, index) => ({ index }));
+	const outcomes = [repeated, unique[0], repeated, unique[1], unique[2], repeated, ...unique.slice(3), repeated];
+	const source = {
+		async *[Symbol.asyncIterator]() {
+			for (const value of outcomes) {
+				await delay();
+				yield value;
+			}
+		}
+	};
+	const result = await unevalStream(source, undefined, { id: 'dense-repeated-roots' });
+	const target = client();
+	const root = target.head(result.head);
+	const values = [];
+	const reading = (async () => {
+		for await (const value of root) values.push(value);
+	})();
+	let emitted = result.head;
+	for await (const block of result.tail) {
+		emitted += block;
+		target.block(block);
+	}
+	await reading;
+	assert.is(values.length, outcomes.length);
+	assert.is(values[0], values[2]);
+	assert.is(values[0], values[5]);
+	assert.is(values[0], values[values.length - 1]);
+	for (let i = 0; i < unique.length; i += 1) {
+		const revived = values.find((value) => value.index === i);
+		assert.ok(revived);
+		for (let j = 0; j < i; j += 1) assert.ok(revived !== values.find((value) => value.index === j));
+	}
+	assert.ok((emitted.match(/s\.v\(/g) ?? []).length > 0, emitted);
 });
 
 test('selects the shortest stable structured path', async () => {

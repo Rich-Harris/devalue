@@ -21,7 +21,6 @@ import {
 	append_reference,
 	assert_descriptor_source,
 	capture_source,
-	count_source,
 	definitions_source,
 	describe_received,
 	expression_source,
@@ -115,8 +114,12 @@ class Session {
 	#validated = new Set();
 	/** Whether the head must define the block dispatch helper. @type {boolean} */
 	#emit_dispatch = false;
-	/** Shortest committed client path for each captured identity. @type {Map<CapturedNode, ClientPath>} */
+	/** Shortest retained client paths, linked when a later path improves on an earlier one. @type {Map<CapturedNode, RetainedReference>} */
 	#references = new Map();
+	/** Ordered client-materialization boundary. Zero denotes the initialized head graph. */
+	#availability = 0;
+	/** Monotonic suffix for block-local outcome bindings. */
+	#local = 0;
 	/** Monotonic owner tag for reusable node planning scratch. */
 	#region_id = 0;
 
@@ -170,8 +173,8 @@ class Session {
 		if (this.#failure) throw this.#failure;
 
 		try {
-			const head_region = this.#emit_region(value, true);
-			this.#assign_references(value, { kind: 'anchor', index: 0, segments: [] }, new Map());
+			const head_region = this.#emit_region(value, true, undefined, 0, 0);
+			this.#assign_references(value, { kind: 'anchor', index: 0, segments: [] }, new Map(), 0);
 			// anything that settled within the window is folded into the head rather than shipped as a block
 			const operations = this.#batch_ready
 				? await this.#deliver(this.#take_batch(), false)
@@ -350,7 +353,7 @@ class Session {
 			if (observer) {
 				const descriptor = this.#native_descriptor(/** @type {Promise<unknown>} */ (value));
 				try {
-					this.#add_source(node, descriptor, 'native').observer = observer;
+					this.#add_source(node, descriptor, 'native', true).observer = observer;
 					this.#native_pending++;
 				} catch (error) {
 					observer.active = false;
@@ -360,7 +363,7 @@ class Session {
 			}
 
 			if (Symbol.asyncIterator in value) {
-				this.#add_source(node, this.#native_sequence_descriptor(value), 'sequence');
+				this.#add_source(node, this.#native_sequence_descriptor(value), 'sequence', true);
 				return true;
 			}
 		}
@@ -374,9 +377,10 @@ class Session {
 	 * @param {CapturedNode} node
 	 * @param {any} descriptor
 	 * @param {'value' | 'sequence' | 'native'} type
+	 * @param {boolean} [immediate] Whether this private adapter invokes its outcome exactly once immediately.
 	 * @returns {Source}
 	 */
-	#add_source(node, descriptor, type) {
+	#add_source(node, descriptor, type, immediate = false) {
 		let captured = false;
 		const pending = this.#pending;
 		/** @param {JavaScriptSource} expression */
@@ -395,7 +399,7 @@ class Session {
 		// the mutation that TypeScript cannot follow.
 		const async_node = /** @type {AsyncNode} */ (node);
 		/** @type {Source} */
-		const state = { node: async_node, descriptor, type, started: false, terminal: false, cleaned: false, active: true };
+		const state = { node: async_node, descriptor, type, immediate, started: false, terminal: false, cleaned: false, active: true };
 		async_node.kind = 'Async';
 		async_node.data = { source, pending, captured, state };
 		this.#sources.push(state);
@@ -731,22 +735,23 @@ class Session {
 	 * @param {unknown} value
 	 * @param {boolean} persistent
 	 * @param {Set<CapturedNode>} [references]
+	 * @param {number} [available] Paths usable while constructing this region.
+	 * @param {number} [retained_at] Boundary after which paths created by this region exist.
 	 * @returns {Emission}
 	 */
-	#emit_region(value, persistent, references) {
+	#emit_region(value, persistent, references, available = this.#availability, retained_at = available) {
 		// A primitive region has neither graph planning nor unresolved source dependencies.
 		if (is_primitive(value)) {
 			if (typeof value === 'symbol') throw this.#error('Cannot stringify a Symbol primitive', value);
 			return stringify_primitive(value);
 		}
-		const retained_references = this.#references;
 		const identities = this.#graph.identities;
 		const region_id = ++this.#region_id;
 		/** @type {CapturedNode[]} */
 		const order = [];
 		/** @param {CapturedNode} node */
 		const visit = (node) => {
-			if (retained_references.has(node) || node.region_id === region_id) return;
+			if (this.#reference_at(node, available) || node.region_id === region_id) return;
 			node.region_id = region_id;
 			node.uses = 0;
 			node.hoisted = false;
@@ -893,10 +898,10 @@ class Session {
 		 * @returns {Emission}
 		 */
 		const expression_node = (node) => {
-			const retained = retained_references.get(node);
+			const retained = this.#reference_at(node, available);
 			if (retained && node.region_id !== region_id) {
 				references?.add(node);
-				return reference_source(node, retained);
+				return reference_source(node, retained.path);
 			}
 			if (node.region_id === region_id && node.name) return node.name;
 			// `rendering` guards against unexpected re-entry while expanding inline.
@@ -1074,7 +1079,7 @@ class Session {
 					const index = this.#collection++;
 					sidecars.push(join_sources([`s.c[${index}]=[`, join_sources(elements.map(expression_node), ','), ']']));
 					for (let i = 0; i < elements.length; i++) {
-						this.#reference_node(elements[i], { kind: 'collection', index, segments: [`[${i}]`] });
+						this.#reference_node(elements[i], { kind: 'collection', index, segments: [`[${i}]`] }, retained_at);
 					}
 				}
 			}
@@ -1088,8 +1093,8 @@ class Session {
 				slots.push(`s.s[${index}]=${node.name}`);
 				/** @type {ClientPath} */
 				const reference = { kind: 'slot', index, segments: [] };
-				this.#reference_node(node, reference);
-				this.#assign_references(node.value, reference, new Map());
+				this.#reference_node(node, reference, retained_at);
+				this.#assign_references(node.value, reference, new Map(), retained_at);
 			}
 		}
 		const all_declarations = early_declarations.concat(declarations);
@@ -1105,16 +1110,37 @@ class Session {
 	}
 
 	/**
-	 * Records a client reference when it is the shortest known source expression for an identity.
+	 * Records a client reference when it improves the shortest known source expression for an identity.
+	 * Older records remain linked so source generated for an earlier boundary cannot select a path
+	 * that only comes into existence later.
 	 *
 	 * @param {CapturedNode} node
 	 * @param {ClientPath} reference
+	 * @param {number} available
 	 */
-	#reference_node(node, reference) {
+	#reference_node(node, reference, available) {
 		const previous = this.#references.get(node);
-		if (!previous || reference_length(reference) < reference_length(previous)) {
-			this.#references.set(node, reference);
+		if (!previous || reference_length(reference) < reference_length(previous.path)) {
+			this.#references.set(node, { path: reference, available, previous });
 		}
+	}
+
+	/**
+	 * Returns the shortest retained path that exists at an ordered client boundary.
+	 * @param {CapturedNode} node
+	 * @param {number} available
+	 * @returns {RetainedReference | undefined}
+	 */
+	#reference_at(node, available) {
+		let reference = this.#references.get(node);
+		let selected;
+		while (reference) {
+			if (reference.available <= available && (!selected || reference_length(reference.path) < reference_length(selected.path))) {
+				selected = reference;
+			}
+			reference = reference.previous;
+		}
+		return selected;
 	}
 
 	/**
@@ -1125,16 +1151,16 @@ class Session {
 	 * @param {import('./stream-source.js').ReferenceInstruction} hole
 	 * @returns {ClientPath}
 	 */
-	#resolve_reference(hole) {
-		const reference = hole.path ?? this.#references.get(hole.node);
+	#resolve_reference(hole, available = this.#availability) {
+		const reference = hole.path ?? this.#reference_at(hole.node, available)?.path;
 		if (!reference) throw this.#error('Cannot stringify value: a client identity has no retained anchor, slot, or collection path before operation generation (internal emitter error)', hole.node.value);
 		return reference;
 	}
 
 	/** Resolves every reachable structured reference before final rendering. @param {Emission} source */
-	#resolve_references(source) {
+	#resolve_references(source, available = this.#availability) {
 		for (const instruction of source_instructions(source)) {
-			if (instruction.type === 'reference') instruction.path = this.#resolve_reference(instruction);
+			if (instruction.type === 'reference') instruction.path = this.#resolve_reference(instruction, available);
 		}
 	}
 
@@ -1144,20 +1170,22 @@ class Session {
 	 * @param {unknown} value
 	 * @param {ClientPath} reference
 	 * @param {Map<CapturedNode, number>} seen
+	 * @param {number} available
 	 */
-	#assign_references(value, reference, seen) {
+	#assign_references(value, reference, seen, available) {
 		if (is_primitive(value)) return;
 		const node = this.#graph.identities.get(/** @type {object} */ (value));
-		if (node) this.#assign_references_node(node, reference, seen);
+		if (node) this.#assign_references_node(node, reference, seen, available);
 	}
 
 	/**
 	 * @param {CapturedNode} node
 	 * @param {ClientPath} reference
 	 * @param {Map<CapturedNode, number>} seen
+	 * @param {number} available
 	 */
-	#assign_references_node(node, reference, seen) {
-		this.#reference_node(node, reference);
+	#assign_references_node(node, reference, seen, available) {
+		this.#reference_node(node, reference, available);
 		const length = reference_length(reference);
 		const previous = seen.get(node);
 		if (previous !== undefined && previous <= length) return;
@@ -1166,15 +1194,15 @@ class Session {
 		if (node.kind === 'Array') {
 			for (let i = 0; i < children.length; i++) {
 				const child = children[i];
-				if (is_node(child)) this.#assign_references_node(child, append_reference(reference, `[${node.keys[i]}]`), seen);
+				if (is_node(child)) this.#assign_references_node(child, append_reference(reference, `[${node.keys[i]}]`), seen, available);
 			}
 		} else if (node.kind === 'Object' || node.kind === 'NullObject') {
 			for (let i = 0; i < children.length; i++) {
 				const child = children[i];
-				if (is_node(child)) this.#assign_references_node(child, append_reference(reference, prop(node.keys[i])), seen);
+				if (is_node(child)) this.#assign_references_node(child, append_reference(reference, prop(node.keys[i])), seen, available);
 			}
 		} else if (is_view(node)) {
-			this.#assign_references_node(node.children[0], append_reference(reference, '.buffer'), seen);
+			this.#assign_references_node(node.children[0], append_reference(reference, '.buffer'), seen, available);
 		}
 	}
 
@@ -1220,6 +1248,7 @@ class Session {
 	 */
 	#emit_batch(events, block = true) {
 		const prefix = block ? `;${this.#scope}[${stringify_string(this.#id)}].b((s,n)=>{` : '';
+		const block_start = this.#availability;
 		/** @type {Emission[]} */
 		const operations = [];
 		/** @type {Set<CapturedNode>} */
@@ -1229,48 +1258,75 @@ class Session {
 		for (const event of events) {
 			const source = event.source;
 			const node = source.node;
+			const available = this.#availability;
+			const retained_at = ++this.#availability;
 			references.add(node);
-			const target = reference_source(node, this.#references.get(node));
+			const target = reference_source(node, this.#reference_at(node, available)?.path);
 			const control = node.data.captured ? raw_source(`s.p[${node.data.pending}]`) : undefined;
 			const reference = {
 				target,
 				control
 			};
-			/** @type {JavaScriptSource} */
+			/** @type {JavaScriptSource | undefined} */
 			let value_source;
 			/** @type {{ source: JavaScriptSource, write: Emission } | undefined} */
 			let anchor;
+			/** @type {Emission | undefined} */
+			let materialization;
 			if (!event.invalid) {
-				// Persistent: async outcomes must retain Map/Set element and opaque custom
-				// child identities for future regions, exactly like the head region.
-				const region = this.#emit_region(event.value, true, references);
-				this.#resolve_references(region);
 				if (!is_primitive(event.value)) {
-					const index = this.#anchor++;
-					this.#assign_references(event.value, { kind: 'anchor', index, segments: [] }, new Map());
-					const name = `s.a[${index}]`;
-					// Implicit anchoring: anchor indices are allocated monotonically and every
-					// allocated index is written exactly once in allocation order, so once the
-					// push helper pays for itself the client can derive the index positionally
-					// (`s.a.push`) instead of receiving it as an explicit assignment. Explicit
-					// writes before the switch keep `s.a` dense, so mixing both forms is safe.
-					const use_helper = this.#runtimes_emitted.v || index > 5;
-					const write = use_helper
-						? join_sources([runtime_source('v'), '(', region, ')'])
-						: join_sources([name, '=', region]);
-					// Defer the anchor write: when the operation uses the value exactly
-					// once, the write is folded into that use site. A helper call is a
-					// primary expression; only the assignment form needs parentheses.
-					const folded = use_helper ? write : join_sources(['(', write, ')']);
-					const outcome = outcome_source(region, name, folded);
-					anchor = { source: outcome, write };
-					value_source = outcome;
+					const outcome_node = this.#graph.identities.get(/** @type {object} */ (event.value));
+					const retained = outcome_node && this.#reference_at(outcome_node, available);
+					/** @type {Emission} */
+					let expression;
+					if (retained) {
+						expression = reference_source(outcome_node, retained.path);
+					} else {
+						// Persistent: async outcomes must retain Map/Set element and opaque custom
+						// child identities for future regions, exactly like the head region.
+						const region = this.#emit_region(event.value, true, references, available, retained_at);
+						this.#resolve_references(region, available);
+						const index = this.#anchor++;
+						const path = { kind: /** @type {const} */ ('anchor'), index, segments: [] };
+						this.#assign_references(event.value, path, new Map(), retained_at);
+						const name = `s.a[${index}]`;
+						// Anchor indices are allocated only for new roots, monotonically and densely.
+						// Once the push helper pays for itself the client can derive the position.
+						const use_helper = this.#runtimes_emitted.v || index > 5;
+						const write = use_helper
+							? join_sources([runtime_source('v'), '(', region, ')'])
+							: join_sources([name, '=', region]);
+						expression = write;
+						if (source.immediate) {
+							const folded = use_helper ? write : join_sources(['(', write, ')']);
+							const outcome = outcome_source(region, name, folded);
+							select_outcome_source(outcome, 'folded');
+							anchor = { source: outcome, write };
+							value_source = outcome;
+						}
+					}
+					if (!source.immediate) {
+						const local = `o${this.#local++}`;
+						materialization = join_sources([`const ${local}=`, expression]);
+						value_source = raw_source(local);
+					} else if (!value_source) {
+						value_source = template_source(expression);
+					}
 				} else {
+					const region = this.#emit_region(event.value, true, references, available, retained_at);
+					this.#resolve_references(region, available);
 					value_source = template_source(region);
 				}
 			} else {
-				value_source = generic_error;
+				if (source.immediate) {
+					value_source = generic_error;
+				} else {
+					const local = `o${this.#local++}`;
+					materialization = `const ${local}=new Error("devalue: failed to serialize asynchronous value")`;
+					value_source = raw_source(local);
+				}
 			}
+			if (!value_source) throw this.#error('Cannot stringify value: an async outcome has no materialized client expression before operation generation (internal emitter error)', event.value);
 
 			try {
 				let operation;
@@ -1281,23 +1337,29 @@ class Session {
 				else operation = source.descriptor.error(reference, value_source);
 				if (!is_source(operation)) throw new TypeError(`Invalid async descriptor operation: ${event.type}() returned ${describe_received(operation)}. It must synchronously return a js tagged template containing client statements; use js\`\` for an empty operation.`);
 				assert_descriptor_source(operation, `async descriptor ${event.type}()`);
-				if (anchor) {
-					if (count_source(operation, anchor.source) === 1) select_outcome_source(anchor.source, 'folded');
-					else {
-						operations.push(anchor.write);
-						select_outcome_source(anchor.source, 'anchored');
-					}
-				}
+				if (materialization) operations.push(materialization);
 				operations.push(operation);
 			} catch (error) {
 				if (event.type === 'resolve' || event.type === 'next' || event.type === 'complete') {
 					this.#report(error, event.value);
-					// The outcome's identities were assigned anchor references, so the anchor
-					// must still ship even though the operation falls back to a generic error.
-					if (anchor) operations.push(anchor.write);
+					// A privately folded adapter is switched back to its separately emitted anchor
+					// if its callback unexpectedly fails. Arbitrary operations were already planned
+					// around an eager local and publish that materialization exactly once.
+					if (anchor) {
+						operations.push(anchor.write);
+						select_outcome_source(anchor.source, 'anchored');
+					} else if (materialization) {
+						operations.push(materialization);
+					}
+					let fallback_value = generic_error;
+					if (!source.immediate) {
+						const local = `o${this.#local++}`;
+						operations.push(`const ${local}=new Error("devalue: failed to serialize asynchronous value")`);
+						fallback_value = raw_source(local);
+					}
 					const fallback = source.type === 'sequence'
-						? source.descriptor.error(reference, generic_error)
-						: source.descriptor.reject(reference, generic_error);
+						? source.descriptor.error(reference, fallback_value)
+						: source.descriptor.reject(reference, fallback_value);
 					if (!is_source(fallback)) throw new TypeError(`Invalid async descriptor operation: fallback ${source.type === 'sequence' ? 'error' : 'reject'}() returned ${describe_received(fallback)}. It must synchronously return a js tagged template containing client statements; use js\`\` for an empty operation.`);
 					assert_descriptor_source(fallback, source.type === 'sequence' ? 'async descriptor fallback error()' : 'async descriptor fallback reject()');
 					operations.push(fallback);
@@ -1314,7 +1376,7 @@ class Session {
 				if (source.type === 'sequence' && event.type === 'error') close.push(source);
 			}
 		}
-		const rendered = this.#render_operations(operations, references);
+		const rendered = this.#render_operations(operations, references, block_start);
 		if (block && this.#active === 0 && this.#batch.length === 0) {
 			rendered.push(this.#cleanup_source());
 		}
@@ -1331,33 +1393,28 @@ class Session {
 	 *
 	 * @param {Emission[]} operations
 	 * @param {Set<CapturedNode>} references
+	 * @param {number} available Paths committed before this batch began.
 	 * @returns {Emission[]}
 	 */
-	#render_operations(operations, references) {
+	#render_operations(operations, references, available) {
 		/** @type {Map<CapturedNode, number>} */
 		const uses = new Map();
-		/** @type {Map<CapturedNode, ClientPath>} */
-		const imported_references = new Map();
 		for (const operation of operations) {
 			for (const value of source_instructions(operation)) {
 				if (value.type !== 'reference') continue;
 				uses.set(value.node, (uses.get(value.node) ?? 0) + 1);
-				if (value.path && !imported_references.has(value.node)) {
-					imported_references.set(value.node, value.path);
-				}
 			}
 		}
-		/** @type {{ node: CapturedNode, path: string, uses: number }[]} */
+		/** @type {{ node: CapturedNode, path: ClientPath, uses: number }[]} */
 		const candidates = [];
 		for (const node of references) {
-			const reference = this.#references.get(node);
+			const reference = this.#reference_at(node, available)?.path;
 			if (!reference || reference.kind === 'slot') continue;
-			const path = render_reference(imported_references.get(node) ?? reference);
 			const count = uses.get(node) ?? 0;
 			if (count < 2) continue;
-			candidates.push({ node, path, uses: count });
+			candidates.push({ node, path: reference, uses: count });
 		}
-		candidates.sort((a, b) => b.path.length - a.path.length);
+		candidates.sort((a, b) => reference_length(b.path) - reference_length(a.path));
 		/** @type {Map<CapturedNode, ClientPath>} */
 		const aliases = new Map();
 		/** @type {string[]} */
@@ -1365,16 +1422,17 @@ class Session {
 		for (const { node, path, uses } of candidates) {
 			const reference = { kind: /** @type {const} */ ('slot'), index: this.#slot, segments: [] };
 			const slot = render_reference(reference);
-			if (reference_length(reference) + 1 + path.length + 1 + reference_length(reference) * uses >= path.length * uses) continue;
+			const path_length = reference_length(path);
+			if (reference_length(reference) + 1 + path_length + 1 + reference_length(reference) * uses >= path_length * uses) continue;
 			this.#slot++;
-			prefix.push(`${slot}=${path}`);
+			prefix.push(`${slot}=${render_reference(path)}`);
 			aliases.set(node, reference);
-			this.#references.set(node, reference);
+			this.#reference_node(node, reference, available);
 		}
 		for (const operation of operations) {
 			for (const instruction of source_instructions(operation)) {
 				if (instruction.type !== 'reference') continue;
-				instruction.path = aliases.get(instruction.node) ?? this.#resolve_reference(instruction);
+				instruction.path = aliases.get(instruction.node) ?? this.#resolve_reference(instruction, available);
 			}
 		}
 		return /** @type {Emission[]} */ (prefix).concat(operations);
@@ -1687,5 +1745,6 @@ function macrotask() {
 	return new Promise(/** @param {(value?: void | PromiseLike<void>) => void} resolve */ (resolve) => setTimeout(resolve, 0));
 }
 
-/** @typedef {{ node: AsyncNode, descriptor: any, type: 'value' | 'sequence' | 'native', started: boolean, terminal: boolean, cleaned: boolean, active: boolean, iterator?: AsyncIterator<unknown>, iterator_closed?: boolean, next?: AsyncIterator<unknown>['next'], pulling?: boolean, pulled?: Promise<void>, pulled_resolve?: () => void, observer?: { active: boolean }, early?: ['resolve' | 'reject', unknown] }} Source */
+/** @typedef {{ path: ClientPath, available: number, previous: RetainedReference | undefined }} RetainedReference */
+/** @typedef {{ node: AsyncNode, descriptor: any, type: 'value' | 'sequence' | 'native', immediate: boolean, started: boolean, terminal: boolean, cleaned: boolean, active: boolean, iterator?: AsyncIterator<unknown>, iterator_closed?: boolean, next?: AsyncIterator<unknown>['next'], pulling?: boolean, pulled?: Promise<void>, pulled_resolve?: () => void, observer?: { active: boolean }, early?: ['resolve' | 'reject', unknown] }} Source */
 /** @typedef {{ source: Source, type: 'resolve' | 'reject' | 'next' | 'complete' | 'error', value: unknown, invalid: boolean }} Event */
