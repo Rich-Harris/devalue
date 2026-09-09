@@ -876,6 +876,8 @@ class Session {
 		const fill = [];
 		/** @type {Emission[]} */
 		const sidecars = [];
+		/** Best paths visited while retaining stable descendants from this region's sidecars. @type {Map<CapturedNode, number>} */
+		const sidecar_seen = new Map();
 		/** @type {Emission[]} */
 		const slots = [];
 		/**
@@ -1067,8 +1069,8 @@ class Session {
 				}
 			}
 			if (persistent && (node.kind === 'Set' || node.kind === 'Map')) {
-				// Retain only non-primitive elements in a flat sidecar so future regions can
-				// reference identities that Set/Map containers do not expose through paths.
+				// Store non-primitive elements in a flat sidecar because Set/Map containers do
+				// not expose paths to them, then retain stable descendants below each element.
 				/** @type {CapturedNode[]} */
 				const elements = [];
 				for (let i = 0; i < children.length; i++) {
@@ -1079,7 +1081,7 @@ class Session {
 					const index = this.#collection++;
 					sidecars.push(join_sources([`s.c[${index}]=[`, join_sources(elements.map(expression_node), ','), ']']));
 					for (let i = 0; i < elements.length; i++) {
-						this.#reference_node(elements[i], { kind: 'collection', index, segments: [`[${i}]`] }, retained_at);
+						this.#assign_references_node(elements[i], { kind: 'collection', index, segments: [`[${i}]`] }, sidecar_seen, retained_at);
 					}
 				}
 			}
