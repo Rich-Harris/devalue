@@ -19,12 +19,13 @@ import { is_source, js, raw_source } from './javascript-source.js';
 import {
 	RUNTIMES,
 	append_reference,
-	assert_descriptor_source,
 	capture_source,
 	definitions_source,
+	descriptor_source_values,
 	describe_received,
 	expression_source,
 	join_sources,
+	map_descriptor_source,
 	map_source,
 	outcome_source,
 	promise_source,
@@ -110,6 +111,10 @@ class Session {
 	#native_pending = 0;
 	/** Custom nodes captured since the last atomic-cycle validation. @type {CapturedNode[]} */
 	#new_custom = [];
+	/** Nodes whose opacity was incremented in an active transaction. @type {CapturedNode[]} */
+	#opaque_increments = [];
+	/** Number of nested graph/emission transactions currently active. */
+	#transaction_depth = 0;
 	/** Custom nodes already proven acyclic. @type {Set<CapturedNode>} */
 	#validated = new Set();
 	/** Whether the head must define the block dispatch helper. @type {boolean} */
@@ -211,51 +216,87 @@ class Session {
 	/**
 	 * Atomically walks a value's devalue-visible graph and discovers async sources.
 	 *
-	 * Everything a walk touches is either append-only (graph nodes, sources, new custom
-	 * nodes) or a counter (pending indices, opaque use counts), so a checkpoint is a few
-	 * integers and rollback truncates back to them. Success costs nothing beyond the walk.
+	 * A shared transaction checkpoint restores graph nodes, sources, counters, retained
+	 * references, validation state, and opacity increments on previously captured nodes.
 	 *
 	 * @param {unknown} value
 	 * @param {boolean} root
 	 * @returns {CapturedNode | undefined}
 	 */
 	#capture(value, root = false) {
-		const graph = this.#graph;
-		const nodes = graph.nodes.length;
-		const sources = this.#sources.length;
-		const custom = this.#new_custom.length;
-		const pending = this.#pending;
-		const native_pending = this.#native_pending;
+		const checkpoint = this.#begin_transaction();
 		try {
-			const node = discover(graph, value);
-			this.#validate_new_custom(custom);
+			const node = discover(this.#graph, value);
+			this.#validate_new_custom(checkpoint.new_custom.length);
 			if (!this.#is_active()) throw this.#terminal_reason();
-			for (let i = sources; i < this.#sources.length; i++) this.#sources[i].committed = true;
+			this.#commit_transaction(checkpoint, true);
 			if (root) this.#root = node;
 			return node;
 		} catch (error) {
-			this.#pending = pending;
-			this.#native_pending = native_pending;
-			for (let i = this.#sources.length - 1; i >= sources; i--) {
-				const source = this.#sources[i];
-				this.#deactivate(source);
-			}
-			this.#sources.length = sources;
-			for (let i = this.#new_custom.length - 1; i >= custom; i--) {
-				const children = this.#new_custom[i].children;
-				for (let j = 0; j < children.length; j++) {
-					const child = children[j];
-					if (is_node(child)) child.opaque--;
-				}
-			}
-			this.#new_custom.length = custom;
-			roll_back(graph, nodes, error);
+			this.#roll_back_transaction(checkpoint, error);
 			throw error;
 		}
 	}
 
+	/** Captures mutable state needed to discard provisional graph/emission work. */
+	#begin_transaction() {
+		this.#transaction_depth++;
+		return {
+			nodes: this.#graph.nodes.length,
+			sources: this.#sources.length,
+			new_custom: this.#new_custom.slice(),
+			validated: new Set(this.#validated),
+			opaque: this.#opaque_increments.length,
+			pending: this.#pending,
+			native_pending: this.#native_pending,
+			active: this.#active,
+			availability: this.#availability,
+			anchor: this.#anchor,
+			slot: this.#slot,
+			collection: this.#collection,
+			local: this.#local,
+			references: new Map(this.#references)
+		};
+	}
+
+	/** @param {TransactionCheckpoint} checkpoint @param {boolean} commit_sources */
+	#commit_transaction(checkpoint, commit_sources) {
+		if (commit_sources) {
+			for (let i = checkpoint.sources; i < this.#sources.length; i++) this.#sources[i].committed = true;
+		}
+		this.#transaction_depth--;
+		if (this.#transaction_depth === 0) this.#opaque_increments.length = checkpoint.opaque;
+	}
+
+	/** @param {TransactionCheckpoint} checkpoint @param {unknown} error */
+	#roll_back_transaction(checkpoint, error) {
+		for (let i = this.#opaque_increments.length - 1; i >= checkpoint.opaque; i--) this.#opaque_increments[i].opaque--;
+		this.#opaque_increments.length = checkpoint.opaque;
+		for (let i = this.#sources.length - 1; i >= checkpoint.sources; i--) this.#deactivate(this.#sources[i]);
+		this.#sources.length = checkpoint.sources;
+		this.#new_custom = checkpoint.new_custom;
+		this.#validated = checkpoint.validated;
+		this.#pending = checkpoint.pending;
+		this.#native_pending = checkpoint.native_pending;
+		this.#active = checkpoint.active;
+		this.#availability = checkpoint.availability;
+		this.#anchor = checkpoint.anchor;
+		this.#slot = checkpoint.slot;
+		this.#collection = checkpoint.collection;
+		this.#local = checkpoint.local;
+		this.#references = checkpoint.references;
+		roll_back(this.#graph, checkpoint.nodes, error);
+		this.#transaction_depth--;
+	}
+
+	/** Records an opaque constructor dependency with rollback support. @param {CapturedNode} node */
+	#make_opaque(node) {
+		node.opaque++;
+		this.#opaque_increments.push(node);
+	}
+
 	/**
-	 * Rejects direct cycles among atomic custom constructors, validating only custom
+	 * Rejects direct cycles among atomic custom and async constructors, validating only
 	 * nodes discovered since the previous validation. Edges are immutable once captured,
 	 * so a new cycle always passes through a newly captured node.
 	 */
@@ -272,7 +313,7 @@ class Session {
 			if (validating.has(node)) throw this.#error('Cannot stringify an atomic custom cycle', node.value);
 			validating.add(node);
 			for (const child of node.children) {
-				if (is_node(child) && child.kind === 'Custom') validate(child);
+				if (is_node(child) && is_atomic(child)) validate(child);
 			}
 			validating.delete(node);
 			validated.add(node);
@@ -303,7 +344,7 @@ class Session {
 				for (let i = 0; i < values.length; i++) {
 					const captured = child(graph, values[i]);
 					children[i] = captured;
-					if (is_node(captured)) captured.opaque++;
+					if (is_node(captured)) this.#make_opaque(captured);
 				}
 				node.kind = 'Custom';
 				node.children = children;
@@ -390,20 +431,19 @@ class Session {
 	 * @returns {Source}
 	 */
 	#add_source(node, descriptor, type, immediate = false) {
-		let captured = false;
+		let capture_called = false;
 		const pending = this.#pending;
 		/** @param {JavaScriptSource} expression */
 		const control = (expression) => {
-			if (captured) throw new TypeError('devalue: capture may only be called once per async descriptor construct(); capture one js expression containing all private controls, such as js`[resolve,reject]`');
+			if (capture_called) throw new TypeError('devalue: capture may only be called once per async descriptor construct(); capture one js expression containing all private controls, such as js`[resolve,reject]`');
 			if (!is_source(expression)) throw new TypeError(`Invalid async descriptor capture: capture() received ${describe_received(expression)}. Pass an expression built with the js tagged template, not a raw value or source string.`);
-			assert_descriptor_source(expression, 'async descriptor capture()');
-			captured = true;
+			capture_called = true;
 			return capture_source(pending, expression);
 		};
 		const source = descriptor.construct(control);
 		if (!this.#is_active()) throw this.#terminal_reason();
 		if (!is_source(source)) throw new TypeError(`Invalid async descriptor construct result: construct() returned ${describe_received(source)}. It must synchronously return a js tagged template representing the client construction expression.`);
-		assert_descriptor_source(source, 'async descriptor construct()');
+		// Reserve the control index and provisional source before recursive hole discovery.
 		this.#pending = pending + 1;
 		// `node` is reserved but unclassified; this call classifies it, so the cast records
 		// the mutation that TypeScript cannot follow.
@@ -411,10 +451,103 @@ class Session {
 		/** @type {Source} */
 		const state = { node: async_node, descriptor, type, immediate, committed: false, started: false, terminal: false, active: true };
 		async_node.kind = 'Async';
-		async_node.data = { source, pending, captured, state };
+		async_node.data = { source, pending, captured: false, state };
 		this.#sources.push(state);
+		const entries = descriptor_source_values(source);
+		const children = new Array(entries.length);
+		for (let i = 0; i < entries.length; i++) {
+			const entry = entries[i];
+			let captured;
+			try {
+				captured = child(this.#graph, entry.value);
+			} catch (error) {
+				throw descriptor_interpolation_error(error, entry.value, entry.capture ? 'async descriptor capture()' : 'async descriptor construct()', entry.index);
+			}
+			children[i] = captured;
+			if (is_node(captured)) this.#make_opaque(captured);
+		}
+		async_node.children = children;
+		async_node.data.captured = capture_called && (descriptor.manages_pending || source_instructions(source).some((instruction) => instruction.type === 'capture' && instruction.pending === pending));
+		this.#new_custom.push(async_node);
 		if (this.#signal?.aborted) throw this.#signal.reason;
 		return state;
+	}
+
+	/**
+	 * Discovers and eagerly materializes every ordinary value hole in a returned
+	 * descriptor fragment. The caller commits only after adding the prerequisites
+	 * and lowered operation to ordered output.
+	 *
+	 * @param {JavaScriptSource} source
+	 * @param {string} context
+	 * @param {number} available
+	 * @param {number} retained_at
+	 * @param {Set<CapturedNode>} references
+	 */
+	#lower_descriptor_source(source, context, available, retained_at, references) {
+		const checkpoint = this.#begin_transaction();
+		try {
+			const entries = descriptor_source_values(source);
+			/** @type {Map<object, CapturedNode>} */
+			const nodes = new Map();
+			for (const entry of entries) {
+				try {
+					const node = discover(this.#graph, entry.value);
+					if (node) nodes.set(/** @type {object} */ (entry.value), node);
+				} catch (error) {
+					throw descriptor_interpolation_error(error, entry.value, context, entry.index);
+				}
+			}
+			this.#validate_new_custom(checkpoint.new_custom.length);
+			if (!this.#is_active()) throw this.#terminal_reason();
+			this.#active += this.#sources.length - checkpoint.sources;
+
+			/** One eager binding per ordinary object identity in this operation. @type {Map<CapturedNode, JavaScriptSource>} */
+			const bindings = new Map();
+			/** @type {Emission[]} */
+			const prerequisites = [];
+			// Arbitrary descriptor payloads are materialized immediately before these
+			// prerequisites, so their retained identities already exist at this event boundary.
+			let prerequisite_available = retained_at;
+			for (const entry of entries) {
+				if (is_primitive(entry.value)) continue;
+				const node = nodes.get(/** @type {object} */ (entry.value));
+				if (!node || bindings.has(node)) continue;
+				references.add(node);
+				const retained = this.#reference_at(node, prerequisite_available);
+				/** @type {Emission} */
+				let expression;
+				if (retained) {
+					expression = reference_source(node, retained.path);
+				} else {
+					const region = this.#emit_region(node.value, true, references, prerequisite_available, retained_at);
+					this.#resolve_references(region, prerequisite_available);
+					const index = this.#anchor++;
+					const path = { kind: /** @type {const} */ ('anchor'), index, segments: [] };
+					this.#assign_references(node.value, path, new Map(), retained_at);
+					expression = join_sources([`s.a[${index}]=`, region]);
+					prerequisite_available = retained_at;
+				}
+				const local = `o${this.#local++}`;
+				prerequisites.push(join_sources([`const ${local}=`, expression]));
+				bindings.set(node, raw_source(local));
+			}
+
+			const lowered = map_descriptor_source(source, (value, index) => {
+				if (is_primitive(value)) {
+					if (typeof value === 'symbol') throw descriptor_interpolation_error(undefined, value, context, index);
+					return stringify_primitive(value);
+				}
+				const node = nodes.get(/** @type {object} */ (value));
+				const binding = node && bindings.get(node);
+				if (!binding) throw this.#error('Cannot stringify value: a descriptor template hole was not captured before lowering (internal emitter error)', value);
+				return binding;
+			});
+			return { checkpoint, prerequisites, source: lowered };
+		} catch (error) {
+			this.#roll_back_transaction(checkpoint, error);
+			throw error;
+		}
 	}
 
 	/**
@@ -968,7 +1101,7 @@ class Session {
 				case 'Map':
 					return map_literal(children);
 				case 'Async':
-					return expression_source(node.data.source);
+					return expression_source(map_descriptor_source(node.data.source, expression));
 				case 'Custom':
 					return expression_source(map_source(node.data, expression));
 				default:
@@ -1247,23 +1380,25 @@ class Session {
 	}
 
 	/**
-	 * Generates ordered client operations for a finalized event batch. Failures here are
-	 * fatal to the session, so emission mutates session state directly.
+	 * Generates ordered client operations for a finalized event batch. Emission is
+	 * transactional so a fatal failure publishes none of its provisional graph state.
 	 *
 	 * @param {Event[]} events
 	 * @param {boolean} block
 	 * @returns {{ source: Emission, close: Source[] }}
 	 */
 	#emit_batch(events, block = true) {
-		const prefix = block ? `;${this.#scope}[${stringify_string(this.#id)}].b((s,n)=>{` : '';
-		const block_start = this.#availability;
-		/** @type {Emission[]} */
-		const operations = [];
-		/** @type {Set<CapturedNode>} */
-		const references = new Set();
-		/** @type {Source[]} */
-		const close = [];
-		for (const event of events) {
+		const transaction = this.#begin_transaction();
+		try {
+			const prefix = block ? `;${this.#scope}[${stringify_string(this.#id)}].b((s,n)=>{` : '';
+			const block_start = this.#availability;
+			/** @type {Emission[]} */
+			const operations = [];
+			/** @type {Set<CapturedNode>} */
+			const references = new Set();
+			/** @type {Source[]} */
+			const close = [];
+			for (const event of events) {
 			if (!this.#is_active()) throw this.#terminal_reason();
 			const source = event.source;
 			const node = source.node;
@@ -1346,9 +1481,10 @@ class Session {
 				else operation = source.descriptor.error(reference, value_source);
 				if (!this.#is_active()) throw this.#terminal_reason();
 				if (!is_source(operation)) throw new TypeError(`Invalid async descriptor operation: ${event.type}() returned ${describe_received(operation)}. It must synchronously return a js tagged template containing client statements; use js\`\` for an empty operation.`);
-				assert_descriptor_source(operation, `async descriptor ${event.type}()`);
+				const lowered = this.#lower_descriptor_source(operation, `async descriptor ${event.type}()`, available, retained_at, references);
 				if (materialization) operations.push(materialization);
-				operations.push(operation);
+				operations.push(...lowered.prerequisites, lowered.source);
+				this.#commit_transaction(lowered.checkpoint, false);
 			} catch (error) {
 				if (!this.#is_active()) throw error;
 				if (event.type === 'resolve' || event.type === 'next' || event.type === 'complete') {
@@ -1373,8 +1509,10 @@ class Session {
 						: source.descriptor.reject(reference, fallback_value);
 					if (!this.#is_active()) throw this.#terminal_reason();
 					if (!is_source(fallback)) throw new TypeError(`Invalid async descriptor operation: fallback ${source.type === 'sequence' ? 'error' : 'reject'}() returned ${describe_received(fallback)}. It must synchronously return a js tagged template containing client statements; use js\`\` for an empty operation.`);
-					assert_descriptor_source(fallback, source.type === 'sequence' ? 'async descriptor fallback error()' : 'async descriptor fallback reject()');
-					operations.push(fallback);
+					const context = source.type === 'sequence' ? 'async descriptor fallback error()' : 'async descriptor fallback reject()';
+					const lowered = this.#lower_descriptor_source(fallback, context, available, retained_at, references);
+					operations.push(...lowered.prerequisites, lowered.source);
+					this.#commit_transaction(lowered.checkpoint, false);
 					event.type = source.type === 'sequence' ? 'error' : 'reject';
 				} else {
 					throw error;
@@ -1387,16 +1525,22 @@ class Session {
 				this.#active--;
 				if (source.type === 'sequence' && event.type === 'error') close.push(source);
 			}
+			}
+			const rendered = this.#render_operations(operations, references, block_start);
+			if (block && this.#active === 0 && this.#batch.length === 0) {
+				rendered.push(this.#cleanup_source());
+			}
+			const body = join_sources(rendered, ';');
+			const structured = block
+				? join_sources([prefix, definitions_source(), ';', body, '})'])
+				: rendered.length ? join_sources([';', body]) : '';
+			const result = { source: structured, close };
+			this.#commit_transaction(transaction, true);
+			return result;
+		} catch (error) {
+			this.#roll_back_transaction(transaction, error);
+			throw error;
 		}
-		const rendered = this.#render_operations(operations, references, block_start);
-		if (block && this.#active === 0 && this.#batch.length === 0) {
-			rendered.push(this.#cleanup_source());
-		}
-		const body = join_sources(rendered, ';');
-		const structured = block
-			? join_sources([prefix, definitions_source(), ';', body, '})'])
-			: rendered.length ? join_sources([';', body]) : '';
-		return { source: structured, close };
 	}
 
 	/**
@@ -1879,7 +2023,20 @@ function is_view(node) {
  * @returns {boolean}
  */
 function is_atomic(node) {
-	return node.kind === 'Custom' || is_view(node);
+	return node.kind === 'Custom' || node.kind === 'Async' || is_view(node);
+}
+
+/**
+ * Adds descriptor callback and local-hole context while preserving graph diagnostics.
+ * @param {unknown} error
+ * @param {unknown} value
+ * @param {string} context
+ * @param {number} index
+ */
+function descriptor_interpolation_error(error, value, context, index) {
+	const detail = typeof value === 'symbol' ? ' Symbol values cannot be serialized as data.'
+		: error instanceof Error ? ` ${error.message}` : '';
+	return new TypeError(`Invalid JavaScript source interpolation in ${context}, template hole ${index + 1}: received ${describe_received(value)}.${detail}`);
 }
 
 /** @param {object} value */
@@ -1941,6 +2098,7 @@ function macrotask() {
 }
 
 /** @typedef {{ path: ClientPath, available: number, previous: RetainedReference | undefined }} RetainedReference */
+/** @typedef {{ nodes: number, sources: number, new_custom: CapturedNode[], validated: Set<CapturedNode>, opaque: number, pending: number, native_pending: number, active: number, availability: number, anchor: number, slot: number, collection: number, local: number, references: Map<CapturedNode, RetainedReference> }} TransactionCheckpoint */
 /** @typedef {{ state: 'preparing' | 'streaming' } | { state: 'completed' } | TerminatingLifecycle} Lifecycle */
 /** @typedef {{ state: 'cancelled' | 'failed', has_reason: boolean, reason: unknown, cleanup: Promise<void>, operations: CleanupOperation[] }} TerminatingLifecycle */
 /** @typedef {{ ok: true } | { ok: false, error: unknown }} CleanupResult */

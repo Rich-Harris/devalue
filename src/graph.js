@@ -70,7 +70,7 @@ import {
  *   | { kind: 'Set' | 'Map', keys: never[], children: Child[], data: undefined }
  *   | { kind: ViewKind, keys: never[], children: [CapturedNode], data: { byteOffset: number, byteLength: number, length: number | undefined } }
  *   | { kind: 'Custom', keys: never[], children: Child[], data: JavaScriptSource }
- *   | { kind: 'Async', keys: never[], children: never[], data: { source: JavaScriptSource, pending: number, captured: boolean, state: Source } }
+ *   | { kind: 'Async', keys: never[], children: Child[], data: { source: JavaScriptSource, pending: number, captured: boolean, state: Source } }
  *   | { kind: 'Number' | 'String' | 'Boolean' | 'BigInt', keys: never[], children: never[], data: number | string | boolean | bigint }
  *   | { kind: 'Date', keys: never[], children: never[], data: number }
  *   | { kind: 'RegExp', keys: never[], children: never[], data: { source: string, flags: string } }
@@ -86,7 +86,7 @@ import {
  * - `Map`: `children` alternate key, value, key, value, … in insertion order.
  * - Views: `children[0]` is the buffer; `length` is undefined for `DataView`.
  * - `Custom`: `children` are the replacer template's holes in order; `data` is the template.
- * - `Async`: `data` is the descriptor plan, filled by `uneval-stream`.
+ * - `Async`: `children` are ordinary values embedded by its constructor; `data` is the descriptor plan, filled by `uneval-stream`.
  */
 /** @typedef {CapturedNode['kind']} Kind */
 /** @typedef {Extract<CapturedNode, { kind: 'Async' }>} AsyncNode */

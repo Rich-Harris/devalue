@@ -74,7 +74,7 @@ export interface ClientReference {
 	 *
 	 * ```js
 	 * (capture) =>
-	 * 	`new Promise((resolve, reject) => { ${capture('[resolve, reject]')} })`
+	 * 	js`new Promise((resolve, reject) => { ${capture(js`[resolve, reject]`)} })`
 	 * ```
 	 *
 	 * ...this would be the source expression that evaluates to the captured `[resolve, reject]` tuple.
@@ -97,13 +97,15 @@ export interface AsyncValueDescriptor<T = unknown> {
 	 *
 	 * ```ts
 	 * (capture) =>
-	 * 	`new Promise((resolve, reject) => { ${capture('[resolve, reject]')} })`
+	 * 	js`new Promise((resolve, reject) => { ${capture(js`[resolve, reject]`)} })`
 	 * ```
 	 *
 	 * This creates a synchronously constructed unresolved Promise. `capture` accepts an expression
 	 * (in this case, `[resolve, reject]`), then replaces it with an equivalent expression that _also_
 	 * stashes the result of the expression so that it can be passed back to `resolve` and `reject` as
-	 * `reference.control`.
+	 * `reference.control`. `construct` returns one client expression. Ordinary values interpolated in
+	 * that returned fragment, including its composed capture expression, are serialized through the
+	 * same session graph; fragments created but not returned or composed remain undiscovered.
 	 */
 	construct(capture: (expression: JavaScriptSource) => JavaScriptSource): JavaScriptSource;
 	/**
@@ -113,7 +115,7 @@ export interface AsyncValueDescriptor<T = unknown> {
 	 * value. For a native Promise, `resolve` looks like this:
 	 *
 	 * ```ts
-	 * ({ control }, valueSource) => `${control}[0](${valueSource})`
+	 * ({ control }, valueSource) => js`${control}[0](${valueSource})`
 	 * ```
 	 *
 	 * The result is equivalent to `resolve(expression)`: `control` is the array captured in
@@ -127,7 +129,7 @@ export interface AsyncValueDescriptor<T = unknown> {
 	 * source expression for the rejection reason. For a native Promise, `reject` looks like this:
 	 *
 	 * ```ts
-	 * ({ control }, reasonSource) => `${control}[1](${reasonSource})`
+	 * ({ control }, reasonSource) => js`${control}[1](${reasonSource})`
 	 * ```
 	 *
 	 * The result is equivalent to `reject(expression)`: index 1 of the captured control contains the
@@ -162,9 +164,9 @@ export interface AsyncSequenceDescriptor<T = unknown, TReturn = unknown> {
 	 * ```ts
 	 * (capture) => {
 	 * 	const controlSource = capture(
-	 * 		'(type, value) => updateBufferedIterator(type, value)'
+	 * 		js`(type, value) => updateBufferedIterator(type, value)`
 	 * 	);
-	 *	return `createBufferedAsyncIterator(${controlSource})`;
+	 *	return js`createBufferedAsyncIterator(${controlSource})`;
 	 * }
 	 * ```
 	 *
@@ -178,7 +180,7 @@ export interface AsyncSequenceDescriptor<T = unknown, TReturn = unknown> {
 	 * the value or resolves a pending client `next()` call:
 	 *
 	 * ```ts
-	 * ({ control }, valueSource) => `${control}(0,${valueSource})`
+	 * ({ control }, valueSource) => js`${control}(0,${valueSource})`
 	 * ```
 	 *
 	 * For example, this may generate `s.p[0](0,s.a[1])`, delivering the value retained at `s.a[1]`.
@@ -190,7 +192,7 @@ export interface AsyncSequenceDescriptor<T = unknown, TReturn = unknown> {
 	 * with opcode 1, which marks the client iterator complete and resolves pending `next()` calls:
 	 *
 	 * ```ts
-	 * ({ control }, returnValueSource) => `${control}(1,${returnValueSource})`
+	 * ({ control }, returnValueSource) => js`${control}(1,${returnValueSource})`
 	 * ```
 	 */
 	complete(reference: ClientReference, returnValueSource: JavaScriptSource): JavaScriptSource;
@@ -200,7 +202,7 @@ export interface AsyncSequenceDescriptor<T = unknown, TReturn = unknown> {
 	 * which marks the client iterator failed and rejects pending `next()` calls:
 	 *
 	 * ```ts
-	 * ({ control }, reasonSource) => `${control}(2,${reasonSource})`
+	 * ({ control }, reasonSource) => js`${control}(2,${reasonSource})`
 	 * ```
 	 */
 	error(reference: ClientReference, reasonSource: JavaScriptSource): JavaScriptSource;

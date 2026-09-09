@@ -4,7 +4,6 @@ import vm from 'node:vm';
 import { SOURCE, js, raw_source } from './javascript-source.js';
 import { stringify_primitive } from './utils.js';
 import {
-	assert_descriptor_source,
 	capture_source,
 	count_source,
 	definitions_source,
@@ -89,29 +88,22 @@ test('renders helper definitions before structured uses', () => {
 	assert.ok(rendered.indexOf('s.r=') < rendered.indexOf('s.r(12'));
 });
 
-test('groups capture assignments and rejects unsupported descriptor holes', () => {
+test('groups capture assignments', () => {
 	const capture = capture_source(0, js`1,2`);
 	assert.is(render_stream_source(js`f(${capture})`), 'f((s.p[0]=(1,2)))');
-	assert.throws(() => assert_descriptor_source(js`${Symbol('x')}`), /template hole 1: received a Symbol.*cannot be serialized as data/);
-	assert.throws(() => assert_descriptor_source(js`${{ type: 'capture' }}`), /template hole 1: received an object.*temporary implementation restriction.*remove this blanket rejection when Plan 007/);
-	assert.not.throws(() => assert_descriptor_source(capture_source(1, js`x`)));
 });
 
-test('explains rejected holes without invoking user conversion or inspection hooks', () => {
+test('describes rejected holes without invoking user conversion or inspection hooks', () => {
 	const value = {
 		get constructor() { assert.unreachable('read constructor'); },
 		get [Symbol.toStringTag]() { assert.unreachable('read toStringTag'); },
 		[Symbol.toPrimitive]() { assert.unreachable('converted value'); },
 		toString() { assert.unreachable('called toString'); }
 	};
-	assert.throws(() => assert_descriptor_source(js`${1},${value}`, 'async descriptor construct()'),
-		/construct\(\), template hole 2: received an object.*not yet supported as data holes/);
 	assert.throws(() => render_stream_source(js`${value}`),
-		/source rendering: received an object.*serializable primitives, nested js templates/);
+		/source rendering: received an object.*internal emitter error/);
 	assert.throws(() => render_stream_source(js`${Symbol('data')}`),
 		/received a Symbol.*Symbol values cannot be serialized as data/);
-	assert.throws(() => assert_descriptor_source(js`${() => {}}`),
-		/received a function.*not yet supported as data holes/);
 	assert.is(describe_received(value), 'an object');
 	const proxy = Proxy.revocable({}, {});
 	proxy.revoke();
