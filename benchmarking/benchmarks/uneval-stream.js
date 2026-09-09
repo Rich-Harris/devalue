@@ -227,6 +227,22 @@ const benchmarks = [
 		}
 	},
 	{
+		label: 'unevalStream stream/repeated outcomes',
+		async fn() {
+			const repeated = { id: 1, child: { values: [1, 2, 3] } };
+			const run = async () => {
+				for (let iteration = 0; iteration < 20; iteration++) {
+					const pending = Array.from({ length: 64 }, () => deferred());
+					const result = await unevalStream(pending.map((item) => item.promise), undefined, { id: 'benchmark' });
+					for (const item of pending) item.resolve(repeated);
+					await consume(result);
+				}
+			};
+			await run();
+			return median_test(5, run);
+		}
+	},
+	{
 		label: 'unevalStream stream/many regions',
 		async fn() {
 			const run = async () => {
