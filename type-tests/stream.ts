@@ -11,37 +11,113 @@ import {
 	type UnevalStreamTail
 } from 'devalue';
 
-declare const promise: Promise<number>;
-declare const sequence: AsyncIterable<number, string>;
-
-declare const source: JavaScriptSource;
-declare const js: JavaScriptTag;
+const promise = Promise.resolve(1);
+const sequence = (async function* (): AsyncGenerator<number, string, unknown> {
+	yield 1;
+	return 'complete';
+})();
 const config = { retries: 2 };
-const reference: ClientReference = { target: source, control: source };
 
-const value: AsyncValueDescriptor<number> = {
-	type: 'async-value',
-	source: promise,
-	construct: (capture) => js`new RemoteValue(${config},${capture(js`[${config}]`)})`,
-	resolve: ({ target }, result) => js`${target}.resolve(${result},${config})`,
-	reject: ({ target }, reason) => js`${target}.reject(${reason},${config})`
+function useSource(_source: JavaScriptSource) {}
+function useReference(reference: ClientReference) {
+	useSource(reference.target);
+	if (reference.control) useSource(reference.control);
+}
+
+function valueDescriptor(js: JavaScriptTag): AsyncValueDescriptor<number> {
+	return {
+		type: 'async-value',
+		source: promise,
+		construct: (capture) => js`new RemoteValue(${config},${capture(js`[${config}]`)})`,
+		resolve: (reference, result) => {
+			useReference(reference);
+			return js`${reference.target}.resolve(${result},${config})`;
+		},
+		reject: ({ target }, reason) => js`${target}.reject(${reason},${config})`
+	};
+}
+
+function sequenceDescriptor(js: JavaScriptTag): AsyncSequenceDescriptor<number, string> {
+	return {
+		type: 'async-sequence',
+		source: sequence,
+		construct: (capture) => js`new RemoteSequence(${config},${capture(js`(type,value)=>dispatch(type,value,${config})`)})`,
+		next: ({ control }, item) => js`${control}(0,${item},${config})`,
+		complete: ({ control }, result) => js`${control}(1,${result},${config})`,
+		error: ({ control }, reason) => js`${control}(2,${reason},${config})`
+	};
+}
+
+const replacer: UnevalStreamReplacer = (candidate, js) => {
+	if (candidate === promise) return valueDescriptor(js);
+	if (candidate === sequence) return sequenceDescriptor(js);
+	return js`new Remote(${config})`;
 };
+const falseFallback: UnevalStreamReplacer = () => false;
+const nullFallback: UnevalStreamReplacer = () => null;
 
-const iterable: AsyncSequenceDescriptor<number, string> = {
-	type: 'async-sequence',
-	source: sequence,
-	construct: () => js`new RemoteSequence(${config})`,
-	next: ({ target }, item) => js`${target}.next(${item},${config})`,
-	complete: ({ target }, result) => js`${target}.complete(${result},${config})`,
-	error: ({ target }, reason) => js`${target}.error(${reason},${config})`
-};
+// @ts-expect-error raw strings are not synchronous replacement source
+const rawReplacement: UnevalStreamReplacer = () => 'new Remote()';
 
-const replacer: UnevalStreamReplacer = (_value, js: JavaScriptTag) => js`new Remote(${value})`;
+function invalidValueDescriptor(js: JavaScriptTag): AsyncValueDescriptor<number> {
+	return {
+		type: 'async-value',
+		source: promise,
+		// @ts-expect-error construct must return branded JavaScriptSource
+		construct: () => 'new RemoteValue()',
+		// @ts-expect-error operations must return branded JavaScriptSource
+		resolve: () => 'resolve()',
+		reject: () => js`reject()`
+	};
+}
+
+function invalidCaptureDescriptor(js: JavaScriptTag): AsyncValueDescriptor<number> {
+	return {
+		type: 'async-value',
+		source: promise,
+		construct: (capture) => {
+			// @ts-expect-error capture requires branded JavaScriptSource
+			capture('[resolve,reject]');
+			return js`new RemoteValue()`;
+		},
+		resolve: () => js`resolve()`,
+		reject: () => js`reject()`
+	};
+}
+
+function incompatibleSequenceDescriptors(js: JavaScriptTag) {
+	const wrongItemSource: AsyncSequenceDescriptor<string, string> = {
+		type: 'async-sequence',
+		// @ts-expect-error the sequence yields numbers, not strings
+		source: sequence,
+		construct: () => js`new RemoteSequence()`,
+		next: () => js``,
+		complete: () => js``,
+		error: () => js``
+	};
+
+	const wrongReturnSource: AsyncSequenceDescriptor<number, number> = {
+		type: 'async-sequence',
+		// @ts-expect-error the sequence returns a string, not a number
+		source: sequence,
+		construct: () => js`new RemoteSequence()`,
+		next: () => js``,
+		complete: () => js``,
+		error: () => js``
+	};
+	return [wrongItemSource, wrongReturnSource];
+}
+
 const options: UnevalStreamOptions = { id: 'typed' };
-const result: UnevalStreamResult = await unevalStream(iterable, replacer, options);
+const result: UnevalStreamResult = await unevalStream(sequence, replacer, options);
 const { head, tail, id }: { head: string; tail: UnevalStreamTail; id: string } = result;
 await tail.return();
-void reference;
+void falseFallback;
+void nullFallback;
+void rawReplacement;
+void invalidValueDescriptor;
+void invalidCaptureDescriptor;
+void incompatibleSequenceDescriptors;
 void head;
 void id;
 

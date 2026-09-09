@@ -69,6 +69,84 @@ test('serializes synchronous primitives and graphs', async () => {
 	assert.equal(blocks, []);
 });
 
+test('preserves object key order across deferred construction in head and tail regions', async () => {
+	class Wrapper {
+		constructor(value) {
+			this.value = value;
+		}
+	}
+
+	const create_graph = (region) => {
+		const self = {};
+		self.self = self;
+		self['later key'] = `${region}-self`;
+
+		const left = {};
+		const right = {};
+		left.peer = right;
+		left.label = `${region}-left`;
+		right.owner = left;
+		right.label = `${region}-right`;
+
+		const mixed = {};
+		mixed.wrapper = new Wrapper(mixed);
+		mixed['after wrapper'] = `${region}-mixed`;
+
+		const repeated = {};
+		repeated.first = region;
+		repeated.self = repeated;
+		repeated['non identifier'] = true;
+
+		const numeric = {};
+		numeric.tail = region;
+		numeric[10] = numeric;
+		numeric[2] = 'two';
+		numeric.after = true;
+
+		const null_object = Object.create(null);
+		null_object.self = null_object;
+		null_object['null key'] = region;
+
+		return { self, left, mixed, repeated: [repeated, repeated], numeric, null_object };
+	};
+	const expected = {
+		self: ['self', 'later key'],
+		left: ['peer', 'label'],
+		right: ['owner', 'label'],
+		mixed: ['wrapper', 'after wrapper'],
+		repeated: ['first', 'self', 'non identifier'],
+		numeric: ['2', '10', 'tail', 'after'],
+		null_object: ['self', 'null key']
+	};
+	const verify = (graph) => {
+		assert.equal(Object.keys(graph.self), expected.self);
+		assert.is(graph.self.self, graph.self);
+		assert.equal(Object.keys(graph.left), expected.left);
+		assert.equal(Object.keys(graph.left.peer), expected.right);
+		assert.is(graph.left.peer.owner, graph.left);
+		assert.equal(Object.keys(graph.mixed), expected.mixed);
+		assert.is(graph.mixed.wrapper.value, graph.mixed);
+		assert.is(graph.repeated[0], graph.repeated[1]);
+		assert.equal(Object.keys(graph.repeated[0]), expected.repeated);
+		assert.is(graph.repeated[0].self, graph.repeated[0]);
+		assert.equal(Object.keys(graph.numeric), expected.numeric);
+		assert.is(graph.numeric[10], graph.numeric);
+		assert.is(Object.getPrototypeOf(graph.null_object), null);
+		assert.equal(Object.keys(graph.null_object), expected.null_object);
+		assert.is(graph.null_object.self, graph.null_object);
+	};
+	const replacer = (value, js) => value instanceof Wrapper && js`({value:${value.value}})`;
+
+	const pending = deferred();
+	const result = await unevalStream({ head: create_graph('head'), tail: pending.promise }, replacer, { id: 'object-order' });
+	const target = client();
+	const root = target.head(result.head);
+	verify(root.head);
+	pending.resolve(create_graph('tail'));
+	for await (const block of result.tail) target.block(block);
+	verify(await root.tail);
+});
+
 test('no async values create no client session', async () => {
 	const target = client();
 	const result = await unevalStream({ value: 1 });
@@ -267,20 +345,31 @@ test('batches promise settlements observed in one flush window', async () => {
 	assert.equal(await result.tail.next(), { done: true, value: undefined });
 });
 
-test('collects settlements until the current batch is consumed', async () => {
+test('collects ordered settlements until the ready batch is consumed', async () => {
 	const a = deferred();
 	const b = deferred();
-	const result = await unevalStream([a.promise, b.promise], undefined, { id: 'frozen' });
+	const result = await unevalStream([a.promise, b.promise], undefined, { id: 'ready-until-consumed' });
 	const target = client();
-	target.head(result.head);
-	a.resolve(1);
-	await delay(5);
-	b.resolve(2);
-	await delay(5);
+	const root = target.head(result.head);
+	const first_settled = deferred();
+	const second_settled = deferred();
+	queueMicrotask(() => {
+		a.resolve('first');
+		first_settled.resolve();
+	});
+	await first_settled.promise;
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	queueMicrotask(() => {
+		b.resolve('second');
+		second_settled.resolve();
+	});
+	await second_settled.promise;
+	await new Promise((resolve) => setTimeout(resolve, 0));
 	const first = await result.tail.next();
 	const second = await result.tail.next();
 	assert.ok(!first.done && second.done);
 	target.block(first.value);
+	assert.equal(await Promise.all(Array.from(root)), ['first', 'second']);
 });
 
 test('rejects an unserializable asynchronous fulfillment', async () => {

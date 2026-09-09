@@ -33,7 +33,7 @@ import {
  * its output.
  *
  * @typedef {object} NodeBase
- * @property {any} value The original value represented by this node. Its contents are not read again during emission.
+ * @property {any} value The original identity represented by this node, retained for identity lookup and diagnostics. Captured container edges and scalar metadata are used during emission; ArrayBuffer `data` remains a live byte view.
  * @property {number} opaque Number of custom constructors embedding this node; when positive, emission must preserve it as a named value rather than duplicate it inline.
  * @property {number} region_id Identifies the emitted region for which the following planning fields are valid.
  * @property {number} position This node's position in the current emission's child-before-parent order.
@@ -92,7 +92,7 @@ import {
 /** @typedef {Extract<CapturedNode, { kind: 'Async' }>} AsyncNode */
 
 /**
- * A reusable snapshot of the non-primitive values discovered during one stream session.
+ * A reusable capture of the non-primitive values discovered during one stream session.
  *
  * @typedef {object} CapturedGraph
  * @property {unknown} root_value The initial value, retained to provide context in serialization errors.
@@ -116,10 +116,12 @@ export function is_node(child) {
 }
 
 /**
- * Builds a snapshot of a value and everything it contains. Each non-primitive identity gets one node,
- * even when it appears more than once, and each node records the values it refers to.
- * Later code can therefore generate output from this snapshot without reading the
- * original objects again.
+ * Captures a reconstruction graph for a value and everything it contains. Each non-primitive
+ * identity gets one node, even when it appears more than once, and each node records its captured
+ * edges or scalar metadata. Later code emits containers and most built-ins from those records
+ * instead of rereading their original contents. ArrayBuffer data deliberately remains a live
+ * `Uint8Array` view rather than a byte snapshot and therefore relies on the stream's immutable-input
+ * contract until emission has finished.
  *
  * Streaming output reuses this graph across multiple emitted values. Before emitting
  * one value, `uneval-stream` walks only the nodes reachable from that value and works
