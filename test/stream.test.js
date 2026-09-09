@@ -1,4 +1,6 @@
 import vm from 'node:vm';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 import { suite } from 'uvu';
 import * as assert from 'uvu/assert';
@@ -1070,6 +1072,7 @@ test('buffers native async iterable events before client next', async () => {
 	const { root } = await drain(await unevalStream(source, undefined, { id: 'native-buffer' }));
 	assert.equal({ ...await root.next() }, { done: false, value: 1 });
 	assert.equal({ ...await root.next() }, { done: true, value: 2 });
+	assert.equal({ ...await root.next() }, { done: true, value: undefined });
 });
 
 test('delivers buffered native yields before source errors', async () => {
@@ -1078,6 +1081,7 @@ test('delivers buffered native yields before source errors', async () => {
 	const { root } = await drain(await unevalStream(source, undefined, { id: 'native-buffer-error' }));
 	assert.equal({ ...await root.next() }, { done: false, value: 1 });
 	await rejects(root.next(), reason);
+	assert.equal({ ...await root.next() }, { done: true, value: undefined });
 });
 
 test('settles multiple pending native next calls on terminal events', async () => {
@@ -1095,15 +1099,19 @@ test('settles multiple pending native next calls on terminal events', async () =
 		const target = client();
 		const root = target.head(result.head);
 		const pending = [root.next(), root.next(), root.next()];
-		const rejected = terminal === 'error' ? pending.map((item) => rejects(item, reason)) : [];
+		const rejected = terminal === 'error' ? rejects(pending[0], reason) : undefined;
 		ready.resolve();
 		for await (const block of result.tail) target.block(block);
 		if (terminal === 'complete') {
 			const settled = await Promise.all(pending);
-			for (const item of settled) assert.equal({ ...item }, { done: true, value: 7 });
+			assert.equal({ ...settled[0] }, { done: true, value: 7 });
+			assert.equal({ ...settled[1] }, { done: true, value: undefined });
+			assert.equal({ ...settled[2] }, { done: true, value: undefined });
 			assert.ok(settled[0] !== settled[1] && settled[1] !== settled[2]);
 		} else {
-			await Promise.all(rejected);
+			await rejected;
+			assert.equal({ ...await pending[1] }, { done: true, value: undefined });
+			assert.equal({ ...await pending[2] }, { done: true, value: undefined });
 		}
 	}
 });
@@ -1146,7 +1154,7 @@ test('native client return and throw are local and ignore later updates', async 
 		const reason = new Error('local');
 		if (method === 'return') {
 			assert.equal({ ...await root.return(7) }, { done: true, value: 7 });
-			assert.equal({ ...await pending }, { done: true, value: 7 });
+			assert.equal({ ...await pending }, { done: true, value: undefined });
 		} else {
 			await rejects(root.throw(reason), reason);
 			await rejects(pending, reason);
@@ -1157,6 +1165,17 @@ test('native client return and throw are local and ignore later updates', async 
 		if (!block.done) target.block(block.value);
 		await result.tail.return();
 		assert.is(returned, 1);
+	}
+});
+
+test('native client close discards updates buffered before server termination', async () => {
+	for (const method of ['return', 'throw']) {
+		const source = { async *[Symbol.asyncIterator]() { yield 1; return 2; } };
+		const { root } = await drain(await unevalStream(source, undefined, { id: `native-buffered-close-${method}` }));
+		const reason = new Error(method);
+		if (method === 'return') assert.equal({ ...await root.return(7) }, { done: true, value: 7 });
+		else await rejects(root.throw(reason), reason);
+		assert.equal({ ...await root.next() }, { done: true, value: undefined });
 	}
 });
 
@@ -1479,7 +1498,10 @@ test('guards primitive pending Promise protocol size', async () => {
 	const root = target.head(result.head);
 	pending.resolve(1);
 	const block = (await result.tail.next()).value;
-	const message = `head=${result.head.length} tail=${block.length}`;
+	const message = `head=${result.head.length} gzip=${gzipSync(result.head).length} tail=${block.length}`;
+	// Immediate rejection observation changes this fixture from raw/gzip 178/161 to 211/177.
+	assert.is(result.head.length, 211, message);
+	assert.is(gzipSync(result.head).length, 177, message);
 	assert.match(result.head, /\{__proto__:null\}/, message);
 	assert.match(result.head, /s=n\["size"\]=\{a:\[\],s:\[\],c:\[\],p:\[\]\}/, message);
 	assert.match(block, /s\.p\[0\]\[0\]\(1\);delete s\.p\[0\];delete n\["size"\]/, message);
@@ -1496,17 +1518,20 @@ test('guards native sequence adapter structure and size', async () => {
 	const source = { async *[Symbol.asyncIterator]() { await ready.promise; yield 1; return 2; } };
 	const result = await unevalStream(source, undefined, { id: 'native-size' });
 	// the queue runtime is defined once in the block prelude, ahead of its first use
-	const runtime = result.head.match(/s\.f=.*?\}\}\}/)?.[0];
+	const runtime = result.head.slice(result.head.indexOf('s.f='), result.head.indexOf(';s.f('));
 	assert.ok(runtime, result.head);
 	const construct = result.head.match(/s\.f\(g=>\{[^}]*\}\)/)?.[0];
 	assert.ok(construct, result.head);
 	// Structured capture grouping changed this fixture from raw/gzip 638/395 to 644/397.
+	// The readable authoritative transition runtime changes it to raw/gzip 1304/665.
 	const message = `runtime=${runtime.length} head=${result.head.length} gzip=${gzipSync(result.head).length}`;
+	assert.is(result.head.length, 1304, message);
+	assert.is(gzipSync(result.head).length, 665, message);
 	assert.ok(result.head.indexOf(runtime) < result.head.indexOf(construct), message);
 	assert.not.match(runtime, /Promise\.(?:resolve|reject)/, message);
 	assert.is((runtime.match(/new Promise/g) ?? []).length, 1, message);
 	assert.match(construct, /\(s\.p\[0\]=\(g\)\)\}/, message);
-	assert.ok(runtime.length + construct.length < 650, message);
+	assert.ok(runtime.length + construct.length < 1300, message);
 	// the queue runtime is shared: both sequences call s.f but its definition ships once
 	const two = await unevalStream(
 		{ a: { async *[Symbol.asyncIterator]() {} }, b: { async *[Symbol.asyncIterator]() {} } },
@@ -1514,7 +1539,9 @@ test('guards native sequence adapter structure and size', async () => {
 		{ id: 'native-shared' }
 	);
 	assert.is((two.head.match(/s\.f\(/g) ?? []).length, 2, two.head);
-	assert.is((two.head.match(/while\(w\.length/g) ?? []).length, 1, two.head);
+	assert.is((two.head.match(/while\(j<w\.length/g) ?? []).length, 1, two.head);
+	assert.is(two.head.length, 1420, `raw=${two.head.length} gzip=${gzipSync(two.head).length}`);
+	assert.is(gzipSync(two.head).length, 696, `raw=${two.head.length} gzip=${gzipSync(two.head).length}`);
 	const target = client();
 	target.head(result.head);
 	ready.resolve();
@@ -1676,6 +1703,16 @@ test('overrides native promise handling through the replacer', async () => {
 	const { root, blocks } = await drain(result);
 	assert.is(root.overridden, true);
 	assert.equal(blocks, []);
+});
+
+test('observes generated native Promise rejections without changing them', () => {
+	const fixture = fileURLToPath(new URL('../fixtures/stream/native-promise-rejection.mjs', import.meta.url));
+	const result = spawnSync(process.execPath, [fixture], {
+		encoding: 'utf8',
+		timeout: 10_000
+	});
+	assert.is(result.signal, null, `fixture timed out or was terminated: ${result.stderr}`);
+	assert.is(result.status, 0, `fixture failed:\n${result.stdout}${result.stderr}`);
 });
 
 test('reports operation fallback and fatal error boundaries', async () => {
@@ -2338,6 +2375,7 @@ test('shares the pending promise construct helper', async () => {
 	const single = await unevalStream(new Promise(() => {}), undefined, { id: 'single-promise' });
 	assert.is((single.head.match(/s\.w=/g) ?? []).length, 1, single.head);
 	assert.is((single.head.match(/s\.w\(/g) ?? []).length, 1, single.head);
+	assert.is((single.head.match(/\.catch\(\(\)=>\{\}\)/g) ?? []).length, 1, single.head);
 	await single.tail.return();
 
 	const multiple = await unevalStream(
@@ -2347,6 +2385,7 @@ test('shares the pending promise construct helper', async () => {
 	);
 	assert.is((multiple.head.match(/s\.w=/g) ?? []).length, 1, multiple.head);
 	assert.is((multiple.head.match(/s\.w\(/g) ?? []).length, 3, multiple.head);
+	assert.is((multiple.head.match(/\.catch\(\(\)=>\{\}\)/g) ?? []).length, 1, multiple.head);
 	assert.ok(multiple.head.indexOf('s.w=') < multiple.head.indexOf('s.w(0)'), multiple.head);
 	await multiple.tail.return();
 });

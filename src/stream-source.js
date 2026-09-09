@@ -431,10 +431,68 @@ export function append_reference(reference, segment) {
 
 /**
  * Session helper definitions. They remain data until the final reachable source is rendered.
+ *
+ * The sequence runtime keeps four concerns separate: `q`/`i` are buffered yields,
+ * `w`/`j` are pending client reads, `t`/`e`/`x` are the server terminal outcome and
+ * whether it was consumed, and `l` is local client closure. Queue indices avoid
+ * repeatedly shifting potentially large buffers. Keep this as the authoritative
+ * implementation evaluated by runtime tests and emitted to clients.
  */
 export const RUNTIMES = {
-	f: '(c)=>{let q=[],w=[],d=0,e,r=(d,v)=>({done:!!d,value:v}),a,f=()=>{while(w.length&&(q.length||d)){a=w.shift();q.length?a[0](r(0,q.shift())):d<2?a[0](r(1,e)):a[1](e)}},g=(o,v)=>d||(o?(d=o,e=v):q.push(v),f());c(g);return{[Symbol.asyncIterator](){return this},async next(){if(q.length)return r(0,q.shift());if(d>1)throw e;return d?r(1,e):new Promise((a,b)=>w.push([a,b]))},async return(v){d||(d=1,e=v,q.length=0,f());return r(1,v)},async throw(v){d||(d=2,e=v,q.length=0,f());throw v}}}',
-	w: 'i=>new Promise((a,b)=>{s.p[i]=[a,b]})',
+	f: `(c)=>{
+	let q=[],i=0; // buffered yields and next unread index
+	let w=[],j=0; // pending reads and next unsettled index
+	let t=0,e,x=0; // server terminal type, value/reason, and consumed flag
+	let l=0; // local client closure
+	let r=(d,v)=>({done:!!d,value:v});
+	let f=()=>{
+		while(j<w.length&&(i<q.length||t||l)){
+			let a=w[j++];
+			if(l)a[0](r(1));
+			else if(i<q.length)a[0](r(0,q[i++]));
+			else if(!x){
+				x=1;
+				t<2?a[0](r(1,e)):a[1](e);
+			}else a[0](r(1));
+		}
+		if(i===q.length)q=[],i=0;
+		if(j===w.length)w=[],j=0;
+	};
+	let g=(o,v)=>{
+		if(l||t)return;
+		o?(t=o,e=v):q.push(v);
+		f();
+	};
+	let k=(v,n)=>{
+		if(l)return;
+		l=1;
+		q=[];i=0;t=0;e=void 0;x=1;
+		for(;j<w.length;j++)n?w[j][1](v):w[j][0](r(1));
+		w=[];j=0;
+	};
+	c(g);
+	return{
+		[Symbol.asyncIterator](){return this},
+		async next(){
+			if(l)return r(1);
+			if(i<q.length){
+				let v=q[i++];
+				if(i===q.length)q=[],i=0;
+				return r(0,v);
+			}
+			if(t&&!x){
+				x=1;
+				if(t>1)throw e;
+				return r(1,e);
+			}
+			if(t)return r(1);
+			return new Promise((a,b)=>w.push([a,b]));
+		},
+		async return(v){k(v,0);return r(1,v)},
+		async throw(v){k(v,1);throw v}
+	};
+}`,
+	w: 'i=>{let p=new Promise((a,b)=>{s.p[i]=[a,b]});p.catch(()=>{});return p}',
 	r: '(i,j,v)=>(s.p[i][j](v),delete s.p[i])',
 	v: 'v=>(s.a.push(v),v)'
 };
