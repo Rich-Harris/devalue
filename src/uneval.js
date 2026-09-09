@@ -23,7 +23,7 @@ const reserved =
 export function uneval(value, replacer) {
 	const counts = new Map();
 
-	/** @type {string[]} */
+	/** @type {import('./types.js').PathSegment[]} */
 	const keys = [];
 
 	const custom = new Map();
@@ -66,7 +66,7 @@ export function uneval(value, replacer) {
 
 				case 'Array':
 					/** @type {any[]} */ (thing).forEach((value, i) => {
-						keys.push(`[${i}]`);
+						keys.push(i);
 						walk(value);
 						keys.pop();
 					});
@@ -78,7 +78,7 @@ export function uneval(value, replacer) {
 
 				case 'Map':
 					for (const [key, value] of thing) {
-						keys.push(`.get(${is_primitive(key) ? stringify_primitive(key) : '...'})`);
+						keys.push({ formatted: `.get(${is_primitive(key) ? stringify_primitive(key) : '...'})` });
 						walk(key);
 						walk(value);
 						keys.pop();
@@ -133,7 +133,7 @@ export function uneval(value, replacer) {
 							);
 						}
 
-						keys.push(stringify_key(key));
+						keys.push(key);
 						walk(thing[key]);
 						keys.pop();
 					}

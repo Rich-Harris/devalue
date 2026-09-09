@@ -23,10 +23,22 @@ export class DevalueError extends Error {
 	constructor(message, keys, value, root) {
 		super(message);
 		this.name = 'DevalueError';
-		this.path = keys.join('');
+		this.path = keys.map(format_key).join('');
 		this.value = value;
 		this.root = root;
 	}
+}
+
+/**
+ * Path segments are recorded raw while stringifying — a property key, an
+ * array index, or a pre-formatted `.get(…)` step — and only formatted here,
+ * when an error is actually raised.
+ * @param {import('./types.js').PathSegment} segment
+ */
+function format_key(segment) {
+	if (typeof segment === 'number') return `[${segment}]`;
+	if (typeof segment === 'string') return stringify_key(segment);
+	return segment.formatted;
 }
 
 /** @param {any} thing */
@@ -83,8 +95,15 @@ function get_escaped_char(char) {
 	}
 }
 
+// characters `stringify_string` escapes: quote, backslash, `<`, control
+// characters, and the line/paragraph separators
+const needs_escape = /["<\\\u0000-\u001f\u2028\u2029]/;
+
 /** @param {string} str */
 export function stringify_string(str) {
+	// the common case: nothing to escape, no per-character work
+	if (!needs_escape.test(str)) return `"${str}"`;
+
 	let result = '';
 	let last_pos = 0;
 	const len = str.length;
@@ -103,9 +122,10 @@ export function stringify_string(str) {
 
 /** @param {Record<string | symbol, any>} object */
 export function enumerable_symbols(object) {
-	return Object.getOwnPropertySymbols(object).filter(
-		(symbol) => Object.getOwnPropertyDescriptor(object, symbol).enumerable
-	);
+	const symbols = Object.getOwnPropertySymbols(object);
+	return symbols.length === 0
+		? symbols
+		: symbols.filter((symbol) => Object.getOwnPropertyDescriptor(object, symbol).enumerable);
 }
 
 const is_identifier = /^[a-zA-Z_$][a-zA-Z_$0-9]*$/;

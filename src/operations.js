@@ -58,7 +58,16 @@ const stringify_operations = {
 
 	toPrimitive: (value) => value,
 
-	tagOf: (value) => get_type(value),
+	tagOf: (value) => {
+		// arrays and plain objects, the common shapes, skip the string
+		// `Object.prototype.toString` allocates — unless a `Symbol.toStringTag`
+		// is present, which that call would honor
+		if (Symbol.toStringTag in value) return get_type(value);
+		if (Array.isArray(value)) return 'Array';
+		const proto = Object.getPrototypeOf(value);
+		if (proto === Object.prototype || proto === null) return 'Object';
+		return get_type(value);
+	},
 
 	isThenable: (value) => typeof value.then === 'function',
 

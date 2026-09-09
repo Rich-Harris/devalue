@@ -1,3 +1,10 @@
+/**
+ * One step of the path `stringify` records to the value being serialized,
+ * kept raw and formatted only when a `DevalueError` is raised: a property
+ * key, an array index, or an already formatted `.get(…)` step of a Map.
+ */
+export type PathSegment = string | number | { formatted: string };
+
 export type StringValueTag =
 	| 'URL'
 	| 'URLSearchParams'

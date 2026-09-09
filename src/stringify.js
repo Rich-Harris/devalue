@@ -1,4 +1,4 @@
-import { DevalueError, stringify_key, stringify_string } from './utils.js';
+import { DevalueError, stringify_string } from './utils.js';
 import {
 	HOLE,
 	NAN,
@@ -84,7 +84,7 @@ function run(async, value, reducers, options) {
 		}
 	}
 
-	/** @type {string[]} */
+	/** @type {import('./types.js').PathSegment[]} */
 	const keys = [];
 
 	let p = 0;
@@ -200,7 +200,7 @@ function run(async, value, reducers, options) {
 						if (i > 0) str += ',';
 
 						if (ops.hasOwn(thing, i)) {
-							keys.push(`[${i}]`);
+							keys.push(i);
 							str += flatten(ops.get(thing, i));
 							keys.pop();
 						} else if (mostly_dense) {
@@ -251,7 +251,7 @@ function run(async, value, reducers, options) {
 								str = '[' + SPARSE + ',' + length;
 								for (let j = 0; j < populated_keys.length; j++) {
 									const key = populated_keys[j];
-									keys.push(`[${key}]`);
+									keys.push(key);
 									str += ',' + key + ',' + flatten(ops.get(thing, key));
 									keys.pop();
 								}
@@ -285,9 +285,9 @@ function run(async, value, reducers, options) {
 						const key_type = ops.typeOf(key);
 						const key_is_primitive =
 							key_type !== 'object' && key_type !== 'function' && key_type !== 'symbol';
-						keys.push(
-							`.get(${key_is_primitive ? stringify_primitive(ops.toPrimitive(key)) : '...'})`
-						);
+						keys.push({
+							formatted: `.get(${key_is_primitive ? stringify_primitive(ops.toPrimitive(key)) : '...'})`
+						});
 						str += `,${flatten(key)},${flatten(value)}`;
 						keys.pop();
 					}
@@ -372,7 +372,7 @@ function run(async, value, reducers, options) {
 								);
 							}
 
-							keys.push(stringify_key(key));
+							keys.push(key);
 							str += `,${stringify_string(key)},${flatten(ops.get(thing, key))}`;
 							keys.pop();
 						}
@@ -392,7 +392,7 @@ function run(async, value, reducers, options) {
 
 							if (started) str += ',';
 							started = true;
-							keys.push(stringify_key(key));
+							keys.push(key);
 							str += `${stringify_string(key)}:${flatten(ops.get(thing, key))}`;
 							keys.pop();
 						}
