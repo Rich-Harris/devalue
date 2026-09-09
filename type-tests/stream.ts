@@ -15,23 +15,25 @@ declare const promise: Promise<number>;
 declare const sequence: AsyncIterable<number, string>;
 
 declare const source: JavaScriptSource;
+declare const js: JavaScriptTag;
+const config = { retries: 2 };
 const reference: ClientReference = { target: source, control: source };
 
 const value: AsyncValueDescriptor<number> = {
 	type: 'async-value',
 	source: promise,
-	construct: () => source,
-	resolve: () => source,
-	reject: () => source
+	construct: (capture) => js`new RemoteValue(${config},${capture(js`[${config}]`)})`,
+	resolve: ({ target }, result) => js`${target}.resolve(${result},${config})`,
+	reject: ({ target }, reason) => js`${target}.reject(${reason},${config})`
 };
 
 const iterable: AsyncSequenceDescriptor<number, string> = {
 	type: 'async-sequence',
 	source: sequence,
-	construct: () => source,
-	next: () => source,
-	complete: () => source,
-	error: () => source
+	construct: () => js`new RemoteSequence(${config})`,
+	next: ({ target }, item) => js`${target}.next(${item},${config})`,
+	complete: ({ target }, result) => js`${target}.complete(${result},${config})`,
+	error: ({ target }, reason) => js`${target}.error(${reason},${config})`
 };
 
 const replacer: UnevalStreamReplacer = (_value, js: JavaScriptTag) => js`new Remote(${value})`;

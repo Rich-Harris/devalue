@@ -157,6 +157,52 @@ export function map_source(source, map) {
 	return create_source(output_strings, /** @type {JavaScriptSource[]} */ (output_values));
 }
 
+/**
+ * Compiles ordinary holes in a descriptor result. Unlike a synchronous custom
+ * replacement, a descriptor may place data inside the expression passed to its
+ * private capture instruction, so that selected instruction child is mapped too.
+ * Other branded instructions remain indivisible internal semantics.
+ * @param {JavaScriptSource} source
+ * @param {(value: unknown, index: number) => Emission} map
+ * @returns {Emission}
+ */
+export function map_descriptor_source(source, map) {
+	const { strings, values } = source[SOURCE];
+	let text = strings[0];
+	/** @type {string[] | undefined} */
+	let output_strings;
+	/** @type {JavaScriptSource[] | undefined} */
+	let output_values;
+	for (let i = 0; i < values.length; i++) {
+		const value = values[i];
+		const mapped = is_source(value) ? map_descriptor_source(value, map)
+			: is_stream_instruction(value) ? map_descriptor_instruction(value, map) : map(value, i);
+		if (typeof mapped === 'string') text += mapped;
+		else {
+			(output_strings ??= []).push(text);
+			(output_values ??= []).push(mapped);
+			text = '';
+		}
+		text += strings[i + 1];
+	}
+	if (!output_strings) return text;
+	output_strings.push(text);
+	return create_source(output_strings, /** @type {JavaScriptSource[]} */ (output_values));
+}
+
+/**
+ * @param {StreamInstruction} instruction
+ * @param {(value: unknown, index: number) => Emission} map
+ * @returns {JavaScriptSource}
+ */
+function map_descriptor_instruction(instruction, map) {
+	if (instruction.type !== 'capture') return instruction_source(instruction);
+	const source = typeof instruction.source === 'string'
+		? instruction.source
+		: map_descriptor_source(instruction.source, map);
+	return instruction_source(brand({ ...instruction, source }));
+}
+
 /** Wrap generated text only at a descriptor's public JavaScriptSource boundary. @param {Emission} source */
 export function template_source(source) {
 	return typeof source === 'string' ? raw_source(source) : source;
@@ -175,6 +221,30 @@ export function source_values(source) {
 		if (is_source(value)) values.push(...source_values(value));
 		else if (!is_stream_instruction(value)) values.push(value);
 	}
+	return values;
+}
+
+/**
+ * Returns ordinary descriptor data holes, including those in reachable private
+ * capture expressions. Hole indices are local to the fragment that owns them.
+ * @param {JavaScriptSource} source
+ * @returns {{ value: unknown, index: number, capture: boolean }[]}
+ */
+export function descriptor_source_values(source) {
+	/** @type {{ value: unknown, index: number, capture: boolean }[]} */
+	const values = [];
+	/** @param {JavaScriptSource} fragment @param {boolean} capture */
+	const walk = (fragment, capture) => {
+		const source_values = fragment[SOURCE].values;
+		for (let i = 0; i < source_values.length; i++) {
+			const value = source_values[i];
+			if (is_source(value)) walk(value, capture);
+			else if (is_stream_instruction(value)) {
+				if (value.type === 'capture' && typeof value.source !== 'string') walk(value.source, true);
+			} else values.push({ value, index: i, capture });
+		}
+	};
+	walk(source, false);
 	return values;
 }
 
@@ -199,21 +269,6 @@ export function count_source(source, target) {
 		if (fragment === target) count++;
 	});
 	return count;
-}
-
-/**
- * Fails closed on every ordinary descriptor hole. Descriptor fragments may contain only
- * supported primitives, nested fragments, and instructions created by this module.
- * @param {JavaScriptSource} source
- * @param {string} [context]
- */
-export function assert_descriptor_source(source, context = 'async descriptor source') {
-	walk_source(source, (value, index) => {
-		if (is_stream_instruction(value)) return;
-		if (!is_primitive(value) || typeof value === 'symbol') {
-			throw interpolation_error(value, `${context}, template hole ${index + 1}`);
-		}
-	});
 }
 
 /**
@@ -311,21 +366,8 @@ export function describe_received(value) {
 function interpolation_error(value, context) {
 	const reason = typeof value === 'symbol'
 		? 'Symbol values cannot be serialized as data. If you intended trusted JavaScript, write it in a nested js tagged template instead.'
-		: 'Ordinary objects and functions are not yet supported as data holes in async descriptor templates. This is a temporary implementation restriction: remove this blanket rejection when Plan 007 adds graph serialization for descriptor holes (unsupported values must still fail graph validation). Until then, use serializable primitives, nested js templates, or the supplied target/control/value source fragments.';
+		: 'This ordinary value reached source rendering without first being serialized through the captured graph (internal emitter error).';
 	return new TypeError(`Invalid JavaScript source interpolation in ${context}: received ${describe_received(value)}. ${reason}`);
-}
-
-/**
- * @param {JavaScriptSource} source
- * @param {(value: unknown, index: number) => void} callback
- */
-function walk_source(source, callback) {
-	const values = source[SOURCE].values;
-	for (let i = 0; i < values.length; i++) {
-		const value = values[i];
-		if (is_source(value)) walk_source(value, callback);
-		else callback(value, i);
-	}
 }
 
 /**

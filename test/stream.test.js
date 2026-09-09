@@ -635,20 +635,23 @@ test('preserves instruction-shaped objects as synchronous replacer data', async 
 	}
 });
 
-test('fails closed on instruction-shaped descriptor holes', async () => {
+test('serializes instruction-shaped descriptor holes as ordinary data', async () => {
 	for (const value of [
-		{ type: 'reference' },
-		{ type: 'capture' },
-		{ type: 'outcome' },
-		Object.create({ type: 'capture' })
+		{ type: 'reference', value: 1 },
+		{ type: 'capture', value: 2 },
+		{ type: 'outcome', value: 3 }
 	]) {
-		await rejects(unevalStream({}, (_value, js) => ({
+		const root = {};
+		const result = await unevalStream(root, (candidate, js) => candidate === root && ({
 			type: 'async-value',
-			source: new Promise(() => {}),
+			source: Promise.resolve(),
 			construct: () => js`${value}`,
 			resolve: () => js``,
 			reject: () => js``
-		})), /construct\(\), template hole 1: received an object.*temporary implementation restriction.*remove this blanket rejection when Plan 007/);
+		}));
+		const { root: revived } = await drain(result);
+		assert.is(revived.type, value.type);
+		assert.is(revived.value, value.value);
 	}
 });
 
@@ -708,7 +711,7 @@ test('explains raw values returned from construction and passed to capture', asy
 	}
 });
 
-test('reports the unsupported operation hole and recovers through the documented fallback', async () => {
+test('serializes nested instruction-shaped operation holes as ordinary data', async () => {
 	const pending = deferred();
 	const reports = [];
 	const job = {};
@@ -721,11 +724,8 @@ test('reports the unsupported operation hole and recovers through the documented
 	const root = target.head(result.head);
 	pending.resolve(7);
 	target.block((await result.tail.next()).value);
-	assert.is(reports.length, 1);
-	assert.instance(reports[0][0], TypeError);
-	assert.match(reports[0][0].message, /resolve\(\), template hole 1: received an object.*supplied target\/control\/value source fragments/);
-	assert.is(reports[0][1], 7);
-	assert.match(root.error.message, /failed to serialize asynchronous value/);
+	assert.is(reports.length, 0);
+	assert.is(root.value.type, 'reference');
 	assert.equal(await result.tail.next(), { done: true, value: undefined });
 });
 
