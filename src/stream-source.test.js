@@ -16,6 +16,7 @@ import {
 	promise_source,
 	reference_source,
 	render_stream_source,
+	render_stream_source_with_names,
 	runtime_source,
 	select_outcome_source,
 	source_helpers,
@@ -92,7 +93,16 @@ test('renders helper definitions before structured uses', () => {
 
 test('groups capture assignments', () => {
 	const capture = capture_source(0, js`1,2`);
-	assert.is(render_stream_source(js`f(${capture})`), 'f((s.p[0]=(1,2)))');
+	assert.is(render_stream_source(js`f(${capture})`), 'f((s.p[0]=(1,2\n)))');
+});
+
+test('preserves and renders reusable identifier tokens through nested source mapping', () => {
+	const first = js.identifier();
+	const second = js.identifier();
+	const source = map_source(js`(()=>{const ${first}=1;return ${js`[${first},${second}]`}})()`, stringify_primitive);
+	const names = new Map([[first, 'a'], [second, 'b']]);
+	assert.is(render_stream_source_with_names(source, [], 'c', (identifier) => names.get(identifier)), '(()=>{const a=1;return [a,b]})()');
+	assert.equal(source_values(source), []);
 });
 
 test('describes rejected holes without invoking user conversion or inspection hooks', () => {
@@ -199,7 +209,7 @@ test('traverses structured dependencies inside capture assignments with textual 
 	const capture = capture_source(0, join_sources(['"0",', promise_source(12)]));
 	const source = join_sources(['f(', capture, ')']);
 	assert.equal(source_helpers(source), ['w']);
-	assert.is(render_stream_source(source), 'f((s.p[0]=("0",s.w(12))))');
+	assert.is(render_stream_source(source), 'f((s.p[0]=("0",s.w(12)\n)))');
 });
 
 test.run();

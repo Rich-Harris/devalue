@@ -52,7 +52,10 @@ export interface JavaScriptTag {
 	(strings: TemplateStringsArray, ...values: unknown[]): JavaScriptSource;
 	/**
 	 * Creates a reusable generated identifier for interpolation into trusted JavaScript source.
-	 * Reusing the token preserves its name; the generated spelling is private.
+	 * Reusing the token preserves its name; the generated spelling is private and coordinated with
+	 * serializer bindings. Stream descriptor constructors and operations should use these tokens for
+	 * local declarations and references when collision freedom from generated bindings is required.
+	 * Literal source remains trusted and is not scope-analyzed.
 	 */
 	identifier(): JavaScriptSource;
 }

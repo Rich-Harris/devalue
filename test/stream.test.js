@@ -483,8 +483,8 @@ test('retains descendants of Map key value and Set member sidecars', async () =>
 	assert.is(await root.pending_key, revived_key.nested[0]);
 	assert.is(await root.pending_value, revived_value.nested.child);
 	assert.is(await root.pending_member, revived_member.nested[0]);
-	assert.is((result.head.match(/s\.c\[\d+\]=/g) ?? []).length, 2, result.head);
-	assert.not.match(emitted, /s\.s\[/);
+	assert.is((result.head.match(/\.c\[\d+\]=/g) ?? []).length, 2, result.head);
+	assert.not.match(emitted, /\.s\[/);
 	assert.not.match(emitted, /Array\.from\(/);
 });
 
@@ -509,7 +509,7 @@ test('retains collection descendants introduced before repeated outcomes in the 
 	same_a.resolve(shared);
 	same_b.resolve(shared);
 	const first = (await result.tail.next()).value;
-	assert.not.match(first, /s\.s\[/);
+	assert.not.match(first, /\.s\[/);
 	target.block(first);
 	const collection = await root.introduced;
 	const revived_key = Array.from(collection.map.keys())[0];
@@ -597,8 +597,8 @@ test('retains cyclic shared view and buffer descendants without blanket slots', 
 	assert.equal(Array.from(root.primitive_map.keys()), ['one', 'two']);
 	assert.is(root.primitive_map.get('one'), 1);
 	assert.is(root.primitive_map.get('two'), 2);
-	assert.is((result.head.match(/s\.c\[\d+\]=/g) ?? []).length, 2, result.head);
-	assert.not.match(emitted, /s\.s\[/);
+	assert.is((result.head.match(/\.c\[\d+\]=/g) ?? []).length, 2, result.head);
+	assert.not.match(emitted, /\.s\[/);
 	assert.not.match(emitted, /Array\.from\(/);
 });
 
@@ -1575,7 +1575,7 @@ test('reports structural output guardrails', async () => {
 	const block = (await result.tail.next()).value;
 	const message = `raw=${block.length} gzip=${gzipSync(block).length}`;
 	assert.not.match(result.head + block, /Array\.from\(/, message);
-	assert.is((block.match(/globalThis\.__d\["sizes"\]\.b\(\(s,n\)=>\{/g) ?? []).length, 1, message);
+	assert.is((block.match(/globalThis\.__d\["sizes"\]\.b\(\([a-z]+,[a-z]+\)=>\{/g) ?? []).length, 1, message);
 	assert.not.match(result.head, /TypeError|invalid stream namespace|missing stream session|stream id collision|Object\.hasOwn|hasOwnProperty|Reflect\.ownKeys/, message);
 	assert.ok(block.length < 300, message);
 });
@@ -1588,12 +1588,13 @@ test('guards primitive pending Promise protocol size', async () => {
 	pending.resolve(1);
 	const block = (await result.tail.next()).value;
 	const message = `head=${result.head.length} gzip=${gzipSync(result.head).length} tail=${block.length}`;
-	// Immediate rejection observation changes this fixture from raw/gzip 178/161 to 211/177.
+	// Immediate rejection observation changed this fixture from raw/gzip 178/161 to 211/177;
+	// coordinated compact binding names retain raw size and change gzip to 178.
 	assert.is(result.head.length, 211, message);
-	assert.is(gzipSync(result.head).length, 177, message);
+	assert.is(gzipSync(result.head).length, 178, message);
 	assert.match(result.head, /\{__proto__:null\}/, message);
-	assert.match(result.head, /s=n\["size"\]=\{a:\[\],s:\[\],c:\[\],p:\[\]\}/, message);
-	assert.match(block, /s\.p\[0\]\[0\]\(1\);delete s\.p\[0\];delete n\["size"\]/, message);
+	assert.match(result.head, /[a-z]+=[a-z]+\["size"\]=\{a:\[\],s:\[\],c:\[\],p:\[\]\}/, message);
+	assert.match(block, /[a-z]+\.p\[0\]\[0\]\(1\);delete [a-z]+\.p\[0\];delete [a-z]+\["size"\]/, message);
 	assert.not.match(result.head + block, /\.(?:anchors|slots|collections|pending)\b/, message);
 	assert.not.match(result.head, /TypeError|invalid stream namespace|missing stream session|stream id collision|Object\.hasOwn|hasOwnProperty|Reflect\.ownKeys/, message);
 	assert.ok(result.head.length < 220, message);
@@ -1607,9 +1608,11 @@ test('guards native sequence adapter structure and size', async () => {
 	const source = { async *[Symbol.asyncIterator]() { await ready.promise; yield 1; return 2; } };
 	const result = await unevalStream(source, undefined, { id: 'native-size' });
 	// the queue runtime is defined once in the block prelude, ahead of its first use
-	const runtime = result.head.slice(result.head.indexOf('s.f='), result.head.indexOf(';s.f('));
+	const session = result.head.match(/,([a-z]+)=[a-z]+\["native-size"\]/)?.[1];
+	assert.ok(session, result.head);
+	const runtime = result.head.slice(result.head.indexOf(`${session}.f=`), result.head.indexOf(`;${session}.f(`));
 	assert.ok(runtime, result.head);
-	const construct = result.head.match(/s\.f\(g=>\{[^}]*\}\)/)?.[0];
+	const construct = result.head.match(new RegExp(`${session}\\.f\\(g=>\\{[^}]*\\}\\)`))?.[0];
 	assert.ok(construct, result.head);
 	// Structured capture grouping changed this fixture from raw/gzip 638/395 to 644/397.
 	// The readable authoritative transition runtime changes it to raw/gzip 1304/665.
@@ -1619,7 +1622,7 @@ test('guards native sequence adapter structure and size', async () => {
 	assert.ok(result.head.indexOf(runtime) < result.head.indexOf(construct), message);
 	assert.not.match(runtime, /Promise\.(?:resolve|reject)/, message);
 	assert.is((runtime.match(/new Promise/g) ?? []).length, 1, message);
-	assert.match(construct, /\(s\.p\[0\]=\(g\)\)\}/, message);
+	assert.match(construct, new RegExp(`\\(${session}\\.p\\[0\\]=\\(g\\)\\)\\}`), message);
 	assert.ok(runtime.length + construct.length < 1300, message);
 	// the queue runtime is shared: both sequences call s.f but its definition ships once
 	const two = await unevalStream(
@@ -1627,19 +1630,20 @@ test('guards native sequence adapter structure and size', async () => {
 		undefined,
 		{ id: 'native-shared' }
 	);
-	assert.is((two.head.match(/s\.f\(/g) ?? []).length, 2, two.head);
+	assert.is((two.head.match(/\.f\(/g) ?? []).length, 2, two.head);
 	assert.is((two.head.match(/while\(j<w\.length/g) ?? []).length, 1, two.head);
 	assert.is(two.head.length, 1420, `raw=${two.head.length} gzip=${gzipSync(two.head).length}`);
-	assert.is(gzipSync(two.head).length, 696, `raw=${two.head.length} gzip=${gzipSync(two.head).length}`);
+	// Coordinated compact wrapper bindings retain raw size and change gzip from 696 to 698.
+	assert.is(gzipSync(two.head).length, 698, `raw=${two.head.length} gzip=${gzipSync(two.head).length}`);
 	const target = client();
 	target.head(result.head);
 	ready.resolve();
 	// Each iterator pull gets its own batch, including the terminal result.
 	const item = (await result.tail.next()).value;
-	assert.match(item, /s\.p\[0\]\(0,1\)/, message);
+	assert.match(item, /\.p\[0\]\(0,1\)/, message);
 	target.block(item);
 	const complete = (await result.tail.next()).value;
-	assert.match(complete, /s\.p\[0\]\(1,2\)/, message);
+	assert.match(complete, /\.p\[0\]\(1,2\)/, message);
 	target.block(complete);
 	assert.equal(await result.tail.next(), { done: true, value: undefined });
 
@@ -1648,7 +1652,7 @@ test('guards native sequence adapter structure and size', async () => {
 	target.head(failed.head);
 	fail.resolve();
 	const errored = (await failed.tail.next()).value;
-	assert.match(errored, /s\.p\[0\]\(2,/, message);
+	assert.match(errored, /\.p\[0\]\(2,/, message);
 });
 
 test('validates replacer results and descriptor shapes synchronously', async () => {
@@ -2205,10 +2209,10 @@ test('guards large payload structure without descendant slots or repeated aliase
 	const block = (await result.tail.next()).value;
 	const message = `raw=${block.length} gzip=${gzipSync(block).length}`;
 	// a single-use outcome folds its anchor assignment into the settlement operation
-	assert.is((block.match(/s\.a\[/g) ?? []).length, 1, message);
-	assert.match(block, /\(s\.a\[1\]=\{/, message);
-	assert.is((block.match(/globalThis\.__d\["large-guardrail"\]\.b\(\(s,n\)=>\{/g) ?? []).length, 1, message);
-	assert.not.match(block, /s\.s\[/, message);
+	assert.is((block.match(/\.a\[/g) ?? []).length, 1, message);
+	assert.match(block, /\([a-z]+\.a\[1\]=\{/, message);
+	assert.is((block.match(/globalThis\.__d\["large-guardrail"\]\.b\(\([a-z]+,[a-z]+\)=>\{/g) ?? []).length, 1, message);
+	assert.not.match(block, /\.s\[/, message);
 	assert.not.match(block, /Array\.from\(/, message);
 });
 
@@ -2232,9 +2236,9 @@ test('anchors implicitly via the push helper once it pays for itself', async () 
 		target.block(block);
 	}
 	// the first five anchors are explicit assignments; later anchors ride the helper
-	assert.is((source.match(/s\.a\[\d+\]=/g) ?? []).length, 6, source); // head root + 5
-	assert.ok((source.match(/s\.v\(/g) ?? []).length >= 7, source);
-	assert.match(source, /s\.v=v=>\(s\.a\.push\(v\),v\)/, source);
+	assert.is((source.match(/\.a\[\d+\]=/g) ?? []).length, 6, source); // head root + 5
+	assert.ok((source.match(/\.v\(/g) ?? []).length >= 7, source);
+	assert.match(source, /[a-z]+\.v=v=>\([a-z]+\.a\.push\(v\),v\)/, source);
 	// identity is preserved across both anchor forms
 	const seen = [];
 	for await (const entry of root) seen.push(entry);
@@ -2307,7 +2311,7 @@ test('keeps dense anchors for unique roots interleaved with repeated roots', asy
 		assert.ok(revived);
 		for (let j = 0; j < i; j += 1) assert.ok(revived !== values.find((value) => value.index === j));
 	}
-	assert.ok((emitted.match(/s\.v\(/g) ?? []).length > 0, emitted);
+	assert.ok((emitted.match(/\.v\(/g) ?? []).length > 0, emitted);
 });
 
 test('selects the shortest stable structured path', async () => {
@@ -2323,7 +2327,7 @@ test('selects the shortest stable structured path', async () => {
 	const root = target.head(result.head);
 	pending.resolve(shared);
 	const block = (await result.tail.next()).value;
-	assert.match(block, /s\.a\[0\]\.x/);
+	assert.match(block, /[a-z]+\.a\[0\]\.x/);
 	assert.not.match(block, /veryLongPropertyName/);
 	target.block(block);
 	assert.is(await root.pending, root.x);
@@ -2337,7 +2341,7 @@ test('promotes a repeatedly used long path only when profitable', async () => {
 	const root = target.head(result.head);
 	pending.resolve([shared, shared, shared]);
 	const block = (await result.tail.next()).value;
-	assert.match(block, /s\.s\[0\]=s\.a\[0\]\.deeplyNestedPropertyName/);
+	assert.match(block, /[a-z]+\.s\[0\]=[a-z]+\.a\[0\]\.deeplyNestedPropertyName/);
 	target.block(block);
 	assert.is((await root.pending)[0], root.deeplyNestedPropertyName.anotherLongPropertyName);
 });
@@ -2350,8 +2354,8 @@ test('does not promote a repeated short path when unprofitable', async () => {
 	const root = target.head(result.head);
 	pending.resolve([shared, shared]);
 	const block = (await result.tail.next()).value;
-	assert.not.match(block, /s\.s\[/);
-	assert.is((block.match(/s\.a\[0\]\.x/g) ?? []).length, 2);
+	assert.not.match(block, /\.s\[/);
+	assert.is((block.match(/[a-z]+\.a\[0\]\.x/g) ?? []).length, 2);
 	target.block(block);
 	assert.is((await root.pending)[0], root.x);
 });
@@ -2362,7 +2366,11 @@ test('composes descriptor references without replacing similar source text', asy
 	const result = await unevalStream(pending.promise, (value, js) => value === pending.promise && ({
 		type: 'async-value',
 		source: pending.promise,
-		construct: (capture) => js`new Promise((a,b)=>{${capture(js`[a,b]`)}})`,
+		construct: (capture) => {
+			const resolve = js.identifier();
+			const reject = js.identifier();
+			return js`new Promise((${resolve},${reject})=>{${capture(js`[${resolve},${reject}]`)}})`;
+		},
 		resolve: ({ control }, payload) => js`globalThis.marker=${marker};${control}[0](${payload})`,
 		reject: ({ control }, reason) => js`${control}[1](${reason})`
 	}));
@@ -2462,8 +2470,8 @@ test('defines the sequence runtime before hoisted declarations that use it', asy
 
 test('shares the pending promise construct helper', async () => {
 	const single = await unevalStream(new Promise(() => {}), undefined, { id: 'single-promise' });
-	assert.is((single.head.match(/s\.w=/g) ?? []).length, 1, single.head);
-	assert.is((single.head.match(/s\.w\(/g) ?? []).length, 1, single.head);
+	assert.is((single.head.match(/\.w=/g) ?? []).length, 1, single.head);
+	assert.is((single.head.match(/\.w\(/g) ?? []).length, 1, single.head);
 	assert.is((single.head.match(/\.catch\(\(\)=>\{\}\)/g) ?? []).length, 1, single.head);
 	await single.tail.return();
 
@@ -2472,10 +2480,10 @@ test('shares the pending promise construct helper', async () => {
 		undefined,
 		{ id: 'multi-promise' }
 	);
-	assert.is((multiple.head.match(/s\.w=/g) ?? []).length, 1, multiple.head);
-	assert.is((multiple.head.match(/s\.w\(/g) ?? []).length, 3, multiple.head);
+	assert.is((multiple.head.match(/\.w=/g) ?? []).length, 1, multiple.head);
+	assert.is((multiple.head.match(/\.w\(/g) ?? []).length, 3, multiple.head);
 	assert.is((multiple.head.match(/\.catch\(\(\)=>\{\}\)/g) ?? []).length, 1, multiple.head);
-	assert.ok(multiple.head.indexOf('s.w=') < multiple.head.indexOf('s.w(0)'), multiple.head);
+	assert.ok(multiple.head.indexOf('.w=') < multiple.head.indexOf('.w(0)'), multiple.head);
 	await multiple.tail.return();
 });
 
@@ -2492,8 +2500,8 @@ test('shares the settlement helper across blocks once profitable', async () => {
 		blocks.push((await result.tail.next()).value);
 	}
 	for (const block of blocks) target.block(block);
-	assert.is((blocks.join('').match(/s\.r=/g) ?? []).length, 1, blocks.join('\n'));
-	assert.match(blocks[2], /s\.r\(2,0,/, blocks[2]);
+	assert.is((blocks.join('').match(/\.r=/g) ?? []).length, 1, blocks.join('\n'));
+	assert.match(blocks[2], /\.r\(2,0,/, blocks[2]);
 	assert.equal(JSON.parse(JSON.stringify(await Promise.all(Array.from(root)))), [{ i: 0 }, { i: 1 }, { i: 2 }]);
 	assert.is(target.context.__d && Object.keys(target.context.__d).length, 0);
 });
@@ -2505,10 +2513,116 @@ test('folds a single-use outcome anchor into its settlement operation', async ()
 	const root = target.head(result.head);
 	pending.resolve({ value: 42 });
 	const block = (await result.tail.next()).value;
-	assert.match(block, /\(s\.a\[1\]=\{value:42\}\)/, block);
-	assert.is((block.match(/s\.a\[1\]/g) ?? []).length, 1, block);
+	assert.match(block, /\([a-z]+\.a\[1\]=\{value:42\}\)/, block);
+	assert.is((block.match(/[a-z]+\.a\[1\]/g) ?? []).length, 1, block);
 	target.block(block);
 	assert.equal({ ...(await root) }, { value: 42 });
+});
+
+test('coordinates generated names with reusable identifier tokens across stream regions and blocks', async () => {
+	class Job {
+		constructor(name) {
+			this.name = name;
+			this.ready = deferred();
+		}
+	}
+	const first = new Job('first');
+	const second = new Job('second');
+	const failed = new Job('failed');
+	const shared = { value: 42 };
+	const outcome = { value: 42 };
+	outcome.self = outcome;
+	const tokens = new Map();
+	const replacer = (value, js) => {
+		if (!(value instanceof Job)) return;
+		const token = tokens.get(value) ?? js.identifier();
+		tokens.set(value, token);
+		return {
+			type: 'async-value',
+			source: value.ready.promise,
+			construct: () => js`({name:${value.name},values:[]})`,
+			resolve: ({ target }, payload) => {
+				if (value === failed) return js`const ${token}=${Symbol('provisional')}`;
+				const distinct = js.identifier();
+				return js`{const ${token}=${payload};const {value:${distinct}}=${token};${target}.values.push(${token},${distinct},${shared})}`;
+			},
+			reject: ({ target }, error) => js`{const ${token}=${error};${target}.values.push(${token},${token})}`
+		};
+	};
+	const result = await unevalStream({ first, second, failed, shared }, replacer, {
+		id: 'identifier-tokens',
+		onerror() {}
+	});
+	const target = client();
+	const root = target.head(result.head);
+	first.ready.resolve(outcome);
+	second.ready.resolve(outcome);
+	await delay(5);
+	const same_batch = (await result.tail.next()).value;
+	target.block(same_batch);
+	failed.ready.resolve(outcome);
+	const fallback = (await result.tail.next()).value;
+	target.block(fallback);
+	assert.is(root.first.values[0], root.second.values[0]);
+	assert.is(root.first.values[0].self, root.first.values[0]);
+	assert.is(root.first.values[2], root.shared);
+	assert.is(root.first.values[1], 42);
+	assert.is(root.failed.values[0], root.failed.values[1]);
+	const emitted = result.head + same_batch + fallback;
+	assert.not.match(emitted, /\b[ov]\d+\b/);
+	assert.is(target.context.__d && Object.keys(target.context.__d).length, 0);
+});
+
+test('protects complete custom construct capture and operation boundaries from line comments', async () => {
+	class Job {
+		constructor(name) {
+			this.name = name;
+			this.ready = deferred();
+		}
+	}
+	const folded = new Job('folded');
+	folded.ready.promise = Promise.resolve('head // string');
+	const first = new Job('first');
+	const second = new Job('second');
+	const failed = new Job('failed');
+	const replacer = (value, js) => {
+		if (!(value instanceof Job)) return;
+		const resolve = js.identifier();
+		const reject = js.identifier();
+		const local = js.identifier();
+		const partial = js`{name:${value.name},events:[]`;
+		return {
+			type: 'async-value',
+			source: value.ready.promise,
+			construct: (capture) => js`(()=>{const ${local}=${partial}};new Promise((${resolve},${reject})=>{${capture(js`[${resolve},${reject}] // capture`)}});return ${local}})() // construct`,
+			resolve: ({ target }, payload) => {
+				if (value === failed) throw new Error('use fallback');
+				return js`${target}.events.push(${payload}) // resolve`;
+			},
+			reject: ({ target }, reason) => js`${target}.events.push(${reason}) /* block */ // reject`
+		};
+	};
+	const result = await unevalStream({ folded, first, second, failed }, replacer, {
+		id: 'line-comments',
+		onerror() {}
+	});
+	const target = client();
+	const root = target.head(result.head);
+	assert.equal(Array.from(root.folded.events), ['head // string']);
+	first.ready.resolve('first');
+	second.ready.resolve('second');
+	await delay(5);
+	const batch = (await result.tail.next()).value;
+	target.block(batch);
+	failed.ready.resolve('ignored');
+	const fallback = (await result.tail.next()).value;
+	target.block(fallback);
+	assert.equal(Array.from(root.first.events), ['first']);
+	assert.equal(Array.from(root.second.events), ['second']);
+	assert.is(root.failed.events.length, 1);
+	assert.match(root.failed.events[0].message, /failed to serialize asynchronous value/);
+	assert.match(result.head + batch + fallback, /\/\/ (?:capture|construct|resolve|reject)\n/);
+	assert.is(target.context.__d && Object.keys(target.context.__d).length, 0);
 });
 
 test.run();

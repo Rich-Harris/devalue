@@ -197,9 +197,9 @@ test('reserves distinct capture indices for nested constructor descriptors', asy
 		construct: (capture) => js`({name:${value.name},control:${capture(js`[]`)},child:${value.child ?? null}})`,
 		resolve: () => js``, reject: () => js``
 	}), { id: 'nested-constructor-indices' });
-	assert.match(result.head, /s\.p\[0\]/);
-	assert.match(result.head, /s\.p\[1\]/);
-	assert.is((result.head.match(/s\.p\[\d+\]/g) ?? []).length, 2);
+	assert.match(result.head, /\.p\[0\]/);
+	assert.match(result.head, /\.p\[1\]/);
+	assert.is((result.head.match(/\.p\[\d+\]/g) ?? []).length, 2);
 	const root = client().head(result.head);
 	assert.is(root.child.name, 'inner');
 	outer.ready.resolve();

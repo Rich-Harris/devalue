@@ -13,13 +13,15 @@
  * @import { Emission } from './stream-source.js'
  */
 
-import { DevalueError, is_primitive, stringify_primitive, stringify_string } from './utils.js';
+import { DevalueError, get_name, is_primitive, stringify_primitive, stringify_string } from './utils.js';
 import { child, create_captured_graph, discover, is_node, roll_back } from './graph.js';
 import { is_source, js, raw_source } from './javascript-source.js';
 import {
 	RUNTIMES,
 	append_reference,
 	capture_source,
+	complete_expression_source,
+	complete_statement_source,
 	definitions_source,
 	descriptor_source_values,
 	describe_received,
@@ -32,7 +34,7 @@ import {
 	reference_source,
 	reference_length,
 	render_reference,
-	render_stream_source,
+	render_stream_source_with_names,
 	runtime_source,
 	select_outcome_source,
 	source_helpers,
@@ -123,8 +125,14 @@ class Session {
 	#references = new Map();
 	/** Ordered client-materialization boundary. Zero denotes the initialized head graph. */
 	#availability = 0;
-	/** Monotonic suffix for block-local outcome bindings. */
-	#local = 0;
+	/** Next coordinated generated lexical name. */
+	#name = 0;
+	/** Stable generated names for opaque identifier tokens. @type {Map<JavaScriptSource, string>} */
+	#identifiers = new Map();
+	/** Generated head/table binding visible to custom operation source. */
+	#table_name = '';
+	/** Generated client-session binding visible to all custom stream source. */
+	#session_name = '';
 	/** Monotonic owner tag for reusable node planning scratch. */
 	#region_id = 0;
 
@@ -161,11 +169,12 @@ class Session {
 			if (!this.#is_active()) return await this.#throw_failure(undefined);
 
 			if (this.#sources.length === 0) {
-				const head = render_stream_source(this.#emit_region(value, false));
+				const head = render_stream_source_with_names(this.#emit_region(value, false), [], 's', this.#render_identifier);
 				this.#complete();
 				return { head, tail: empty_tail(), id: this.#id };
 			}
 
+			this.#initialize_client_names();
 			this.#status = { state: 'streaming' };
 			// start observing the async sources
 			this.#start_sources();
@@ -209,7 +218,29 @@ class Session {
 	#render_final(source) {
 		const definitions = source_helpers(source).filter((key) => !this.#runtimes_emitted[key]);
 		for (const key of definitions) this.#runtimes_emitted[key] = true;
-		return render_stream_source(source, definitions);
+		return render_stream_source_with_names(source, definitions, this.#session_name || 's', this.#render_identifier);
+	}
+
+	/** Allocates the next compact name in the session's shared custom-visible scope. */
+	#next_name() {
+		return get_name(this.#name++);
+	}
+
+	/** @param {JavaScriptSource} identifier */
+	#render_identifier = (identifier) => {
+		let name = this.#identifiers.get(identifier);
+		if (name === undefined) {
+			name = this.#next_name();
+			this.#identifiers.set(identifier, name);
+		}
+		return name;
+	};
+
+	/** Reserves stable wrapper bindings before any asynchronous graph source is emitted. */
+	#initialize_client_names() {
+		if (this.#session_name) return;
+		this.#table_name = this.#next_name();
+		this.#session_name = this.#next_name();
 	}
 
 	/**
@@ -253,7 +284,7 @@ class Session {
 			anchor: this.#anchor,
 			slot: this.#slot,
 			collection: this.#collection,
-			local: this.#local,
+			name: this.#name,
 			references: new Map(this.#references)
 		};
 	}
@@ -282,7 +313,7 @@ class Session {
 		this.#anchor = checkpoint.anchor;
 		this.#slot = checkpoint.slot;
 		this.#collection = checkpoint.collection;
-		this.#local = checkpoint.local;
+		this.#name = checkpoint.name;
 		this.#references = checkpoint.references;
 		roll_back(this.#graph, checkpoint.nodes, error);
 		this.#transaction_depth--;
@@ -437,7 +468,7 @@ class Session {
 			if (capture_called) throw new TypeError('devalue: capture may only be called once per async descriptor construct(); capture one js expression containing all private controls, such as js`[resolve,reject]`');
 			if (!is_source(expression)) throw new TypeError(`Invalid async descriptor capture: capture() received ${describe_received(expression)}. Pass an expression built with the js tagged template, not a raw value or source string.`);
 			capture_called = true;
-			return capture_source(pending, expression);
+			return capture_source(pending, expression, immediate);
 		};
 		const source = descriptor.construct(control);
 		if (!this.#is_active()) throw this.#terminal_reason();
@@ -524,10 +555,10 @@ class Session {
 					const index = this.#anchor++;
 					const path = { kind: /** @type {const} */ ('anchor'), index, segments: [] };
 					this.#assign_references(node.value, path, new Map(), retained_at);
-					expression = join_sources([`s.a[${index}]=`, region]);
+					expression = join_sources([`${this.#session_name}.a[${index}]=`, region]);
 					prerequisite_available = retained_at;
 				}
-				const local = `o${this.#local++}`;
+				const local = this.#next_name();
 				prerequisites.push(join_sources([`const ${local}=`, expression]));
 				bindings.set(node, raw_source(local));
 			}
@@ -1007,8 +1038,7 @@ class Session {
 			}
 		}
 
-		let name_count = 0;
-		for (const node of order) if (node.hoisted) node.name = `v${name_count++}`;
+		for (const node of order) if (node.hoisted) node.name = this.#next_name();
 
 		/** Population that must wait for a later declaration (a genuine back-edge). @type {Emission[]} */
 		const deferred_fill = [];
@@ -1100,9 +1130,11 @@ class Session {
 				case 'Map':
 					return map_literal(children);
 				case 'Async':
-					return expression_source(map_descriptor_source(node.data.source, expression));
+					return node.data.state.immediate
+						? expression_source(map_descriptor_source(node.data.source, expression))
+						: complete_expression_source(map_descriptor_source(node.data.source, expression));
 				case 'Custom':
-					return expression_source(map_source(node.data, expression));
+					return complete_expression_source(map_source(node.data, expression));
 				default:
 					return scalar(node, expression_child);
 			}
@@ -1277,7 +1309,7 @@ class Session {
 				}
 				if (elements.length) {
 					const index = this.#collection++;
-					sidecars.push(join_sources([`s.c[${index}]=[`, join_sources(elements.map(expression_node), ','), ']']));
+					sidecars.push(join_sources([`${this.#session_name}.c[${index}]=[`, join_sources(elements.map(expression_node), ','), ']']));
 					for (let i = 0; i < elements.length; i++) {
 						this.#assign_references_node(elements[i], { kind: 'collection', index, segments: [`[${i}]`] }, sidecar_seen, retained_at);
 					}
@@ -1291,7 +1323,7 @@ class Session {
 			for (const node of order) {
 				if (node.opaque === 0) continue;
 				const index = this.#slot++;
-				slots.push(`s.s[${index}]=${node.name}`);
+				slots.push(`${this.#session_name}.s[${index}]=${node.name}`);
 				/** @type {ClientPath} */
 				const reference = { kind: 'slot', index, segments: [] };
 				this.#reference_node(node, reference, retained_at);
@@ -1417,14 +1449,19 @@ class Session {
 	#wrap_head(region, operations) {
 		const scope = this.#scope;
 		const id = stringify_string(this.#id);
+		const table_name = this.#table_name;
+		const session_name = this.#session_name;
 		// The dispatch helper is only defined when a tail exists; every tail block calls
-		// it to receive `s`/`n`, replacing a longer per-block lookup preamble.
-		const dispatch = this.#emit_dispatch ? ';s.b=f=>f(s,n)' : '';
-		const table = `let n=${scope}||(${scope}={__proto__:null}),s=n[${id}]={a:[],s:[],c:[],p:[]}${dispatch};`;
+		// it to receive the session/table pair, replacing a longer per-block lookup preamble.
+		const dispatch = this.#emit_dispatch ? `;${session_name}.b=f=>f(${session_name},${table_name})` : '';
+		const table = `let ${table_name}=${scope}||(${scope}={__proto__:null}),${session_name}=${table_name}[${id}]={a:[],s:[],c:[],p:[]}${dispatch};`;
 		const definitions = definitions_source();
 		const source = operations === undefined
-			? join_sources(['(()=>{', table, definitions, ';return s.a[0]=', region, '})()'])
-			: join_sources(['(()=>{', table, definitions, ';let r=s.a[0]=', region, ';', operations, ';return r})()']);
+			? join_sources(['(()=>{', table, definitions, `;return ${session_name}.a[0]=`, region, '})()'])
+			: (() => {
+				const root_name = this.#next_name();
+				return join_sources(['(()=>{', table, definitions, `;let ${root_name}=${session_name}.a[0]=`, region, ';', operations, `;return ${root_name}})()`]);
+			})();
 		return this.#render_final(source);
 	}
 
@@ -1435,7 +1472,7 @@ class Session {
 	 */
 	#cleanup_source() {
 		const id = stringify_string(this.#id);
-		return `delete n[${id}]`;
+		return `delete ${this.#table_name}[${id}]`;
 	}
 
 	/**
@@ -1449,7 +1486,9 @@ class Session {
 	#emit_batch(events, block = true) {
 		const transaction = this.#begin_transaction();
 		try {
-			const prefix = block ? `;${this.#scope}[${stringify_string(this.#id)}].b((s,n)=>{` : '';
+			const block_session = this.#session_name;
+			const block_table = this.#table_name;
+			const prefix = block ? `;${this.#scope}[${stringify_string(this.#id)}].b((${block_session},${block_table})=>{` : '';
 			const block_start = this.#availability;
 			/** @type {Emission[]} */
 			const operations = [];
@@ -1465,7 +1504,7 @@ class Session {
 			const retained_at = ++this.#availability;
 			references.add(node);
 			const target = reference_source(node, this.#reference_at(node, available)?.path);
-			const control = node.data.captured ? raw_source(`s.p[${node.data.pending}]`) : undefined;
+			const control = node.data.captured ? raw_source(`${block_session}.p[${node.data.pending}]`) : undefined;
 			const reference = {
 				target,
 				control
@@ -1492,7 +1531,7 @@ class Session {
 						const index = this.#anchor++;
 						const path = { kind: /** @type {const} */ ('anchor'), index, segments: [] };
 						this.#assign_references(event.value, path, new Map(), retained_at);
-						const name = `s.a[${index}]`;
+						const name = `${block_session}.a[${index}]`;
 						// Anchor indices are allocated only for new roots, monotonically and densely.
 						// Once the push helper pays for itself the client can derive the position.
 						const use_helper = this.#runtimes_emitted.v || index > 5;
@@ -1509,7 +1548,7 @@ class Session {
 						}
 					}
 					if (!source.immediate) {
-						const local = `o${this.#local++}`;
+						const local = this.#next_name();
 						materialization = join_sources([`const ${local}=`, expression]);
 						value_source = raw_source(local);
 					} else if (!value_source) {
@@ -1524,7 +1563,7 @@ class Session {
 				if (source.immediate) {
 					value_source = generic_error;
 				} else {
-					const local = `o${this.#local++}`;
+					const local = this.#next_name();
 					materialization = `const ${local}=new Error("devalue: failed to serialize asynchronous value")`;
 					value_source = raw_source(local);
 				}
@@ -1542,7 +1581,7 @@ class Session {
 				if (!is_source(operation)) throw new TypeError(`Invalid async descriptor operation: ${event.type}() returned ${describe_received(operation)}. It must synchronously return a js tagged template containing client statements; use js\`\` for an empty operation.`);
 				const lowered = this.#lower_descriptor_source(operation, `async descriptor ${event.type}()`, available, retained_at, references);
 				if (materialization) operations.push(materialization);
-				operations.push(...lowered.prerequisites, lowered.source);
+				operations.push(...lowered.prerequisites, source.immediate ? lowered.source : complete_statement_source(lowered.source));
 				this.#commit_transaction(lowered.checkpoint, false);
 			} catch (error) {
 				if (!this.#is_active()) throw error;
@@ -1559,7 +1598,7 @@ class Session {
 					}
 					let fallback_value = generic_error;
 					if (!source.immediate) {
-						const local = `o${this.#local++}`;
+						const local = this.#next_name();
 						operations.push(`const ${local}=new Error("devalue: failed to serialize asynchronous value")`);
 						fallback_value = raw_source(local);
 					}
@@ -1570,7 +1609,7 @@ class Session {
 					if (!is_source(fallback)) throw new TypeError(`Invalid async descriptor operation: fallback ${source.type === 'sequence' ? 'error' : 'reject'}() returned ${describe_received(fallback)}. It must synchronously return a js tagged template containing client statements; use js\`\` for an empty operation.`);
 					const context = source.type === 'sequence' ? 'async descriptor fallback error()' : 'async descriptor fallback reject()';
 					const lowered = this.#lower_descriptor_source(fallback, context, available, retained_at, references);
-					operations.push(...lowered.prerequisites, lowered.source);
+					operations.push(...lowered.prerequisites, source.immediate ? lowered.source : complete_statement_source(lowered.source));
 					this.#commit_transaction(lowered.checkpoint, false);
 					event.type = source.type === 'sequence' ? 'error' : 'reject';
 				} else {
@@ -1578,14 +1617,14 @@ class Session {
 				}
 			}
 			if (event.type !== 'next' && node.data.captured && !source.descriptor.manages_pending) {
-				operations.push(`delete s.p[${node.data.pending}]`);
+				operations.push(`delete ${block_session}.p[${node.data.pending}]`);
 			}
 			if (event.type !== 'next') {
 				this.#active--;
 				if (source.type === 'sequence' && event.type === 'error') close.push(source);
 			}
 			}
-			const rendered = this.#render_operations(operations, references, block_start);
+			const rendered = this.#render_operations(operations, references, block_start, block_session);
 			if (block && this.#active === 0 && this.#batch.length === 0) {
 				rendered.push(this.#cleanup_source());
 			}
@@ -1609,9 +1648,10 @@ class Session {
 	 * @param {Emission[]} operations
 	 * @param {Set<CapturedNode>} references
 	 * @param {number} available Paths committed before this batch began.
+	 * @param {string} session Generated client-session binding in this operation scope.
 	 * @returns {Emission[]}
 	 */
-	#render_operations(operations, references, available) {
+	#render_operations(operations, references, available, session) {
 		/** @type {Map<CapturedNode, number>} */
 		const uses = new Map();
 		for (const operation of operations) {
@@ -1636,11 +1676,11 @@ class Session {
 		const prefix = [];
 		for (const { node, path, uses } of candidates) {
 			const reference = { kind: /** @type {const} */ ('slot'), index: this.#slot, segments: [] };
-			const slot = render_reference(reference);
+			const slot = render_reference(reference, session);
 			const path_length = reference_length(path);
 			if (reference_length(reference) + 1 + path_length + 1 + reference_length(reference) * uses >= path_length * uses) continue;
 			this.#slot++;
-			prefix.push(`${slot}=${render_reference(path)}`);
+			prefix.push(`${slot}=${render_reference(path, session)}`);
 			aliases.set(node, reference);
 			this.#reference_node(node, reference, available);
 		}
@@ -2157,7 +2197,7 @@ function macrotask() {
 }
 
 /** @typedef {{ path: ClientPath, available: number, previous: RetainedReference | undefined }} RetainedReference */
-/** @typedef {{ nodes: number, sources: number, new_custom: CapturedNode[], validated: Set<CapturedNode>, opaque: number, pending: number, native_pending: number, active: number, availability: number, anchor: number, slot: number, collection: number, local: number, references: Map<CapturedNode, RetainedReference> }} TransactionCheckpoint */
+/** @typedef {{ nodes: number, sources: number, new_custom: CapturedNode[], validated: Set<CapturedNode>, opaque: number, pending: number, native_pending: number, active: number, availability: number, anchor: number, slot: number, collection: number, name: number, references: Map<CapturedNode, RetainedReference> }} TransactionCheckpoint */
 /** @typedef {{ state: 'preparing' | 'streaming' } | { state: 'completed' } | TerminatingLifecycle} Lifecycle */
 /** @typedef {{ state: 'cancelled' | 'failed', has_reason: boolean, reason: unknown, cleanup: Promise<void>, operations: CleanupOperation[] }} TerminatingLifecycle */
 /** @typedef {{ ok: true } | { ok: false, error: unknown }} CleanupResult */

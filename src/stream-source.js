@@ -1,4 +1,4 @@
-import { SOURCE, create_source, is_source, raw_source } from './javascript-source.js';
+import { SOURCE, create_source, is_identifier, is_source, raw_source } from './javascript-source.js';
 import { is_primitive, stringify_primitive } from './utils.js';
 
 /** Internal stream instructions are branded with a non-enumerable module-private key. */
@@ -42,10 +42,11 @@ export function reference_source(node, path) {
 /**
  * @param {number} pending
  * @param {Emission} source
+ * @param {boolean} [compact]
  * @returns {JavaScriptSource}
  */
-export function capture_source(pending, source) {
-	return instruction_source(brand({ type: 'capture', pending, source }));
+export function capture_source(pending, source, compact = false) {
+	return instruction_source(brand({ type: 'capture', pending, source, compact }));
 }
 
 /**
@@ -54,6 +55,16 @@ export function capture_source(pending, source) {
  */
 export function expression_source(source) {
 	return typeof source === 'string' ? `(${source})` : instruction_source(brand({ type: 'expression', source }));
+}
+
+/** Protects generated closing syntax after a complete user expression. @param {Emission} source */
+export function complete_expression_source(source) {
+	return typeof source === 'string' ? `(${source}\n)` : instruction_source(brand({ type: 'expression', source, complete: true }));
+}
+
+/** Protects generated separators and closing syntax after a complete user operation. @param {Emission} source */
+export function complete_statement_source(source) {
+	return join_sources([source, '\n']);
 }
 
 /**
@@ -134,6 +145,7 @@ export function join_sources(sources, separator = '') {
  * @returns {Emission}
  */
 export function map_source(source, map) {
+	if (is_identifier(source)) return source;
 	const { strings, values } = source[SOURCE];
 	let text = strings[0];
 	/** @type {string[] | undefined} */
@@ -167,6 +179,7 @@ export function map_source(source, map) {
  * @returns {Emission}
  */
 export function map_descriptor_source(source, map) {
+	if (is_identifier(source)) return source;
 	const { strings, values } = source[SOURCE];
 	let text = strings[0];
 	/** @type {string[] | undefined} */
@@ -235,6 +248,7 @@ export function descriptor_source_values(source) {
 	const values = [];
 	/** @param {JavaScriptSource} fragment @param {boolean} capture */
 	const walk = (fragment, capture) => {
+		if (is_identifier(fragment)) return;
 		const source_values = fragment[SOURCE].values;
 		for (let i = 0; i < source_values.length; i++) {
 			const value = source_values[i];
@@ -297,11 +311,25 @@ export function source_helpers(source) {
  * @param {(keyof typeof RUNTIMES)[]} [definitions]
  */
 export function render_stream_source(source, definitions = []) {
+	return render_stream_source_with_names(source, definitions, 's', () => {
+		throw new TypeError('Unresolved stream identifier: no generated name was assigned before rendering (internal emitter error)');
+	});
+}
+
+/**
+ * Renders structured stream source with the coordinated session binding and identifier allocator.
+ * @param {Emission} source
+ * @param {(keyof typeof RUNTIMES)[]} definitions
+ * @param {string} session
+ * @param {(identifier: JavaScriptSource) => string} render_identifier
+ */
+export function render_stream_source_with_names(source, definitions, session, render_identifier) {
 	if (typeof source === 'string') return source;
-	const definition_source = definitions.map((key) => `s.${key}=${RUNTIMES[key]}`).join(';');
+	const definition_source = definitions.map((key) => `${session}.${key}=${render_runtime(key, session)}`).join(';');
 	/** @param {Emission} fragment */
 	const render = (fragment) => {
 		if (typeof fragment === 'string') return fragment;
+		if (is_identifier(fragment)) return render_identifier(fragment);
 		const { strings, values } = fragment[SOURCE];
 		let result = strings[0];
 		for (let i = 0; i < values.length; i++) {
@@ -316,15 +344,15 @@ export function render_stream_source(source, definitions = []) {
 		switch (instruction.type) {
 			case 'reference':
 				if (!instruction.path) throw new TypeError('Unresolved stream reference: a client identity has no assigned anchor, slot, or collection path before rendering (internal emitter error)');
-				return render_reference(instruction.path);
+				return render_reference(instruction.path, session);
 			case 'capture':
-				return `(s.p[${instruction.pending}]=(${render(instruction.source)}))`;
+				return `(${session}.p[${instruction.pending}]=(${render(instruction.source)}${instruction.compact ? '' : '\n'}))`;
 			case 'expression':
-				return `(${render(instruction.source)})`;
+				return `(${render(instruction.source)}${instruction.complete ? '\n' : ''})`;
 			case 'runtime':
-				return `s.${instruction.key}`;
+				return `${session}.${instruction.key}`;
 			case 'promise':
-				return `s.w(${instruction.pending})`;
+				return `${session}.w(${instruction.pending})`;
 			case 'definitions':
 				return definition_source;
 			case 'outcome':
@@ -376,6 +404,7 @@ function interpolation_error(value, context) {
  */
 function visit(source, callback) {
 	if (typeof source === 'string') return;
+	if (is_identifier(source)) return;
 	for (const value of source[SOURCE].values) {
 		if (is_source(value)) visit(value, callback);
 		else if (is_stream_instruction(value)) {
@@ -396,6 +425,7 @@ function visit(source, callback) {
 function visit_sources(source, callback) {
 	if (typeof source === 'string') return;
 	callback(source);
+	if (is_identifier(source)) return;
 	for (const value of source[SOURCE].values) {
 		if (is_source(value)) visit_sources(value, callback);
 		else if (is_stream_instruction(value)) {
@@ -409,8 +439,8 @@ function visit_sources(source, callback) {
 }
 
 /** @param {ClientPath} reference */
-export function render_reference(reference) {
-	return `s.${reference.kind[0]}[${reference.index}]` + reference.segments.join('');
+export function render_reference(reference, session = 's') {
+	return `${session}.${reference.kind[0]}[${reference.index}]` + reference.segments.join('');
 }
 
 /** @param {ClientPath} reference */
@@ -497,13 +527,21 @@ export const RUNTIMES = {
 	v: 'v=>(s.a.push(v),v)'
 };
 
+/** @param {keyof typeof RUNTIMES} key @param {string} session */
+function render_runtime(key, session) {
+	if (key === 'w') return `i=>{let p=new Promise((c,d)=>{${session}.p[i]=[c,d]});p.catch(()=>{});return p}`;
+	if (key === 'r') return `(i,j,v)=>(${session}.p[i][j](v),delete ${session}.p[i])`;
+	if (key === 'v') return `v=>(${session}.a.push(v),v)`;
+	return RUNTIMES[key];
+}
+
 /** @typedef {import('./javascript-source.js').JavaScriptSource} JavaScriptSource */
 /** Generated text or a fragment carrying unresolved semantics. Not a user interpolation type. @typedef {string | JavaScriptSource} Emission */
 /** @typedef {import('./graph.js').CapturedNode} CapturedNode */
 /** @typedef {import('./graph.js').ClientPath} ClientPath */
 /** @typedef {{ type: 'reference', node: CapturedNode, path: ClientPath | undefined }} ReferenceInstruction */
-/** @typedef {{ type: 'capture', pending: number, source: Emission }} CaptureInstruction */
-/** @typedef {{ type: 'expression', source: Emission }} ExpressionInstruction */
+/** @typedef {{ type: 'capture', pending: number, source: Emission, compact: boolean }} CaptureInstruction */
+/** @typedef {{ type: 'expression', source: Emission, complete?: boolean }} ExpressionInstruction */
 /** @typedef {{ type: 'runtime', key: keyof typeof RUNTIMES }} RuntimeInstruction */
 /** @typedef {{ type: 'promise', pending: number }} PromiseInstruction */
 /** @typedef {{ type: 'definitions' }} DefinitionsInstruction */
