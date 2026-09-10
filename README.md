@@ -143,7 +143,20 @@ devalue.uneval(vector, (value, js) => {
 }); // `new Vector(30,40)`
 ```
 
-The replacer must return a source created with the supplied `js` tag, or `undefined`, `null` or `false` to serialize the value normally. Each value hole is recursively serialized, preserving shared references. In most cases, cyclic references are supported, but some rare direct custom dependencies are not, and will throw an error. For example:
+The replacer must return a source created with the supplied `js` tag, or `undefined`, `null` or `false` to serialize the value normally. Each value hole is recursively serialized, preserving shared references. The literal source is trusted, is not automatically scope-analyzed, and must form a valid expression. Create local bindings with `js.identifier()` so they cannot collide with generated names, and interpolate the returned identifier wherever that binding is declared or referenced:
+
+```js
+devalue.uneval(vector, (value, js) => {
+	if (value instanceof Vector) {
+		const result = js.identifier();
+		return js`(()=>{const ${result}=new Vector(${value.x},${value.y});return ${result}})()`;
+	}
+});
+```
+
+Repeated interpolation of one identifier token uses the same generated name, while separate tokens use separate names. The generated spelling is private and should not be inspected or written into literal source.
+
+In most cases, cyclic references are supported, but some rare direct custom dependencies are not, and will throw an error. For example:
 
 ```js
 class Atomic {

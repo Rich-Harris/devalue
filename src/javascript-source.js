@@ -1,4 +1,5 @@
 const SOURCE = Symbol('JavaScriptSource');
+const IDENTIFIER = Symbol('JavaScriptIdentifier');
 
 /**
  * @param {TemplateStringsArray} strings
@@ -11,6 +12,11 @@ export function js(strings, ...values) {
 	}
 	return create_source(strings, values);
 }
+
+/** Creates a reusable generated identifier for interpolation into trusted source. */
+js.identifier = function identifier() {
+	return { [SOURCE]: { strings: [''], values: [] }, [IDENTIFIER]: true };
+};
 
 /**
  * @param {readonly string[]} strings
@@ -29,6 +35,11 @@ export function is_source(value) {
 	return typeof value === 'object' && value !== null && SOURCE in value;
 }
 
+/** @param {JavaScriptSource} source */
+export function is_identifier(source) {
+	return IDENTIFIER in source;
+}
+
 /**
  * @param {string} text
  * @returns {JavaScriptSource}
@@ -40,13 +51,15 @@ export function raw_source(text) {
 /**
  * @param {JavaScriptSource} source
  * @param {(value: unknown) => string} render
+ * @param {(identifier: JavaScriptSource) => string} render_identifier
  */
-export function render_source(source, render) {
+export function render_source(source, render, render_identifier) {
+	if (is_identifier(source)) return render_identifier(source);
 	const { strings, values } = source[SOURCE];
 	let result = strings[0];
 	for (let i = 0; i < values.length; i++) {
 		const value = values[i];
-		result += is_source(value) ? render_source(value, render) : render(value);
+		result += is_source(value) ? render_source(value, render, render_identifier) : render(value);
 		result += strings[i + 1];
 	}
 	return result;
@@ -57,6 +70,7 @@ export function render_source(source, render) {
  * @param {(value: unknown) => void} visit
  */
 export function visit_source(source, visit) {
+	if (is_identifier(source)) return;
 	for (const value of source[SOURCE].values) {
 		if (is_source(value)) visit_source(value, visit);
 		else visit(value);

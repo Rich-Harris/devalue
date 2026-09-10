@@ -1,5 +1,9 @@
 import { MAX_ARRAY_INDEX, MAX_ARRAY_LEN } from './constants.js';
 
+const name_chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$';
+const reserved_names =
+	/^(?:do|if|in|for|int|let|new|try|var|byte|case|char|else|enum|goto|long|this|void|with|await|break|catch|class|const|final|float|short|super|throw|while|yield|delete|double|export|import|native|return|switch|throws|typeof|boolean|default|extends|finally|package|private|abstract|continue|debugger|function|volatile|interface|protected|transient|implements|instanceof|synchronized)$/;
+
 /** @type {Record<string, string>} */
 export const escaped = {
 	'<': '\\u003C',
@@ -53,6 +57,18 @@ export function is_plain_object(thing) {
 /** @param {any} thing */
 export function get_type(thing) {
 	return Object.prototype.toString.call(thing).slice(8, -1);
+}
+
+/** Returns the compact JavaScript identifier at `index`. @param {number} index */
+export function get_name(index) {
+	let name = '';
+
+	do {
+		name = name_chars[index % name_chars.length] + name;
+		index = ~~(index / name_chars.length) - 1;
+	} while (index >= 0);
+
+	return reserved_names.test(name) ? `${name}0` : name;
 }
 
 /** @param {string} char */

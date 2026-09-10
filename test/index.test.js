@@ -922,7 +922,7 @@ const fixtures = {
 		{
 			name: 'Custom type',
 			value: [instance, instance],
-			js: '(function(a){return [a,a]}((new Foo({bar:(new Bar({answer:42}))}))))',
+			js: '(function(a){return [a,a]}((new Foo({bar:(new Bar({answer:42})\n)})\n)))',
 			json: '[[1,1],["Foo",2],{"bar":3},["Bar",4],{"answer":5},42]',
 			replacer: (value, js) => {
 				if (value instanceof Foo) {
@@ -955,7 +955,7 @@ const fixtures = {
 		{
 			name: 'Custom fallback',
 			value: date,
-			js: "(new Date(''))",
+			js: "(new Date('')\n)",
 			json: '[["Date",""]]',
 			replacer: (value, js) => value instanceof Date && js`new Date('')`,
 			reducers: {
@@ -985,7 +985,7 @@ const fixtures = {
 			{
 				name: 'Function wrapped in custom type',
 				value: new FunctionRef(testFn),
-				js: '(new FunctionRef((x) => x * 2))',
+				js: '(new FunctionRef((x) => x * 2)\n)',
 				json: '[["FunctionRef",1],"(x) => x * 2"]',
 				replacer: (value, js) => {
 					if (value instanceof FunctionRef) {
@@ -1017,7 +1017,7 @@ const fixtures = {
 			{
 				name: 'Function in nested structure',
 				value: { fn: testFn, nested: { data: 42 } },
-				js: '{fn:((x) => x * 2),nested:{data:42}}',
+				js: '{fn:((x) => x * 2\n),nested:{data:42}}',
 				json: '[{"fn":1,"nested":3},["FunctionRef",2],"(x) => x * 2",{"data":4},42]',
 				replacer: (value, js) => {
 					if (typeof value === 'function') {
@@ -1071,6 +1071,50 @@ custom_source_test('preserves identities referenced by custom source', () => {
 	);
 	const result = eval(source);
 	assert.is(result.wrapped.inner, result.shared);
+});
+custom_source_test('generates collision-free custom source identifiers', () => {
+	class Wrapper {
+		constructor(inner, total) {
+			this.inner = inner;
+			this.total = total;
+		}
+	}
+
+	const container = {};
+	const wrapper = new Wrapper(container, 0);
+	container.wrapper = wrapper;
+	const source = uneval([wrapper, wrapper, container], (value, js) => {
+		if (value instanceof Wrapper) {
+			const a = js.identifier();
+			const o0 = js.identifier();
+			const result = js.identifier();
+			return js`(()=>{const ${a}=1,${o0}=2;const read=({value:${result}},${a})=>${result}+${a};return new Wrapper(${value.inner},read({value:${o0}},${a}))})()`;
+		}
+	});
+	const result = vm.runInNewContext(source, { Wrapper });
+
+	assert.ok(source.startsWith('(function(b){var a;'));
+	assert.ok(source.includes('const c=1,d=2;const read=({value:e},c)=>e+c'));
+	assert.is(result[0], result[1]);
+	assert.is(result[0].inner, result[2]);
+	assert.is(result[0].inner.wrapper, result[0]);
+	assert.is(result[0].total, 3);
+
+	class Marker {}
+	const left = {};
+	const right = {};
+	left.peer = right;
+	right.peer = left;
+	const cycle_source = uneval([left, new Marker()], (value, js) => {
+		if (!(value instanceof Marker)) return;
+		const local = js.identifier();
+		return js`(()=>{const ${local}=42;return ${local}})()`;
+	});
+	const cycle = vm.runInNewContext(cycle_source);
+	assert.ok(cycle_source.startsWith('(function(a,b)'));
+	assert.ok(cycle_source.includes('const c=42;return c'));
+	assert.is(cycle[0].peer.peer, cycle[0]);
+	assert.is(cycle[1], 42);
 });
 custom_source_test('constructs a repeated wrapper after its shared child is populated', () => {
 	class Wrapper {
@@ -1210,7 +1254,7 @@ custom_source_test('keeps dependency-free custom constructions in IIFE arguments
 		value instanceof Wrapper ? js`new Wrapper()` : undefined
 	);
 
-	assert.is(source, '(function(a){return [a,a]}((new Wrapper())))');
+	assert.is(source, '(function(a){return [a,a]}((new Wrapper()\n)))');
 	const result = vm.runInNewContext(source, { Wrapper });
 	assert.is(result[0], result[1]);
 });
@@ -1424,30 +1468,75 @@ custom_source_test('treats replacer results as expressions', () => {
 	const object = new Replacement('object');
 	const nested = new Replacement('nested');
 	const escaped = new Replacement('escaped');
-	const source = uneval([comma, conditional, object, nested, escaped], (value, js) => {
-		if (!(value instanceof Replacement)) return;
-		switch (value.source) {
-			case 'comma':
-				return js`1,2`;
-			case 'conditional':
-				return js`false?1:2`;
-			case 'object':
-				return js`{answer:42}`;
-			case 'nested':
-				return js`${js`Math.max(`}${1},${2}${js`)`}`;
-			case 'escaped':
-				return js`${'</script>'}`;
+	const slashes = new Replacement('slashes');
+	const block = new Replacement('block');
+	const partial = new Replacement('partial');
+	const source = uneval(
+		[comma, conditional, object, nested, escaped, slashes, block, partial],
+		(value, js) => {
+			if (!(value instanceof Replacement)) return;
+			switch (value.source) {
+				case 'comma':
+					return js`1,2`;
+				case 'conditional':
+					return js`false?1:2`;
+				case 'object':
+					return js`{answer:42}`;
+				case 'nested':
+					return js`${js`Math.max(`}${1},${2}${js`)`}`;
+				case 'escaped':
+					return js`${'</script>'}`;
+				case 'slashes':
+					return js`"https://example.com//path"`;
+				case 'block':
+					return js`/* before */ ({answer:42}) /* after */`;
+				case 'partial':
+					return js`${js`(()=>{ // comment from a partial fragment`}${js`\nreturn `}${42}${js`;})()`}`;
+			}
 		}
-	});
+	);
 	const result = vm.runInNewContext(source);
 
-	assert.is(result.length, 5);
+	assert.is(result.length, 8);
 	assert.is(result[0], 2);
 	assert.is(result[1], 2);
 	assert.is(result[2].answer, 42);
 	assert.is(result[3], 2);
 	assert.is(result[4], '</script>');
+	assert.is(result[5], 'https://example.com//path');
+	assert.is(result[6].answer, 42);
+	assert.is(result[7], 42);
 	assert.ok(!source.includes('</script>'));
+});
+custom_source_test('terminates complete custom expressions after line comments', () => {
+	class Replacement {
+		constructor(value) {
+			this.value = value;
+		}
+	}
+
+	const root_source = uneval(new Replacement(42), (value, js) =>
+		value instanceof Replacement ? js`({value:${value.value}}) // root comment` : undefined
+	);
+	const root = vm.runInNewContext(root_source);
+	assert.is(root.value, 42);
+
+	const argument = new Replacement(1);
+	const child = { answer: 42 };
+	const initializer = new Replacement(child);
+	const nested_source = uneval(
+		[argument, argument, initializer, initializer, child],
+		(value, js) =>
+			value instanceof Replacement
+				? js`({value:${value.value}}) // nested comment`
+				: undefined
+	);
+	const nested = vm.runInNewContext(nested_source);
+	assert.is(nested[0], nested[1]);
+	assert.is(nested[0].value, 1);
+	assert.is(nested[2], nested[3]);
+	assert.is(nested[2].value, nested[4]);
+	assert.is(nested[4].answer, 42);
 });
 custom_source_test('groups a root object-literal replacement', () => {
 	class Replacement {}
@@ -1455,7 +1544,7 @@ custom_source_test('groups a root object-literal replacement', () => {
 	const source = uneval(new Replacement(), (value, js) =>
 		value instanceof Replacement ? js`{answer:42}` : undefined
 	);
-	assert.is(source, '({answer:42})');
+	assert.is(source, '({answer:42}\n)');
 	assert.is(vm.runInNewContext(source).answer, 42);
 });
 custom_source_test('requires js to be used as a tagged template', () => {

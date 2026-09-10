@@ -4,6 +4,7 @@ import {
 	DevalueError,
 	enumerable_symbols,
 	escaped,
+	get_name,
 	get_type,
 	is_plain_object,
 	is_primitive,
@@ -13,11 +14,8 @@ import {
 } from './utils.js';
 import { is_source, js, render_source, visit_source } from './javascript-source.js';
 
-const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$';
 const MAX_IIFE_PARAMS = 65534;
 const unsafe_chars = /[<\b\f\n\r\t\0\u2028\u2029]/g;
-const reserved =
-	/^(?:do|if|in|for|int|let|new|try|var|byte|case|char|else|enum|goto|long|this|void|with|await|break|catch|class|const|final|float|short|super|throw|while|yield|delete|double|export|import|native|return|switch|throws|typeof|boolean|default|extends|finally|package|private|abstract|continue|debugger|function|volatile|interface|protected|transient|implements|instanceof|synchronized)$/;
 
 /**
  * Turn a value into the JavaScript that creates an equivalent value
@@ -177,6 +175,8 @@ class Renderer {
 	#dependencies;
 	/** @type {Map<any, string>} */
 	#names;
+	/** @type {Map<any, string>} */
+	#identifiers;
 
 	/**
 	 * @param {Map<any, number>} counts
@@ -188,6 +188,7 @@ class Renderer {
 		this.#custom = custom;
 		this.#dependencies = dependencies;
 		this.#names = new Map();
+		this.#identifiers = new Map();
 	}
 
 	/**
@@ -574,7 +575,11 @@ class Renderer {
 		}
 
 		if (this.#custom.has(thing)) {
-			return `(${render_source(this.#custom.get(thing), this.#reference)})`;
+			return `(${render_source(
+				this.#custom.get(thing),
+				this.#reference,
+				this.#render_identifier
+			)}\n)`;
 		}
 
 		const type = get_type(thing);
@@ -759,6 +764,16 @@ class Renderer {
 				return `${type}.from(${stringify_string(thing.toString())})`;
 		}
 	}
+
+	/** @param {any} identifier */
+	#render_identifier = (identifier) => {
+		let name = this.#identifiers.get(identifier);
+		if (name === undefined) {
+			name = get_name(this.#names.size + this.#identifiers.size);
+			this.#identifiers.set(identifier, name);
+		}
+		return name;
+	};
 }
 
 /**
@@ -913,18 +928,6 @@ function stringify_typed_array_elements(type, buffer) {
 	}
 
 	return array.toString();
-}
-
-/** @param {number} num */
-function get_name(num) {
-	let name = '';
-
-	do {
-		name = chars[num % chars.length] + name;
-		num = ~~(num / chars.length) - 1;
-	} while (num >= 0);
-
-	return reserved.test(name) ? `${name}0` : name;
 }
 
 /** @param {string} c */
