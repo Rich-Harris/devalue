@@ -1,4 +1,6 @@
 import { getEventListeners } from 'node:events';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { suite } from 'uvu';
 import * as assert from 'uvu/assert';
 import { unevalStream } from '../index.js';
@@ -52,6 +54,18 @@ function sequence_descriptor(value, js, cancel) {
 		cancel
 	};
 }
+
+test('keeps cleanup diagnostics isolated from disposed source getters', () => {
+	const fixture = fileURLToPath(new URL('../fixtures/stream/cleanup-diagnostics.mjs', import.meta.url));
+	const child = spawnSync(process.execPath, ['--unhandled-rejections=strict', fixture], {
+		encoding: 'utf8',
+		timeout: 10_000
+	});
+	assert.is(child.error, undefined, child.error?.stack);
+	assert.is(child.signal, null, child.stderr || child.stdout);
+	assert.is(child.status, 0, child.stderr || child.stdout);
+	assert.equal(JSON.parse(child.stdout), { fixture: 'cleanup diagnostics', cases: 5 });
+});
 
 test('detaches abort listeners on every successful completion path', async () => {
 	{
@@ -301,6 +315,96 @@ test('abort during operation generation stops later callbacks', async () => {
 	second.resolve(2);
 	assert.is(await rejected(waiting), 'stop');
 	assert.equal(calls, ['first']);
+});
+
+for (const phase of ['resolve', 'next', 'complete']) {
+	test(`does not invoke ${phase} fallback after onerror aborts`, async () => {
+		const controller = new AbortController();
+		const gate = deferred();
+		const reason = { phase, kind: 'abort from onerror' };
+		const calls = [];
+		let pulls = 0;
+		let returns = 0;
+		let cancels = 0;
+		const sequence = phase !== 'resolve';
+		const source = sequence ? {
+			[Symbol.asyncIterator]() { return this; },
+			next() { pulls++; return gate.promise; },
+			return() { returns++; return { done: true }; }
+		} : gate.promise;
+		const value = {};
+		const result = await unevalStream(value, (candidate, js) => candidate === value && ({
+			type: sequence ? 'async-sequence' : 'async-value',
+			source,
+			construct: () => js`0`,
+			resolve() { calls.push('resolve'); return null; },
+			reject() { calls.push('fallback'); return js``; },
+			next() { calls.push('next'); return null; },
+			complete() { calls.push('complete'); return null; },
+			error() { calls.push('fallback'); return js``; },
+			cancel() { cancels++; }
+		}), {
+			signal: controller.signal,
+			onerror(error) {
+				calls.push('report');
+				assert.instance(error, TypeError);
+				controller.abort(reason);
+			}
+		});
+		const waiting = settled(result.tail.next());
+		if (sequence) gate.resolve({ done: phase === 'complete', value: 1 });
+		else gate.resolve(1);
+		const outcome = await waiting;
+		assert.is(outcome.ok, false);
+		assert.is(outcome.reason, reason);
+		assert.equal(calls, [phase, 'report']);
+		assert.is(cancels, 1);
+		assert.is(pulls, sequence ? 1 : 0);
+		assert.is(returns, sequence ? 1 : 0);
+	});
+}
+
+test('still invokes a valid fallback when onerror does not terminate the session', async () => {
+	const gate = deferred();
+	const calls = [];
+	const value = {};
+	const result = await unevalStream(value, (candidate, js) => candidate === value && ({
+		type: 'async-value', source: gate.promise, construct: () => js`0`,
+		resolve() { calls.push('resolve'); return null; },
+		reject() { calls.push('fallback'); return js``; }
+	}), { onerror: () => calls.push('report') });
+	gate.resolve(1);
+	assert.is((await result.tail.next()).done, false);
+	assert.equal(calls, ['resolve', 'report', 'fallback']);
+	assert.equal(await result.tail.next(), { done: true, value: undefined });
+});
+
+test('does not queue an invalid captured outcome after onerror aborts', async () => {
+	const controller = new AbortController();
+	const gate = deferred();
+	const reason = { kind: 'invalid outcome abort' };
+	let operations = 0;
+	let cancels = 0;
+	const value = {};
+	const result = await unevalStream(value, (candidate, js) => candidate === value && ({
+		type: 'async-value', source: gate.promise, construct: () => js`0`,
+		resolve() { operations++; return js``; },
+		reject() { operations++; return js``; },
+		cancel() { cancels++; }
+	}), {
+		signal: controller.signal,
+		onerror(error) {
+			assert.match(error.message, /Cannot stringify a function/);
+			controller.abort(reason);
+		}
+	});
+	const waiting = settled(result.tail.next());
+	gate.resolve(() => {});
+	const outcome = await waiting;
+	assert.is(outcome.ok, false);
+	assert.is(outcome.reason, reason);
+	assert.is(operations, 0);
+	assert.is(cancels, 1);
 });
 
 test('selects cleanup failures in source and operation order', async () => {
