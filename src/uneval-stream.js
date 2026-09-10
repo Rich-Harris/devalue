@@ -29,18 +29,16 @@ import {
 	join_sources,
 	map_descriptor_source,
 	map_source,
-	outcome_source,
 	promise_source,
 	reference_source,
 	reference_length,
 	render_reference,
 	render_stream_source_with_names,
 	runtime_source,
-	select_outcome_source,
 	source_helpers,
-	source_instructions,
 	source_values,
-	template_source
+	template_source,
+	visit_source_instructions
 } from './stream-source.js';
 
 const promise_then = Promise.prototype.then;
@@ -522,7 +520,11 @@ class Session {
 			if (is_node(captured)) this.#make_opaque(captured);
 		}
 		async_node.children = children;
-		async_node.data.captured = capture_called && (descriptor.manages_pending || source_instructions(source).some((instruction) => instruction.type === 'capture' && instruction.pending === pending));
+		let contains_capture = false;
+		visit_source_instructions(source, (instruction) => {
+			if (instruction.type === 'capture' && instruction.pending === pending) contains_capture = true;
+		});
+		async_node.data.captured = capture_called && (descriptor.manages_pending || contains_capture);
 		this.#new_custom.push(async_node);
 		if (this.#signal?.aborted) throw this.#signal.reason;
 		return state;
@@ -1418,9 +1420,9 @@ class Session {
 
 	/** Resolves every reachable structured reference before final rendering. @param {Emission} source */
 	#resolve_references(source, available = this.#availability) {
-		for (const instruction of source_instructions(source)) {
+		visit_source_instructions(source, (instruction) => {
 			if (instruction.type === 'reference') instruction.path = this.#resolve_reference(instruction, available);
-		}
+		});
 	}
 
 	/**
@@ -1538,7 +1540,7 @@ class Session {
 			};
 			/** @type {JavaScriptSource | undefined} */
 			let value_source;
-			/** @type {{ source: JavaScriptSource, write: Emission } | undefined} */
+			/** @type {Emission | undefined} */
 			let anchor;
 			/** @type {Emission | undefined} */
 			let materialization;
@@ -1568,10 +1570,8 @@ class Session {
 						expression = write;
 						if (source.immediate) {
 							const folded = use_helper ? write : join_sources(['(', write, ')']);
-							const outcome = outcome_source(region, name, folded);
-							select_outcome_source(outcome, 'folded');
-							anchor = { source: outcome, write };
-							value_source = outcome;
+							anchor = write;
+							value_source = template_source(folded);
 						}
 					}
 					if (!source.immediate) {
@@ -1614,12 +1614,11 @@ class Session {
 				if (!this.#is_active()) throw error;
 				if (event.type === 'resolve' || event.type === 'next' || event.type === 'complete') {
 					this.#report(error, event.value);
-					// A privately folded adapter is switched back to its separately emitted anchor
-					// if its callback unexpectedly fails. Arbitrary operations were already planned
-					// around an eager local and publish that materialization exactly once.
+					// A privately folded adapter publishes its separate anchor write if its callback
+					// unexpectedly fails. The failed operation containing the folded expression was
+					// never added to output. Arbitrary operations retain their eager local instead.
 					if (anchor) {
-						operations.push(anchor.write);
-						select_outcome_source(anchor.source, 'anchored');
+						operations.push(anchor);
 					} else if (materialization) {
 						operations.push(materialization);
 					}
@@ -1682,10 +1681,10 @@ class Session {
 		/** @type {Map<CapturedNode, number>} */
 		const uses = new Map();
 		for (const operation of operations) {
-			for (const value of source_instructions(operation)) {
-				if (value.type !== 'reference') continue;
+			visit_source_instructions(operation, (value) => {
+				if (value.type !== 'reference') return;
 				uses.set(value.node, (uses.get(value.node) ?? 0) + 1);
-			}
+			});
 		}
 		/** @type {{ node: CapturedNode, path: ClientPath, uses: number }[]} */
 		const candidates = [];
@@ -1712,10 +1711,10 @@ class Session {
 			this.#reference_node(node, reference, available);
 		}
 		for (const operation of operations) {
-			for (const instruction of source_instructions(operation)) {
-				if (instruction.type !== 'reference') continue;
+			visit_source_instructions(operation, (instruction) => {
+				if (instruction.type !== 'reference') return;
 				instruction.path = aliases.get(instruction.node) ?? this.#resolve_reference(instruction, available);
-			}
+			});
 		}
 		return /** @type {Emission[]} */ (prefix).concat(operations);
 	}

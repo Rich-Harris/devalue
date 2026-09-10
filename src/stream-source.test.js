@@ -5,24 +5,22 @@ import { SOURCE, js, raw_source } from './javascript-source.js';
 import { stringify_primitive } from './utils.js';
 import {
 	capture_source,
-	count_source,
 	definitions_source,
 	describe_received,
 	expression_source,
 	is_stream_instruction,
 	join_sources,
+	map_descriptor_source,
 	map_source,
-	outcome_source,
 	promise_source,
 	reference_source,
 	render_stream_source,
 	render_stream_source_with_names,
 	runtime_source,
-	select_outcome_source,
 	source_helpers,
-	source_instructions,
 	source_values,
-	template_source
+	template_source,
+	visit_source_instructions
 } from './stream-source.js';
 
 const test = suite('structured stream source');
@@ -60,19 +58,6 @@ test('composes ordered statements without flattening children', () => {
 	], ';'), '})()']);
 	assert.is(render_stream_source(source), '(()=>{const a=1;return (a,2)})()');
 	assert.is(render_stream_source(join_sources([js`a`, js`b`, js`c`], ',')), 'a,b,c');
-});
-
-test('collects helpers only through the selected reachable outcome', () => {
-	const outcome = outcome_source(
-		runtime_source('f'),
-		raw_source('s.a[1]'),
-		runtime_source('v')
-	);
-	assert.equal(source_helpers(outcome), ['f']);
-	select_outcome_source(outcome, 'anchored');
-	assert.equal(source_helpers(outcome), []);
-	select_outcome_source(outcome, 'folded');
-	assert.equal(source_helpers(outcome), ['v']);
 });
 
 test('renders helper definitions before structured uses', () => {
@@ -130,8 +115,7 @@ test('describes rejected primitive categories without printing user payloads', (
 	]) assert.is(describe_received(value), description);
 });
 
-test('explains internal outcome and unresolved-reference failures', () => {
-	assert.throws(() => select_outcome_source(js`0`, 'folded'), /expects the fragment returned by outcome_source\(\)/);
+test('explains unresolved-reference failures', () => {
 	assert.throws(() => render_stream_source(reference_source(/** @type {any} */ ({}), undefined)),
 		/no assigned anchor, slot, or collection path before rendering.*internal emitter error/);
 });
@@ -152,7 +136,9 @@ test('keeps resolved emission as strings, including expressions and statements',
 	const statements = join_sources(['let a=1', join_sources(['a=', expression_source('a,2')])], ';');
 	assert.is(statements, 'let a=1;a=(a,2)');
 	assert.equal(source_helpers(statements), []);
-	assert.equal(source_instructions(statements), []);
+	let instructions = 0;
+	visit_source_instructions(statements, () => instructions++);
+	assert.is(instructions, 0);
 	assert.is(render_stream_source(object), object);
 });
 
@@ -184,25 +170,25 @@ test('keeps references and helper requests structured when compiling custom temp
 	const reference = reference_source(node, { kind: 'slot', index: 0, segments: [] });
 	const pending = promise_source(1);
 	const source = map_source(js`[${'0'},${reference},${pending}]`, stringify_primitive);
-	const instructions = source_instructions(source);
+	const instructions = [];
+	visit_source_instructions(source, (instruction) => instructions.push(instruction));
 	assert.equal(instructions.map((instruction) => instruction.type), ['reference', 'promise']);
-	assert.is(instructions[0], source_instructions(reference)[0]);
+	let reference_instruction;
+	visit_source_instructions(reference, (instruction) => reference_instruction = instruction);
+	assert.is(instructions[0], reference_instruction);
 	assert.equal(source_helpers(source), ['w']);
 	assert.is(render_stream_source(source), '["0",s.s[0],s.w(1)]');
 });
 
-test('retains outcome selection and counting with textual and structured children', () => {
-	const outcome = outcome_source('"0"', 's.a[1]', join_sources([runtime_source('v'), '("0")']));
-	const operation = js`f(${outcome},${js`${outcome}`})`;
-	assert.is(count_source(operation, outcome), 2);
-	assert.is(count_source(outcome, outcome), 1);
-	assert.equal(source_helpers(operation), []);
-	select_outcome_source(outcome, 'folded');
-	assert.equal(source_helpers(operation), ['v']);
-	assert.is(render_stream_source(operation), 'f(s.v("0"),s.v("0"))');
-	select_outcome_source(outcome, 'anchored');
-	assert.equal(source_helpers(operation), []);
-	assert.is(render_stream_source(operation), 'f(s.a[1],s.a[1])');
+test('maps descriptor capture holes without descending into other instructions', () => {
+	const data = { value: 1 };
+	const capture = capture_source(0, js`[${data},${js`Number(${2})`},${runtime_source('v')}]`);
+	const source = map_descriptor_source(js`f(${capture},${'0'})`, (value, index) => {
+		if (value === data) return '{value:1}';
+		return `${index}:${stringify_primitive(value)}`;
+	});
+	assert.is(render_stream_source(source), 'f((s.p[0]=([{value:1},Number(0:2),s.v]\n)),1:"0")');
+	assert.equal(source_helpers(source), ['v']);
 });
 
 test('traverses structured dependencies inside capture assignments with textual siblings', () => {
