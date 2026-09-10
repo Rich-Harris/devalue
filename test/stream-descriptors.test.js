@@ -1,7 +1,7 @@
 import vm from 'node:vm';
 import { suite } from 'uvu';
 import * as assert from 'uvu/assert';
-import { unevalStream } from '../index.js';
+import { DevalueError, unevalStream } from '../index.js';
 
 const test = suite('unevalStream descriptor holes');
 
@@ -25,6 +25,20 @@ function client() {
 async function rejected(promise) {
 	try { await promise; } catch (error) { return error; }
 	assert.unreachable('expected rejection');
+}
+
+function invalid_graph_value(label) {
+	const bad = function invalid_descriptor_value() {};
+	return { bad, value: { deep: { [label]: bad } } };
+}
+
+function assert_descriptor_diagnostic(error, context, bad, root, path) {
+	assert.instance(error, TypeError);
+	assert.match(error.message, new RegExp(`${context.replace(/[()]/g, '\\$&')}, template hole 1: received an object`));
+	assert.instance(error.cause, DevalueError);
+	assert.is(error.cause.value, bad);
+	assert.is(error.cause.root, root);
+	assert.is(error.cause.path, path);
 }
 
 test('serializes graph values in construct and reachable capture expressions', async () => {
@@ -255,6 +269,179 @@ test('reports invalid operation data then lowers a valid fallback hole', async (
 	assert.is(reports.length, 1);
 	assert.match(reports[0].message, /resolve\(\), template hole 1: received a function/);
 	assert.is(root.value.ok, true);
+});
+
+for (const mode of ['construct', 'capture']) {
+	test(`preserves finalized graph diagnostics for nested ${mode} holes`, async () => {
+		const { bad, value: config } = invalid_graph_value('bad');
+		const job = {};
+		const root = { job };
+		const error = await rejected(unevalStream(root, (value, js) => value === job && ({
+			type: 'async-value',
+			source: new Promise(() => {}),
+			construct: (capture) => mode === 'construct'
+				? js`({config:${config}})`
+				: js`({control:${capture(js`[${config}]`)}})`,
+			resolve: () => js``,
+			reject: () => js``
+		})));
+		assert_descriptor_diagnostic(error, `async descriptor ${mode}()`, bad, root, '.job.deep.bad');
+	});
+}
+
+test('preserves descriptor diagnostics nested in an asynchronous payload region', async () => {
+	const outcome = deferred();
+	const { bad, value: config } = invalid_graph_value('bad');
+	const job = {};
+	const payload = { job };
+	const reports = [];
+	const result = await unevalStream(outcome.promise, (value, js) => value === job && ({
+		type: 'async-value', source: new Promise(() => {}),
+		construct: () => js`({config:${config}})`,
+		resolve: () => js``, reject: () => js``
+	}), { onerror: (error) => reports.push(error) });
+	outcome.resolve(payload);
+	await result.tail.next();
+	assert.is(reports.length, 1);
+	assert_descriptor_diagnostic(reports[0], 'async descriptor construct()', bad, outcome.promise, '.job.deep.bad');
+});
+
+for (const phase of ['resolve', 'next', 'complete']) {
+	test(`preserves operation diagnostics and redacts recovered ${phase} failures from client source`, async () => {
+		const gate = deferred();
+		const { bad, value: invalid } = invalid_graph_value('bad');
+		const reports = [];
+		const job = {};
+		const sequence = phase !== 'resolve';
+		const source = sequence ? {
+			[Symbol.asyncIterator]() { return this; },
+			next() { return gate.promise; }
+		} : gate.promise;
+		const result = await unevalStream(job, (value, js) => value === job && ({
+			type: sequence ? 'async-sequence' : 'async-value',
+			source,
+			construct: () => js`({error:null})`,
+			resolve: () => js`${invalid}`,
+			next: () => js`${invalid}`,
+			complete: () => js`${invalid}`,
+			reject: ({ target }, error) => js`${target}.error=${error}`,
+			error: ({ target }, error) => js`${target}.error=${error}`
+		}), { onerror: (error) => reports.push(error) });
+		const target = client();
+		const root = target.head(result.head);
+		gate.resolve(sequence ? { done: phase === 'complete', value: 1 } : 1);
+		const block = await result.tail.next();
+		assert.is(block.done, false);
+		assert.not.match(block.value, /invalid_descriptor_value|Cannot stringify a function|\.deep\.bad/);
+		target.block(block.value);
+		assert.is(reports.length, 1);
+		assert_descriptor_diagnostic(reports[0], `async descriptor ${phase}()`, bad, job, '.deep.bad');
+		assert.match(root.error.message, /failed to serialize asynchronous value/);
+		assert.not.match(root.error.message, /Cannot stringify|deep|bad/);
+		if (phase === 'next') await result.tail.return();
+	});
+}
+
+for (const mode of ['reject', 'error', 'fallback reject', 'fallback error']) {
+	test(`preserves finalized diagnostics for terminal ${mode} holes`, async () => {
+		const gate = deferred();
+		const { bad, value: invalid } = invalid_graph_value('bad');
+		const job = {};
+		const sequence = mode.endsWith('error');
+		const fallback = mode.startsWith('fallback');
+		const source = sequence ? {
+			[Symbol.asyncIterator]() { return this; },
+			next() { return gate.promise; }
+		} : gate.promise;
+		const result = await unevalStream(job, (value, js) => value === job && ({
+			type: sequence ? 'async-sequence' : 'async-value',
+			source,
+			construct: () => js`({})`,
+			resolve: () => fallback ? js`${() => {}}` : js``,
+			next: () => fallback ? js`${() => {}}` : js``,
+			complete: () => js``,
+			reject: () => js`${invalid}`,
+			error: () => js`${invalid}`
+		}));
+		const pending = result.tail.next();
+		if (fallback) gate.resolve(sequence ? { done: false, value: 1 } : 1);
+		else gate.reject('terminal reason');
+		const error = await rejected(pending);
+		const context = fallback ? `async descriptor fallback ${sequence ? 'error' : 'reject'}()` : `async descriptor ${sequence ? 'error' : 'reject'}()`;
+		assert_descriptor_diagnostic(error, context, bad, job, '.deep.bad');
+	});
+}
+
+test('keeps sequential descriptor unwind paths independent', async () => {
+	const gates = [deferred(), deferred()];
+	const invalid = [invalid_graph_value('first'), invalid_graph_value('second')];
+	const reports = [];
+	class Job { constructor(index) { this.index = index; } }
+	const jobs = [new Job(0), new Job(1)];
+	const root = { jobs };
+	const result = await unevalStream(root, (value, js) => value instanceof Job && ({
+		type: 'async-value', source: gates[value.index].promise,
+		construct: () => js`({})`,
+		resolve: () => js`${invalid[value.index].value}`,
+		reject: () => js``
+	}), { onerror: (error) => reports.push(error) });
+	gates[0].resolve(1);
+	await result.tail.next();
+	gates[1].resolve(2);
+	await result.tail.next();
+	assert.is(reports.length, 2);
+	assert_descriptor_diagnostic(reports[0], 'async descriptor resolve()', invalid[0].bad, root, '.deep.first');
+	assert_descriptor_diagnostic(reports[1], 'async descriptor resolve()', invalid[1].bad, root, '.deep.second');
+});
+
+for (const reason of [null, undefined]) {
+	test(`preserves an arbitrary thrown ${String(reason)} cause without graph fields`, async () => {
+		const throwing = {};
+		Object.defineProperty(throwing, 'value', { enumerable: true, get() { throw reason; } });
+		const ready = deferred();
+		const reports = [];
+		const job = {};
+		const result = await unevalStream(job, (value, js) => value === job && ({
+			type: 'async-value', source: ready.promise,
+			construct: () => js`({})`,
+			resolve: () => js`${throwing}`,
+			reject: () => js``
+		}), { onerror: (error) => reports.push(error) });
+		ready.resolve(1);
+		await result.tail.next();
+		assert.is(reports.length, 1);
+		assert.ok(Object.hasOwn(reports[0], 'cause'));
+		assert.is(reports[0].cause, reason);
+		assert.not.ok(reports[0].cause instanceof DevalueError);
+	});
+}
+
+test('keeps Symbol interpolation clear and does not inspect hostile description hooks', async () => {
+	const gates = [deferred(), deferred()];
+	const reports = [];
+	let inspections = 0;
+	const hostile = function hostile() {};
+	for (const key of ['constructor', 'toString']) {
+		Object.defineProperty(hostile, key, { get() { inspections++; throw new Error('inspected'); } });
+	}
+	Object.defineProperty(hostile, Symbol.toStringTag, { get() { inspections++; throw new Error('inspected'); } });
+	const jobs = [{ index: 0 }, { index: 1 }];
+	const result = await unevalStream(jobs, (value, js) => jobs.includes(value) && ({
+		type: 'async-value', source: gates[value.index].promise,
+		construct: () => js`({})`,
+		resolve: () => value.index === 0 ? js`${Symbol('private')}` : js`${hostile}`,
+		reject: () => js``
+	}), { onerror: (error) => reports.push(error) });
+	gates[0].resolve(1);
+	await result.tail.next();
+	gates[1].resolve(2);
+	await result.tail.next();
+	assert.is(inspections, 0);
+	assert.match(reports[0].message, /received a Symbol.*Symbol values cannot be serialized/);
+	assert.not.ok(Object.hasOwn(reports[0], 'cause'));
+	assert.match(reports[1].message, /received a function/);
+	assert.instance(reports[1].cause, DevalueError);
+	assert.is(reports[1].cause.value, hostile);
 });
 
 test('starts nested operation descriptors only after committed output', async () => {

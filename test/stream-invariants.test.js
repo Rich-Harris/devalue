@@ -1,7 +1,7 @@
 import vm from 'node:vm';
 import { suite } from 'uvu';
 import * as assert from 'uvu/assert';
-import { unevalStream } from '../index.js';
+import { uneval, unevalStream } from '../index.js';
 
 const test = suite('unevalStream cross-feature invariants');
 
@@ -105,6 +105,7 @@ function build_matrix_case(seed, promises) {
 	for (let i = 0; i < bytes.length; i += 1) bytes[i] = (seed * 17 + i * 29) & 255;
 	const view = new Uint16Array(buffer, 2, 4);
 	const wrapped = new MatrixWrapper(`wrapper-${seed}`, shared);
+	const constructor_read = new MatrixWrapper(`constructor-${seed}`, { items: sparse });
 	const map = new Map(shuffle([
 		[shared, view],
 		[null_object, sparse],
@@ -137,9 +138,10 @@ function build_matrix_case(seed, promises) {
 		['buffer', buffer],
 		['view', view],
 		['wrapped', wrapped],
+		['constructor_read', constructor_read],
 		['promises', promises]
 	], random);
-	return { root: Object.fromEntries(entries), outcomes, wrappers: [wrapped] };
+	return { root: Object.fromEntries(entries), outcomes, wrappers: [wrapped, constructor_read], constructor_read };
 }
 
 function compare_topology(server, revived, label, server_to_client = new Map(), client_to_server = new WeakMap()) {
@@ -217,6 +219,9 @@ function matrix_replacer(calls) {
 	return (value, js) => {
 		if (!(value instanceof MatrixWrapper)) return;
 		calls.set(value, (calls.get(value) ?? 0) + 1);
+		if (value.kind.startsWith('constructor-')) {
+			return js`Object.defineProperty({kind:${value.kind},value:${value.value}},"observed",{value:${value.value}.items[4].kind})`;
+		}
 		return js`({kind:${value.kind},value:${value.value}})`;
 	};
 }
@@ -264,6 +269,7 @@ async function run_matrix_case(seed, schedule) {
 		for (const wrapper of graph.wrappers) {
 			assert.is(calls.get(wrapper), 1, `seed ${seed}, ${schedule}: replacer call count`);
 		}
+		assert.is(server_to_client.get(graph.constructor_read).observed, 'null-object', `seed ${seed}, ${schedule}: sparse/null constructor read`);
 	} finally {
 		await result.tail.return();
 	}
@@ -275,6 +281,40 @@ test('preserves bounded fixed-seed graph topology across observation schedules',
 	for (const seed of seeds) {
 		for (const schedule of schedules) {
 			await with_watchdog(`seed ${seed}, ${schedule}`, run_matrix_case(seed, schedule));
+		}
+	}
+});
+
+test('preserves ordinary custom-mode Object Map and Set cycle order in bounded release cases', () => {
+	class Wrapped {
+		constructor(value) { this.value = value; }
+	}
+	const replacer = (value, js) => value instanceof Wrapped && js`({value:${value.value}})`;
+	for (const kind of ['Object', 'Map', 'Set']) {
+		for (const position of [0, 1, 2]) {
+			let value;
+			if (kind === 'Object') {
+				value = {};
+				for (let i = 0; i < 3; i++) value[`key${i}`] = i === position ? value : i;
+			} else if (kind === 'Map') {
+				value = new Map();
+				for (let i = 0; i < 3; i++) value.set(`key${i}`, i === position ? value : i);
+			} else {
+				value = new Set();
+				for (let i = 0; i < 3; i++) value.add(i === position ? value : i);
+			}
+			const source = uneval(new Wrapped(value), replacer);
+			const revived = Function(`return (${source})`)().value;
+			const label = `${kind} cycle position ${position}`;
+			if (kind === 'Map') {
+				assert.equal(Array.from(revived.keys()), ['key0', 'key1', 'key2'], `${label}: order`);
+				assert.is(revived.get(`key${position}`), revived, `${label}: cycle`);
+			} else if (kind === 'Set') {
+				assert.equal(Array.from(revived, (entry) => entry === revived ? 'cycle' : entry), Array.from({ length: 3 }, (_, i) => i === position ? 'cycle' : i), `${label}: order`);
+			} else {
+				assert.equal(Object.keys(revived), ['key0', 'key1', 'key2'], `${label}: order`);
+				assert.is(revived[`key${position}`], revived, `${label}: cycle`);
+			}
 		}
 	}
 });

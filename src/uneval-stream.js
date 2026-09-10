@@ -42,6 +42,8 @@ import {
 } from './stream-source.js';
 
 const promise_then = Promise.prototype.then;
+/** Original failures wrapped with descriptor interpolation context. @type {WeakMap<object, unknown>} */
+const descriptor_error_causes = new WeakMap();
 
 const generic_error = js`new Error("devalue: failed to serialize asynchronous value")`;
 
@@ -335,7 +337,7 @@ class Session {
 		this.#slot = checkpoint.slot;
 		this.#collection = checkpoint.collection;
 		this.#name = checkpoint.name;
-		roll_back(this.#graph, checkpoint.nodes, error);
+		roll_back(this.#graph, checkpoint.nodes, descriptor_graph_error(error));
 		this.#transaction_depth--;
 	}
 
@@ -514,7 +516,7 @@ class Session {
 			try {
 				captured = child(this.#graph, entry.value);
 			} catch (error) {
-				throw descriptor_interpolation_error(error, entry.value, entry.capture ? 'async descriptor capture()' : 'async descriptor construct()', entry.index);
+				throw descriptor_interpolation_error(error, entry.value, entry.capture ? 'async descriptor capture()' : 'async descriptor construct()', entry.index, true);
 			}
 			children[i] = captured;
 			if (is_node(captured)) this.#make_opaque(captured);
@@ -559,7 +561,7 @@ class Session {
 					const node = discover(this.#graph, entry.value);
 					if (node) nodes.set(/** @type {object} */ (entry.value), node);
 				} catch (error) {
-					throw descriptor_interpolation_error(error, entry.value, context, entry.index);
+					throw descriptor_interpolation_error(error, entry.value, context, entry.index, true);
 				}
 			}
 			this.#validate_new_custom(checkpoint.new_custom);
@@ -1909,7 +1911,7 @@ class Session {
 		let finish = () => {};
 		const cleanup = new Promise((resolve) => { finish = resolve; });
 		/** @type {TerminatingLifecycle} */
-		const status = { state, has_reason, reason, cleanup, operations: [] };
+		const status = { state, has_reason, reason, cleanup };
 		this.#status = status;
 		this.#release_lifecycle();
 		this.#notify();
@@ -1918,10 +1920,8 @@ class Session {
 			if (!source.committed) continue;
 			this.#deactivate(source);
 			if (source.acquiring) continue;
-			const close = this.#close_sequence(source);
-			if (close && !status.operations.includes(close)) status.operations.push(close);
-			const cancel = this.#cancel_source(source);
-			if (cancel && !status.operations.includes(cancel)) status.operations.push(cancel);
+			this.#close_sequence(source);
+			this.#cancel_source(source);
 		}
 
 		// Reentrant callbacks may finish iterator acquisition after the terminal transition.
@@ -1936,7 +1936,13 @@ class Session {
 	 * @param {TerminatingLifecycle} status
 	 */
 	async #settle_cleanup(status) {
-		const operations = status.operations;
+		/** @type {CleanupOperation[]} */
+		const operations = [];
+		for (const source of this.#sources) {
+			if (!source.committed) continue;
+			if (source.close_operation) operations.push(source.close_operation);
+			if (source.cancel_operation) operations.push(source.cancel_operation);
+		}
 		const results = await Promise.all(operations.map((operation) => operation.result));
 		let primary = -1;
 		if (!status.has_reason) {
@@ -1964,8 +1970,7 @@ class Session {
 	 */
 	#close_sequence(source) {
 		if (source.close_operation) return source.close_operation;
-		if (source.iterator_closed || !source.iterator) return;
-		source.iterator_closed = true;
+		if (!source.iterator) return;
 		const operation = this.#create_cleanup(source, 'return');
 		source.close_operation = operation;
 		try {
@@ -1988,8 +1993,6 @@ class Session {
 	 */
 	#cancel_source(source) {
 		if (source.cancel_operation) return source.cancel_operation;
-		if (source.cancel_started) return;
-		source.cancel_started = true;
 		const operation = this.#create_cleanup(source, 'cancel');
 		source.cancel_operation = operation;
 		try {
@@ -2006,8 +2009,8 @@ class Session {
 	}
 
 	/**
-	 * Creates and registers an always-fulfilled cleanup result before invoking user code, making
-	 * getter/callback reentry idempotent and preserving deterministic operation order.
+	 * Creates an always-fulfilled source-owned cleanup result before invoking user code, making
+	 * getter/callback reentry idempotent. Termination later collects records in source order.
 	 * @param {Source} source
 	 * @param {'return' | 'cancel'} kind
 	 * @returns {CleanupOperation}
@@ -2018,8 +2021,6 @@ class Session {
 		const result = new Promise((resolve) => { settle = resolve; });
 		/** @type {CleanupOperation} */
 		const operation = { source, kind, reported: false, result, settle };
-		const status = this.#status;
-		if (status.state === 'cancelled' || status.state === 'failed') status.operations.push(operation);
 		return operation;
 	}
 
@@ -2043,7 +2044,8 @@ class Session {
 		const operation = this.#close_sequence(source);
 		if (!operation) return;
 		void operation.result.then((result) => {
-			if (!result.ok) this.#report_cleanup(operation, result.error);
+			const status = this.#status;
+			if (!result.ok && status.state !== 'cancelled' && status.state !== 'failed') this.#report_cleanup(operation, result.error);
 		});
 	}
 
@@ -2157,11 +2159,26 @@ function is_atomic(node) {
  * @param {unknown} value
  * @param {string} context
  * @param {number} index
+ * @param {boolean} [has_cause]
  */
-function descriptor_interpolation_error(error, value, context, index) {
+function descriptor_interpolation_error(error, value, context, index, has_cause = false) {
 	const detail = typeof value === 'symbol' ? ' Symbol values cannot be serialized as data.'
 		: error instanceof Error ? ` ${error.message}` : '';
-	return new TypeError(`Invalid JavaScript source interpolation in ${context}, template hole ${index + 1}: received ${describe_received(value)}.${detail}`);
+	const message = `Invalid JavaScript source interpolation in ${context}, template hole ${index + 1}: received ${describe_received(value)}.${detail}`;
+	const wrapped = has_cause ? new TypeError(message, { cause: error }) : new TypeError(message);
+	if (has_cause) descriptor_error_causes.set(wrapped, error);
+	return wrapped;
+}
+
+/**
+ * Returns the original privately wrapped graph failure without inspecting arbitrary user causes.
+ * @param {unknown} error
+ */
+function descriptor_graph_error(error) {
+	while (typeof error === 'object' && error !== null && descriptor_error_causes.has(error)) {
+		error = descriptor_error_causes.get(error);
+	}
+	return error;
 }
 
 /** @param {object} value */
@@ -2226,8 +2243,8 @@ function macrotask() {
 /** @typedef {{ node: CapturedNode, previous: RetainedReference | undefined }} ReferenceMutation */
 /** @typedef {{ nodes: number, sources: number, new_custom: number, validated: number, opaque: number, references: number, pending: number, native_pending: number, active: number, availability: number, anchor: number, slot: number, collection: number, name: number }} TransactionCheckpoint */
 /** @typedef {{ state: 'preparing' | 'streaming' } | { state: 'completed' } | TerminatingLifecycle} Lifecycle */
-/** @typedef {{ state: 'cancelled' | 'failed', has_reason: boolean, reason: unknown, cleanup: Promise<void>, operations: CleanupOperation[] }} TerminatingLifecycle */
+/** @typedef {{ state: 'cancelled' | 'failed', has_reason: boolean, reason: unknown, cleanup: Promise<void> }} TerminatingLifecycle */
 /** @typedef {{ ok: true } | { ok: false, error: unknown }} CleanupResult */
 /** @typedef {{ source: Source, kind: 'return' | 'cancel', reported: boolean, result: Promise<CleanupResult>, settle: (result: CleanupResult) => void }} CleanupOperation */
-/** @typedef {{ node: AsyncNode, descriptor: any, type: 'value' | 'sequence' | 'native', immediate: boolean, committed: boolean, started: boolean, terminal: boolean, active: boolean, iterator?: AsyncIterator<unknown>, iterator_closed?: boolean, acquiring?: boolean, next?: AsyncIterator<unknown>['next'], pulling?: boolean, observer?: { active: boolean, dispatch?: (type: 'resolve' | 'reject', result: unknown) => void }, early?: ['resolve' | 'reject', unknown], close_operation?: CleanupOperation, cancel_started?: boolean, cancel_operation?: CleanupOperation }} Source */
+/** @typedef {{ node: AsyncNode, descriptor: any, type: 'value' | 'sequence' | 'native', immediate: boolean, committed: boolean, started: boolean, terminal: boolean, active: boolean, iterator?: AsyncIterator<unknown>, acquiring?: boolean, next?: AsyncIterator<unknown>['next'], pulling?: boolean, observer?: { active: boolean, dispatch?: (type: 'resolve' | 'reject', result: unknown) => void }, early?: ['resolve' | 'reject', unknown], close_operation?: CleanupOperation, cancel_operation?: CleanupOperation }} Source */
 /** @typedef {{ source: Source, type: 'resolve' | 'reject' | 'next' | 'complete' | 'error', value: unknown, invalid: boolean }} Event */

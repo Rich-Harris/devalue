@@ -30,6 +30,13 @@ async function rejected(promise) {
 	return reason;
 }
 
+function settled(promise) {
+	return promise.then(
+		(value) => ({ ok: true, value }),
+		(reason) => ({ ok: false, reason })
+	);
+}
+
 function listeners(signal) {
 	return getEventListeners(signal, 'abort').length;
 }
@@ -183,6 +190,46 @@ test('return getter reentry invokes return and cancel at most once', async () =>
 	pull.resolve({ done: true });
 });
 
+test('return and cancel getter failures are observed once in operation order', async () => {
+	const return_failure = { kind: 'return getter' };
+	const cancel_failure = { kind: 'cancel getter' };
+	const reports = [];
+	let return_gets = 0;
+	let cancel_gets = 0;
+	const iterator = {
+		next: () => new Promise(() => {}),
+		get return() {
+			return_gets++;
+			throw return_failure;
+		}
+	};
+	const source = { [Symbol.asyncIterator]() { return iterator; } };
+	const value = { source };
+	const descriptor = sequence_descriptor(value, undefined);
+	Object.defineProperty(descriptor, 'cancel', {
+		get() {
+			cancel_gets++;
+			if (cancel_gets === 1) return () => {};
+			throw cancel_failure;
+		}
+	});
+	const result = await unevalStream(value, (candidate, js) => {
+		if (candidate !== value) return;
+		descriptor.construct = () => js`({events:[]})`;
+		descriptor.next = ({ target }, item) => js`${target}.events.push(${item})`;
+		descriptor.complete = () => js``;
+		descriptor.error = () => js``;
+		return descriptor;
+	}, { onerror: (error) => reports.push(error) });
+	assert.is(await rejected(result.tail.return()), return_failure);
+	assert.equal(reports, [cancel_failure]);
+	assert.is(return_gets, 1);
+	assert.is(cancel_gets, 2);
+	assert.equal(await result.tail.return(), { done: true, value: undefined });
+	assert.is(return_gets, 1);
+	assert.is(cancel_gets, 2);
+});
+
 test('abort during initial traversal leaves every provisional descriptor untouched', async () => {
 	const controller = new AbortController();
 	const calls = [];
@@ -277,6 +324,119 @@ test('selects cleanup failures in source and operation order', async () => {
 	}), { onerror: (error) => reports.push(error) });
 	assert.is(await rejected(result.tail.return()), return_failure);
 	assert.equal(reports, [cancel_failure, later_failure]);
+});
+
+for (const settlement of ['return-first', 'cancel-first']) {
+	test(`selects acquisition-reentry cleanup failures by discovery order (${settlement})`, async () => {
+		const outcome = deferred();
+		const return_gate = deferred();
+		const cancel_gate = deferred();
+		const return_failure = { kind: 'return' };
+		const cancel_failure = { kind: 'cancel' };
+		const reports = [];
+		const calls = [];
+		const acquired = deferred();
+		let reentrant_return;
+		let result;
+		let returns = 0;
+		let first_cancels = 0;
+		let second_cancels = 0;
+		class Sequence {
+			constructor(name) {
+				this.name = name;
+				this.source = {
+					[Symbol.asyncIterator]: () => {
+						calls.push(`acquire:${name}`);
+						if (name === 'first') {
+							reentrant_return = settled(result.tail.return());
+							acquired.resolve();
+						}
+						return this.source;
+					},
+					next: () => new Promise(() => {}),
+					return: () => {
+						returns++;
+						calls.push(`return:${name}`);
+						return return_gate.promise;
+					}
+				};
+			}
+		}
+		const values = [new Sequence('first'), new Sequence('second')];
+		result = await unevalStream(outcome.promise, (value, js) => value instanceof Sequence && sequence_descriptor(value, js, () => {
+			calls.push(`cancel:${value.name}`);
+			if (value.name === 'first') first_cancels++;
+			else {
+				second_cancels++;
+				return cancel_gate.promise;
+			}
+		}), { onerror: (error) => reports.push(error) });
+		const next = settled(result.tail.next());
+		let timer;
+		const watchdog = new Promise((_, reject) => {
+			timer = setTimeout(() => reject(new Error('acquisition-reentry cleanup deadlocked')), 1000);
+		});
+		try {
+			outcome.resolve(values);
+			await Promise.race([acquired.promise, watchdog]);
+			assert.ok(reentrant_return);
+			assert.is(second_cancels, 1);
+			assert.is(returns, 1);
+			assert.is(first_cancels, 1);
+			if (settlement === 'return-first') {
+				return_gate.reject(return_failure);
+				await Promise.resolve();
+				cancel_gate.reject(cancel_failure);
+			} else {
+				cancel_gate.reject(cancel_failure);
+				await Promise.resolve();
+				return_gate.reject(return_failure);
+			}
+			const next_result = await Promise.race([next, watchdog]);
+			const return_result = await Promise.race([reentrant_return, watchdog]);
+			assert.is(next_result.ok, false);
+			assert.is(return_result.ok, false);
+			assert.is(next_result.reason, return_failure);
+			assert.is(return_result.reason, return_failure);
+			assert.equal(reports, [cancel_failure]);
+			assert.is(returns, 1);
+			assert.is(first_cancels, 1);
+			assert.is(second_cancels, 1);
+		} finally {
+			clearTimeout(timer);
+			return_gate.resolve({ done: true });
+			cancel_gate.resolve();
+		}
+	});
+}
+
+test('preserves a falsy abort reason during iterator acquisition', async () => {
+	const controller = new AbortController();
+	const outcome = deferred();
+	const return_failure = { kind: 'return' };
+	const cancel_failure = { kind: 'cancel' };
+	const reports = [];
+	class Sequence {
+		constructor(name) {
+			this.name = name;
+			this.source = {
+				[Symbol.asyncIterator]: () => {
+					if (name === 'first') controller.abort(0);
+					return this.source;
+				},
+				next: () => new Promise(() => {}),
+				return: () => Promise.reject(return_failure)
+			};
+		}
+	}
+	const values = [new Sequence('first'), new Sequence('second')];
+	const result = await unevalStream(outcome.promise, (value, js) => value instanceof Sequence && sequence_descriptor(value, js, () => {
+		if (value.name === 'second') throw cancel_failure;
+	}), { signal: controller.signal, onerror: (error) => reports.push(error) });
+	const next = rejected(result.tail.next());
+	outcome.resolve(values);
+	assert.is(await next, 0);
+	assert.equal(reports, [return_failure, cancel_failure]);
 });
 
 test('explicit cancellation reuses a failed-sequence close already in flight', async () => {
