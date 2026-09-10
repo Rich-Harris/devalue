@@ -31,6 +31,8 @@ function headers(response) {
 const release = deferred();
 let released = false;
 const abandonment = { requests: 0, returns: 0, cancels: 0, closed: 0 };
+const tasks = new Set();
+const sockets = new Set();
 
 class CustomValue {
 	constructor(value) {
@@ -97,20 +99,30 @@ async function serve_abandonment(response) {
 		construct: () => js`({})`, next: () => js``, complete: () => js``, error: () => js``,
 		cancel() { abandonment.cancels++; }
 	}), { id: 'browser-csp-abandonment' });
-	headers(response);
-	response.write('<!doctype html><meta charset="utf-8"><title>devalue abandoned stream</title>');
-	response.write(script(`globalThis.data=(${result.head});globalThis.headReady=true;location.href='/';`));
+	let cleanup;
 	let closed = false;
-	response.on('close', () => {
+	const cleanup_tail = () => {
+		if (!cleanup) {
+			cleanup = Promise.resolve(result.tail.return()).finally(() => pull.resolve({ done: true }));
+			cleanup.catch((error) => console.error(error?.stack ?? error));
+		}
+		return cleanup;
+	};
+	response.once('close', () => {
 		if (closed) return;
 		closed = true;
 		abandonment.closed++;
-		void result.tail.return().finally(() => pull.resolve({ done: true }));
+		void cleanup_tail();
 	});
+	headers(response);
+	response.write('<!doctype html><meta charset="utf-8"><title>devalue abandoned stream</title>');
+	response.write(script(`globalThis.data=(${result.head});globalThis.abandonmentHeadReady=location.pathname==='/abandon';`));
 	try {
 		for await (const block of result.tail) response.write(script(block));
 	} catch {
 		// The browser deliberately abandons this response.
+	} finally {
+		if (cleanup) await cleanup;
 	}
 }
 
@@ -122,10 +134,10 @@ const server = http.createServer((request, response) => {
 		return;
 	}
 	if (url.pathname === '/stream') {
-		void serve_stream(response).catch((error) => {
+		track(serve_stream(response).catch((error) => {
 			if (!response.headersSent) response.writeHead(500);
 			response.end(String(error?.stack ?? error));
-		});
+		}));
 		return;
 	}
 	if (url.pathname === '/release') {
@@ -138,7 +150,10 @@ const server = http.createServer((request, response) => {
 		return;
 	}
 	if (url.pathname === '/abandon') {
-		void serve_abandonment(response).catch(() => {});
+		track(serve_abandonment(response).catch((error) => {
+			if (!response.destroyed) response.destroy(error);
+			else console.error(error?.stack ?? error);
+		}));
 		return;
 	}
 	if (url.pathname === '/status') {
@@ -150,8 +165,38 @@ const server = http.createServer((request, response) => {
 	response.end('not found');
 });
 
+server.on('connection', (socket) => {
+	sockets.add(socket);
+	socket.once('close', () => sockets.delete(socket));
+});
+
+function track(task) {
+	tasks.add(task);
+	void task.then(() => tasks.delete(task), () => tasks.delete(task));
+}
+
 server.listen(port, host, () => console.log(`http://${host}:${server.address().port}`));
 
+let shutting_down = false;
+async function shutdown() {
+	if (shutting_down) return;
+	shutting_down = true;
+	released = true;
+	release.resolve();
+	server.close();
+	server.closeAllConnections();
+	for (const socket of sockets) socket.destroy();
+	await Promise.race([
+		Promise.allSettled([...tasks]),
+		new Promise((resolve) => setTimeout(resolve, 1_500))
+	]);
+}
+
 for (const signal of ['SIGINT', 'SIGTERM']) {
-	process.once(signal, () => server.close(() => process.exit(0)));
+	process.once(signal, () => {
+		void shutdown().then(() => process.exit(0), (error) => {
+			console.error(error?.stack ?? error);
+			process.exit(1);
+		});
+	});
 }
