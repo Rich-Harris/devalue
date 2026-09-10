@@ -195,6 +195,20 @@ test('preserves identity between separate promise outcomes', async () => {
 	assert.is(await root[0], await root[1]);
 });
 
+test('keeps scalar Promise transaction copying proportional to changed state', () => {
+	const fixture = fileURLToPath(new URL('../fixtures/stream/scalar-scaling.mjs', import.meta.url));
+	const child = spawnSync(process.execPath, [fixture, '100', '200', '400'], { encoding: 'utf8' });
+	assert.is(child.status, 0, child.stderr || child.stdout);
+	const measurement = JSON.parse(child.stdout);
+	assert.is(measurement.fixture, 'resolved native Promise<number>[]');
+	assert.equal(measurement.results.map((result) => result.count), [100, 200, 400]);
+	for (const result of measurement.results) {
+		assert.ok(result.copied_entries <= result.count * 2, JSON.stringify(measurement));
+		assert.ok(result.copied_containers <= result.count * 2, JSON.stringify(measurement));
+		assert.ok(result.bytes > 0);
+	}
+});
+
 test('preserves same-batch identities without reading paths before their event exists', async () => {
 	class Wrapper {
 		constructor(value) {

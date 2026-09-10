@@ -151,6 +151,35 @@ function deferred() {
 	return { promise, resolve };
 }
 
+/** @param {number} count */
+function scalar_scaling_benchmark(count) {
+	let described = false;
+	const run = async () => {
+		const promises = Array.from({ length: count }, (_, index) => Promise.resolve(index));
+		const result = await unevalStream(promises, undefined, { id: `scalar-scaling-${count}` });
+		const root = Function(`return (${result.head})`)();
+		let bytes = result.head.length;
+		for await (const block of result.tail) {
+			bytes += block.length;
+			Function(block)();
+		}
+		const values = await Promise.all(root);
+		if (values.length !== count || values[count - 1] !== count - 1) throw new Error('scalar scaling fixture was not consumed');
+		blackhole += bytes + values.length;
+		if (!described) {
+			described = true;
+			console.log(`  ${process.version}; resolved native Promise<number>[]; N=${count}; generated=${bytes} bytes`);
+		}
+	};
+	return {
+		label: `unevalStream stream/scalar scaling ${count}`,
+		async fn() {
+			await run();
+			return median_test(3, run);
+		}
+	};
+}
+
 /** @param {Awaited<ReturnType<typeof unevalStream>>} result */
 async function consume(result) {
 	blackhole += result.head.length;
@@ -176,6 +205,7 @@ const benchmarks = [
 	sync_benchmark('unevalStream edge/collections', collection_graph(), 100),
 	sync_benchmark('unevalStream custom/nested', custom_graph(), 100, replacer),
 	sync_benchmark('unevalStream custom/atomic cycle', atomic_graph(), 150, replacer),
+	...([100, 400, 1000, 4000].map(scalar_scaling_benchmark)),
 	{
 		label: 'unevalStream stream/resolved head',
 		async fn() {

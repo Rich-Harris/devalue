@@ -115,6 +115,10 @@ class Session {
 	#new_custom = [];
 	/** Nodes whose opacity was incremented in an active transaction. @type {CapturedNode[]} */
 	#opaque_increments = [];
+	/** Nodes added to the validated set in active transactions. @type {CapturedNode[]} */
+	#validated_additions = [];
+	/** Retained-reference heads replaced in active transactions. @type {ReferenceMutation[]} */
+	#reference_mutations = [];
 	/** Number of nested graph/emission transactions currently active. */
 	#transaction_depth = 0;
 	/** Custom nodes already proven acyclic. @type {Set<CapturedNode>} */
@@ -254,10 +258,18 @@ class Session {
 	 * @returns {CapturedNode | undefined}
 	 */
 	#capture(value, root = false) {
+		// Primitive capture cannot append graph or source state. Validate it directly so
+		// common scalar outcomes do not open even a small graph transaction.
+		if (is_primitive(value)) {
+			const node = discover(this.#graph, value);
+			if (!this.#is_active()) throw this.#terminal_reason();
+			if (root) this.#root = node;
+			return node;
+		}
 		const checkpoint = this.#begin_transaction();
 		try {
 			const node = discover(this.#graph, value);
-			this.#validate_new_custom(checkpoint.new_custom.length);
+			this.#validate_new_custom(checkpoint.new_custom);
 			if (!this.#is_active()) throw this.#terminal_reason();
 			this.#commit_transaction(checkpoint, true);
 			if (root) this.#root = node;
@@ -274,9 +286,10 @@ class Session {
 		return {
 			nodes: this.#graph.nodes.length,
 			sources: this.#sources.length,
-			new_custom: this.#new_custom.slice(),
-			validated: new Set(this.#validated),
+			new_custom: this.#new_custom.length,
+			validated: this.#validated_additions.length,
 			opaque: this.#opaque_increments.length,
+			references: this.#reference_mutations.length,
 			pending: this.#pending,
 			native_pending: this.#native_pending,
 			active: this.#active,
@@ -284,8 +297,7 @@ class Session {
 			anchor: this.#anchor,
 			slot: this.#slot,
 			collection: this.#collection,
-			name: this.#name,
-			references: new Map(this.#references)
+			name: this.#name
 		};
 	}
 
@@ -295,17 +307,28 @@ class Session {
 			for (let i = checkpoint.sources; i < this.#sources.length; i++) this.#sources[i].committed = true;
 		}
 		this.#transaction_depth--;
-		if (this.#transaction_depth === 0) this.#opaque_increments.length = checkpoint.opaque;
+		if (this.#transaction_depth === 0) {
+			this.#opaque_increments.length = 0;
+			this.#validated_additions.length = 0;
+			this.#reference_mutations.length = 0;
+		}
 	}
 
 	/** @param {TransactionCheckpoint} checkpoint @param {unknown} error */
 	#roll_back_transaction(checkpoint, error) {
+		for (let i = this.#sources.length - 1; i >= checkpoint.sources; i--) this.#deactivate(this.#sources[i]);
 		for (let i = this.#opaque_increments.length - 1; i >= checkpoint.opaque; i--) this.#opaque_increments[i].opaque--;
 		this.#opaque_increments.length = checkpoint.opaque;
-		for (let i = this.#sources.length - 1; i >= checkpoint.sources; i--) this.#deactivate(this.#sources[i]);
+		for (let i = this.#validated_additions.length - 1; i >= checkpoint.validated; i--) this.#validated.delete(this.#validated_additions[i]);
+		this.#validated_additions.length = checkpoint.validated;
+		for (let i = this.#reference_mutations.length - 1; i >= checkpoint.references; i--) {
+			const mutation = this.#reference_mutations[i];
+			if (mutation.previous) this.#references.set(mutation.node, mutation.previous);
+			else this.#references.delete(mutation.node);
+		}
+		this.#reference_mutations.length = checkpoint.references;
 		this.#sources.length = checkpoint.sources;
-		this.#new_custom = checkpoint.new_custom;
-		this.#validated = checkpoint.validated;
+		this.#new_custom.length = checkpoint.new_custom;
 		this.#pending = checkpoint.pending;
 		this.#native_pending = checkpoint.native_pending;
 		this.#active = checkpoint.active;
@@ -314,7 +337,6 @@ class Session {
 		this.#slot = checkpoint.slot;
 		this.#collection = checkpoint.collection;
 		this.#name = checkpoint.name;
-		this.#references = checkpoint.references;
 		roll_back(this.#graph, checkpoint.nodes, error);
 		this.#transaction_depth--;
 	}
@@ -322,7 +344,7 @@ class Session {
 	/** Records an opaque constructor dependency with rollback support. @param {CapturedNode} node */
 	#make_opaque(node) {
 		node.opaque++;
-		this.#opaque_increments.push(node);
+		if (this.#transaction_depth > 0) this.#opaque_increments.push(node);
 	}
 
 	/**
@@ -332,7 +354,6 @@ class Session {
 	 */
 	#validate_new_custom(start = 0) {
 		if (this.#new_custom.length === start) return;
-		const pending = this.#new_custom.slice(start);
 		/** @type {Set<CapturedNode>} */
 		const validating = new Set();
 		/** @type {Set<CapturedNode>} */
@@ -348,9 +369,13 @@ class Session {
 			validating.delete(node);
 			validated.add(node);
 		};
-		for (const node of pending) validate(node);
-		this.#new_custom.splice(start);
-		for (const node of validated) this.#validated.add(node);
+		for (let i = start; i < this.#new_custom.length; i++) validate(this.#new_custom[i]);
+		this.#new_custom.length = start;
+		for (const node of validated) {
+			if (this.#validated.has(node)) continue;
+			this.#validated.add(node);
+			if (this.#transaction_depth > 0) this.#validated_additions.push(node);
+		}
 	}
 
 	/**
@@ -510,14 +535,21 @@ class Session {
 	 *
 	 * @param {JavaScriptSource} source
 	 * @param {string} context
-	 * @param {number} available
 	 * @param {number} retained_at
 	 * @param {Set<CapturedNode>} references
 	 */
-	#lower_descriptor_source(source, context, available, retained_at, references) {
+	#lower_descriptor_source(source, context, retained_at, references) {
+		const entries = descriptor_source_values(source);
+		if (entries.length === 0) return { prerequisites: [], source };
+		if (entries.every((entry) => is_primitive(entry.value))) {
+			const lowered = map_descriptor_source(source, (value, index) => {
+				if (typeof value === 'symbol') throw descriptor_interpolation_error(undefined, value, context, index);
+				return stringify_primitive(/** @type {null | undefined | boolean | number | string | bigint} */ (value));
+			});
+			return { prerequisites: [], source: lowered };
+		}
 		const checkpoint = this.#begin_transaction();
 		try {
-			const entries = descriptor_source_values(source);
 			/** @type {Map<object, CapturedNode>} */
 			const nodes = new Map();
 			for (const entry of entries) {
@@ -528,7 +560,7 @@ class Session {
 					throw descriptor_interpolation_error(error, entry.value, context, entry.index);
 				}
 			}
-			this.#validate_new_custom(checkpoint.new_custom.length);
+			this.#validate_new_custom(checkpoint.new_custom);
 			if (!this.#is_active()) throw this.#terminal_reason();
 			this.#active += this.#sources.length - checkpoint.sources;
 
@@ -538,25 +570,23 @@ class Session {
 			const prerequisites = [];
 			// Arbitrary descriptor payloads are materialized immediately before these
 			// prerequisites, so their retained identities already exist at this event boundary.
-			let prerequisite_available = retained_at;
 			for (const entry of entries) {
 				if (is_primitive(entry.value)) continue;
 				const node = nodes.get(/** @type {object} */ (entry.value));
 				if (!node || bindings.has(node)) continue;
 				references.add(node);
-				const retained = this.#reference_at(node, prerequisite_available);
+				const retained = this.#reference_at(node, retained_at);
 				/** @type {Emission} */
 				let expression;
 				if (retained) {
 					expression = reference_source(node, retained.path);
 				} else {
-					const region = this.#emit_region(node.value, true, references, prerequisite_available, retained_at);
-					this.#resolve_references(region, prerequisite_available);
+					const region = this.#emit_region(node.value, true, references, retained_at, retained_at);
+					this.#resolve_references(region, retained_at);
 					const index = this.#anchor++;
 					const path = { kind: /** @type {const} */ ('anchor'), index, segments: [] };
 					this.#assign_references(node.value, path, new Map(), retained_at);
 					expression = join_sources([`${this.#session_name}.a[${index}]=`, region]);
-					prerequisite_available = retained_at;
 				}
 				const local = this.#next_name();
 				prerequisites.push(join_sources([`const ${local}=`, expression]));
@@ -1353,6 +1383,7 @@ class Session {
 	#reference_node(node, reference, available) {
 		const previous = this.#references.get(node);
 		if (!previous || reference_length(reference) < reference_length(previous.path)) {
+			if (this.#transaction_depth > 0) this.#reference_mutations.push({ node, previous });
 			this.#references.set(node, { path: reference, available, previous });
 		}
 	}
@@ -1365,14 +1396,10 @@ class Session {
 	 */
 	#reference_at(node, available) {
 		let reference = this.#references.get(node);
-		let selected;
 		while (reference) {
-			if (reference.available <= available && (!selected || reference_length(reference.path) < reference_length(selected.path))) {
-				selected = reference;
-			}
+			if (reference.available <= available) return reference;
 			reference = reference.previous;
 		}
-		return selected;
 	}
 
 	/**
@@ -1579,10 +1606,10 @@ class Session {
 				else operation = source.descriptor.error(reference, value_source);
 				if (!this.#is_active()) throw this.#terminal_reason();
 				if (!is_source(operation)) throw new TypeError(`Invalid async descriptor operation: ${event.type}() returned ${describe_received(operation)}. It must synchronously return a js tagged template containing client statements; use js\`\` for an empty operation.`);
-				const lowered = this.#lower_descriptor_source(operation, `async descriptor ${event.type}()`, available, retained_at, references);
+				const lowered = this.#lower_descriptor_source(operation, `async descriptor ${event.type}()`, retained_at, references);
 				if (materialization) operations.push(materialization);
 				operations.push(...lowered.prerequisites, source.immediate ? lowered.source : complete_statement_source(lowered.source));
-				this.#commit_transaction(lowered.checkpoint, false);
+				if (lowered.checkpoint) this.#commit_transaction(lowered.checkpoint, false);
 			} catch (error) {
 				if (!this.#is_active()) throw error;
 				if (event.type === 'resolve' || event.type === 'next' || event.type === 'complete') {
@@ -1608,9 +1635,9 @@ class Session {
 					if (!this.#is_active()) throw this.#terminal_reason();
 					if (!is_source(fallback)) throw new TypeError(`Invalid async descriptor operation: fallback ${source.type === 'sequence' ? 'error' : 'reject'}() returned ${describe_received(fallback)}. It must synchronously return a js tagged template containing client statements; use js\`\` for an empty operation.`);
 					const context = source.type === 'sequence' ? 'async descriptor fallback error()' : 'async descriptor fallback reject()';
-					const lowered = this.#lower_descriptor_source(fallback, context, available, retained_at, references);
+					const lowered = this.#lower_descriptor_source(fallback, context, retained_at, references);
 					operations.push(...lowered.prerequisites, source.immediate ? lowered.source : complete_statement_source(lowered.source));
-					this.#commit_transaction(lowered.checkpoint, false);
+					if (lowered.checkpoint) this.#commit_transaction(lowered.checkpoint, false);
 					event.type = source.type === 'sequence' ? 'error' : 'reject';
 				} else {
 					throw error;
@@ -2197,7 +2224,8 @@ function macrotask() {
 }
 
 /** @typedef {{ path: ClientPath, available: number, previous: RetainedReference | undefined }} RetainedReference */
-/** @typedef {{ nodes: number, sources: number, new_custom: CapturedNode[], validated: Set<CapturedNode>, opaque: number, pending: number, native_pending: number, active: number, availability: number, anchor: number, slot: number, collection: number, name: number, references: Map<CapturedNode, RetainedReference> }} TransactionCheckpoint */
+/** @typedef {{ node: CapturedNode, previous: RetainedReference | undefined }} ReferenceMutation */
+/** @typedef {{ nodes: number, sources: number, new_custom: number, validated: number, opaque: number, references: number, pending: number, native_pending: number, active: number, availability: number, anchor: number, slot: number, collection: number, name: number }} TransactionCheckpoint */
 /** @typedef {{ state: 'preparing' | 'streaming' } | { state: 'completed' } | TerminatingLifecycle} Lifecycle */
 /** @typedef {{ state: 'cancelled' | 'failed', has_reason: boolean, reason: unknown, cleanup: Promise<void>, operations: CleanupOperation[] }} TerminatingLifecycle */
 /** @typedef {{ ok: true } | { ok: false, error: unknown }} CleanupResult */
