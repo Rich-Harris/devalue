@@ -1,6 +1,7 @@
 import { suite } from 'uvu';
 import * as assert from 'uvu/assert';
 import { child, create_captured_graph, discover, roll_back } from './graph.js';
+import { DevalueError } from './utils.js';
 
 const test = suite('shared graph');
 const create_test_graph = (root) => create_captured_graph(root, () => false);
@@ -127,6 +128,90 @@ test('reports __proto__ keys at the owning object', () => {
 	assert.is(error.message, 'Cannot stringify objects with __proto__ keys');
 	assert.is(error.path, '.foo');
 	assert.is(error.value, inner);
+});
+
+test('does not mutate external errors or retain their unwind path', () => {
+	const preserved = {};
+	const graph = create_test_graph(preserved);
+	discover(graph, preserved);
+	const mark = graph.nodes.length;
+	const external_value = {};
+	const external_root = {};
+	const external = new DevalueError('external failure', ['.external'], external_value, external_root);
+	Object.freeze(external);
+	const failed = {};
+	Object.defineProperty(failed, 'prop', { enumerable: true, get() { throw external; } });
+	let thrown;
+	try {
+		discover(graph, failed);
+	} catch (error) {
+		thrown = error;
+	}
+	roll_back(graph, mark, thrown);
+
+	assert.is(thrown, external);
+	assert.is(external.path, '.external');
+	assert.is(external.value, external_value);
+	assert.is(external.root, external_root);
+	assert.is(graph.unwind.length, 0);
+	assert.is(graph.nodes.length, mark);
+	assert.is(graph.identities.get(preserved), graph.nodes[0]);
+	assert.is(graph.identities.has(failed), false);
+
+	const invalid = { deep: { bad: () => {} } };
+	try {
+		discover(graph, invalid);
+	} catch (error) {
+		thrown = error;
+	}
+	roll_back(graph, mark, thrown);
+	assert.is(thrown.path, '.deep.bad');
+	assert.is(graph.unwind.length, 0);
+	assert.is(graph.nodes.length, mark);
+});
+
+test('clears unwind after a revoked value is thrown', () => {
+	const graph = create_test_graph(null);
+	const { proxy, revoke } = Proxy.revocable({}, {});
+	revoke();
+	const failed = {};
+	Object.defineProperty(failed, 'prop', { enumerable: true, get() { throw proxy; } });
+	let thrown;
+	try {
+		discover(graph, failed);
+	} catch (error) {
+		thrown = error;
+	}
+	roll_back(graph, 0, thrown);
+	assert.is(thrown, proxy);
+	assert.is(graph.unwind.length, 0);
+	assert.is(graph.nodes.length, 0);
+});
+
+test('does not claim an error owned by a different graph', () => {
+	const first = create_test_graph(null);
+	let foreign;
+	try {
+		discover(first, { original: () => {} });
+	} catch (error) {
+		foreign = error;
+	}
+	roll_back(first, 0, foreign);
+	assert.is(foreign.path, '.original');
+
+	const second = create_test_graph(null);
+	const failed = {};
+	Object.defineProperty(failed, 'foreign', { enumerable: true, get() { throw foreign; } });
+	let thrown;
+	try {
+		discover(second, failed);
+	} catch (error) {
+		thrown = error;
+	}
+	roll_back(second, 0, thrown);
+	assert.is(thrown, foreign);
+	assert.is(foreign.path, '.original');
+	assert.is(second.unwind.length, 0);
 });
 
 test.run();

@@ -416,6 +416,138 @@ for (const reason of [null, undefined]) {
 	});
 }
 
+test('preserves hostile thrown values without inspecting them', async () => {
+	const throwing_message = new Error('hidden');
+	Object.defineProperty(throwing_message, 'message', { get() { throw new Error('message inspected'); } });
+	const hostile_conversion = new Error('hidden');
+	Object.defineProperty(hostile_conversion, 'message', {
+		value: { [Symbol.toPrimitive]() { throw new Error('message converted'); } }
+	});
+	const revoked = Proxy.revocable({}, {});
+	revoked.revoke();
+	const hostile_cause = {};
+	Object.defineProperty(hostile_cause, 'cause', { get() { throw new Error('cause inspected'); } });
+	const cyclic_cause = {};
+	cyclic_cause.cause = cyclic_cause;
+	const reasons = [throwing_message, hostile_conversion, revoked.proxy, hostile_cause, cyclic_cause];
+
+	for (let i = 0; i < reasons.length; i++) {
+		const reason = reasons[i];
+		const throwing = {};
+		Object.defineProperty(throwing, 'value', { enumerable: true, get() { throw reason; } });
+		const ready = deferred();
+		const reports = [];
+		const job = {};
+		const result = await unevalStream(job, (value, js) => value === job && ({
+			type: 'async-value', source: ready.promise,
+			construct: () => js`({})`,
+			resolve: () => js`${throwing}`,
+			reject: () => js``
+		}), { id: `hostile-descriptor-cause-${i}`, onerror: (error) => reports.push(error) });
+		ready.resolve(1);
+		await result.tail.next();
+		assert.is(reports.length, 1);
+		assert.match(reports[0].message, /async descriptor resolve\(\), template hole 1: received an object/);
+		assert.ok(Object.hasOwn(reports[0], 'cause'));
+		assert.is(reports[0].cause, reason);
+	}
+});
+
+for (const frozen of [false, true]) {
+	test(`does not mutate a ${frozen ? 'frozen' : 'writable'} external DevalueError`, async () => {
+		const external_value = {};
+		const external_root = {};
+		const external = new DevalueError('external failure', ['.external'], external_value, external_root);
+		if (frozen) Object.freeze(external);
+		const throwing = {};
+		Object.defineProperty(throwing, 'prop', { enumerable: true, get() { throw external; } });
+		const ready = deferred();
+		const reports = [];
+		const job = {};
+		const result = await unevalStream(job, (value, js) => value === job && ({
+			type: 'async-value', source: ready.promise,
+			construct: () => js`({})`, resolve: () => js`${throwing}`, reject: () => js``
+		}), { id: `external-devalue-error-${frozen}`, onerror: (error) => reports.push(error) });
+		ready.resolve(1);
+		await result.tail.next();
+		assert.is(reports.length, 1);
+		assert.is(reports[0].cause, external);
+		assert.is(external.path, '.external');
+		assert.is(external.value, external_value);
+		assert.is(external.root, external_root);
+	});
+}
+
+for (const mode of ['construct', 'capture']) {
+	test(`preserves an external cause during initial descriptor ${mode}`, async () => {
+		const reason = new Error(`external ${mode} failure`);
+		Object.defineProperty(reason, 'message', { get() { throw new Error('message inspected'); } });
+		const throwing = {};
+		Object.defineProperty(throwing, 'prop', { enumerable: true, get() { throw reason; } });
+		const job = {};
+		const error = await rejected(unevalStream(job, (value, js) => value === job && ({
+			type: 'async-value', source: new Promise(() => {}),
+			construct: (capture) => mode === 'construct'
+				? js`({value:${throwing}})`
+				: js`({control:${capture(js`[${throwing}]`)}})`,
+			resolve: () => js``, reject: () => js``
+		})));
+		assert.match(error.message, new RegExp(`async descriptor ${mode}\\(\\), template hole 1: received an object`));
+		assert.is(error.cause, reason);
+	});
+}
+
+test('preserves immediate causes through nested descriptor wrappers', async () => {
+	class Job { constructor(name) { this.name = name; } }
+	const outer = new Job('outer');
+	const inner = new Job('inner');
+	const reason = {};
+	Object.defineProperty(reason, 'cause', { get() { throw new Error('cause inspected'); } });
+	const throwing = {};
+	Object.defineProperty(throwing, 'prop', { enumerable: true, get() { throw reason; } });
+	const error = await rejected(unevalStream(outer, (value, js) => value instanceof Job && ({
+		type: 'async-value', source: new Promise(() => {}),
+		construct: () => value === outer ? js`({inner:${inner}})` : js`({value:${throwing}})`,
+		resolve: () => js``, reject: () => js``
+	})));
+	assert.match(error.message, /async descriptor construct\(\), template hole 1/);
+	assert.instance(error.cause, TypeError);
+	assert.match(error.cause.message, /async descriptor construct\(\), template hole 1/);
+	assert.is(error.cause.cause, reason);
+});
+
+for (const phase of ['reject', 'error', 'fallback reject', 'fallback error']) {
+	test(`preserves an external cause in fatal ${phase} interpolation`, async () => {
+		const reason = new Error('private terminal failure');
+		Object.defineProperty(reason, 'message', { get() { throw new Error('message inspected'); } });
+		const throwing = {};
+		Object.defineProperty(throwing, 'prop', { enumerable: true, get() { throw reason; } });
+		const ready = deferred();
+		const job = {};
+		const fallback = phase.startsWith('fallback');
+		const sequence = phase.endsWith('error');
+		const source = sequence ? {
+			[Symbol.asyncIterator]() { return this; },
+			next() { return ready.promise; }
+		} : ready.promise;
+		const result = await unevalStream(job, (value, js) => value === job && ({
+			type: sequence ? 'async-sequence' : 'async-value', source,
+			construct: () => js`({})`,
+			resolve: () => fallback ? js`${() => {}}` : js``,
+			next: () => fallback ? js`${() => {}}` : js``,
+			complete: () => js``,
+			reject: () => js`${throwing}`,
+			error: () => js`${throwing}`
+		}));
+		const pending = result.tail.next();
+		if (fallback) ready.resolve(sequence ? { done: false, value: 1 } : 1);
+		else ready.reject('terminal reason');
+		const error = await rejected(pending);
+		assert.match(error.message, new RegExp(`async descriptor ${phase}\\(\\), template hole 1`));
+		assert.is(error.cause, reason);
+	});
+}
+
 test('keeps Symbol interpolation clear and does not inspect hostile description hooks', async () => {
 	const gates = [deferred(), deferred()];
 	const reports = [];

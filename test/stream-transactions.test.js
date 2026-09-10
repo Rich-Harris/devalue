@@ -1,7 +1,7 @@
 import vm from 'node:vm';
 import { suite } from 'uvu';
 import * as assert from 'uvu/assert';
-import { unevalStream } from '../index.js';
+import { DevalueError, unevalStream } from '../index.js';
 
 const test = suite('unevalStream transactions');
 
@@ -142,6 +142,86 @@ test('keeps nested commits provisional when a later terminal callback aborts the
 	assert.is(target.context.__d['transaction-outer-rollback'].p.length, 0);
 	assert.ok(!starts.includes('nested'));
 	assert.not.ok(cancels.includes('nested'));
+});
+
+test('continues cleanly after external and owned graph failures', async () => {
+	class Job {
+		constructor(name, ready) {
+			this.name = name;
+			this.ready = ready;
+		}
+	}
+	const gates = [deferred(), deferred(), deferred(), deferred(), deferred()];
+	const external_job = new Job('external', gates[0]);
+	const graph_job = new Job('graph', gates[1]);
+	const healthy_job = new Job('healthy', gates[2]);
+	const provisional = new Job('provisional', gates[3]);
+	const nested = new Job('nested', gates[4]);
+	const shared = { value: 42 };
+	const external_value = {};
+	const external_root = {};
+	const external = new DevalueError('external failure', ['.external'], external_value, external_root);
+	Object.freeze(external);
+	const external_hole = { provisional };
+	Object.defineProperty(external_hole, 'prop', { enumerable: true, get() { throw external; } });
+	const bad = () => {};
+	const graph_hole = { deep: { bad } };
+	const starts = [];
+	const cancels = [];
+	const reports = [];
+	const result = await unevalStream({ shared, jobs: [external_job, graph_job, healthy_job] }, (value, js) => value instanceof Job && ({
+		type: 'async-value',
+		source: {
+			get then() {
+				starts.push(value.name);
+				return value.ready.promise.then.bind(value.ready.promise);
+			}
+		},
+		construct: () => js`({name:${value.name},value:null})`,
+		resolve: ({ target }) => {
+			if (value === external_job) return js`${external_hole}`;
+			if (value === graph_job) return js`${graph_hole}`;
+			if (value === healthy_job) return js`${target}.value={shared:${shared},again:${shared},nested:${nested}}`;
+			return js`${target}.value="done"`;
+		},
+		reject: ({ target }, error) => js`${target}.value=${error}`,
+		cancel() { cancels.push(value.name); }
+	}), { id: 'owned-error-rollback', onerror: (error) => reports.push(error) });
+	const target = client();
+	const root = target.head(result.head);
+	assert.equal(starts, ['external', 'graph', 'healthy']);
+
+	gates[0].resolve(1);
+	target.block((await result.tail.next()).value);
+	assert.is(reports[0].cause, external);
+	assert.is(external.path, '.external');
+	assert.is(external.value, external_value);
+	assert.is(external.root, external_root);
+	assert.ok(!starts.includes('provisional'));
+	assert.ok(!cancels.includes('provisional'));
+
+	gates[1].resolve(2);
+	target.block((await result.tail.next()).value);
+	assert.is(reports[1].cause.value, bad);
+	assert.is(reports[1].cause.path, '.deep.bad');
+
+	gates[2].resolve(3);
+	const healthy_block = (await result.tail.next()).value;
+	target.block(healthy_block);
+	assert.equal(starts, ['external', 'graph', 'healthy', 'nested']);
+	assert.is(root.jobs[2].value.shared, root.shared);
+	assert.is(root.jobs[2].value.again, root.shared);
+	assert.is(root.jobs[2].value.nested.name, 'nested');
+	assert.match(healthy_block, /\.a\[1\]/);
+	assert.not.match(healthy_block, /\.a\[2\]/);
+	assert.is(target.context.__d['owned-error-rollback'].a.length, 2);
+
+	gates[4].resolve(4);
+	target.block((await result.tail.next()).value);
+	assert.is(root.jobs[2].value.nested.value, 'done');
+	assert.is(reports.length, 2);
+	await result.tail.return();
+	assert.equal(cancels, []);
 });
 
 test.run();

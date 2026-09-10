@@ -100,6 +100,7 @@ import {
  * @property {Map<object, CapturedNode>} identities Maps each original non-primitive identity to its canonical node, preserving sharing and cycles.
  * @property {(value: unknown, node: CapturedNode) => void} classify Fills in a reserved node's `kind`, `keys`, `children`, and `data`.
  * @property {string[]} unwind Formatted path segments collected innermost-first while a discovery error propagates.
+ * @property {{ error: DevalueError } | undefined} failure Error created by the active discovery walk, retired when rollback finalizes it.
  */
 
 /** Shared by every node without keys or children; never mutated. @type {never[]} */
@@ -146,7 +147,8 @@ export function create_captured_graph(root, custom_classify) {
 		nodes: [],
 		identities: new Map(),
 		classify: (value, node) => custom_classify(graph, node, value) || builtin_classify(graph, node, value),
-		unwind: []
+		unwind: [],
+		failure: undefined
 	};
 	return graph;
 }
@@ -169,10 +171,23 @@ export function roll_back(graph, mark, error) {
 	for (let i = nodes.length - 1; i >= mark; i--) identities.delete(nodes[i].value);
 	nodes.length = mark;
 	const unwind = graph.unwind;
-	if (unwind.length) {
-		if (error instanceof DevalueError) error.path = unwind.reverse().join('');
-		unwind.length = 0;
-	}
+	const path = unwind.length ? unwind.reverse().join('') : '';
+	// Identity, rather than class membership or user-readable fields, proves that this
+	// error belongs to the active walk. Retire ownership and clear unwind before enrichment.
+	const failure = graph.failure;
+	graph.failure = undefined;
+	unwind.length = 0;
+	if (path && failure && error === failure.error) failure.error.path = path;
+}
+
+/**
+ * Returns message detail only for the error created by this graph's active discovery walk.
+ * @param {CapturedGraph} graph
+ * @param {unknown} error
+ */
+export function graph_error_message(graph, error) {
+	const failure = graph.failure;
+	return failure && error === failure.error ? failure.error.message : undefined;
 }
 
 /**
@@ -361,5 +376,7 @@ function builtin_classify(graph, node, value) {
 function error(graph, message, value) {
 	// The path is unknown here; enclosing containers append their segments as the error
 	// unwinds and `roll_back` assembles them.
-	return new DevalueError(message, [], value, graph.root_value);
+	const failure = new DevalueError(message, [], value, graph.root_value);
+	graph.failure = { error: failure };
+	return failure;
 }

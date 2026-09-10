@@ -14,7 +14,7 @@
  */
 
 import { DevalueError, get_name, is_primitive, stringify_primitive, stringify_string } from './utils.js';
-import { child, create_captured_graph, discover, is_node, roll_back } from './graph.js';
+import { child, create_captured_graph, discover, graph_error_message, is_node, roll_back } from './graph.js';
 import { is_source, js, raw_source } from './javascript-source.js';
 import {
 	RUNTIMES,
@@ -337,8 +337,12 @@ class Session {
 		this.#slot = checkpoint.slot;
 		this.#collection = checkpoint.collection;
 		this.#name = checkpoint.name;
-		roll_back(this.#graph, checkpoint.nodes, descriptor_graph_error(error));
-		this.#transaction_depth--;
+		try {
+			roll_back(this.#graph, checkpoint.nodes, descriptor_graph_error(error));
+		} finally {
+			// Diagnostic finalization must not strand nested transaction bookkeeping.
+			this.#transaction_depth--;
+		}
 	}
 
 	/** Records an opaque constructor dependency with rollback support. @param {CapturedNode} node */
@@ -517,7 +521,7 @@ class Session {
 			try {
 				captured = child(this.#graph, entry.value);
 			} catch (error) {
-				throw descriptor_interpolation_error(error, entry.value, entry.capture ? 'async descriptor capture()' : 'async descriptor construct()', entry.index, true);
+				throw descriptor_interpolation_error(error, entry.value, entry.capture ? 'async descriptor capture()' : 'async descriptor construct()', entry.index, true, descriptor_error_detail(this.#graph, error));
 			}
 			children[i] = captured;
 			if (is_node(captured)) this.#make_opaque(captured);
@@ -562,7 +566,7 @@ class Session {
 					const node = discover(this.#graph, entry.value);
 					if (node) nodes.set(/** @type {object} */ (entry.value), node);
 				} catch (error) {
-					throw descriptor_interpolation_error(error, entry.value, context, entry.index, true);
+					throw descriptor_interpolation_error(error, entry.value, context, entry.index, true, descriptor_error_detail(this.#graph, error));
 				}
 			}
 			this.#validate_new_custom(checkpoint.new_custom);
@@ -2177,14 +2181,25 @@ function is_atomic(node) {
  * @param {string} context
  * @param {number} index
  * @param {boolean} [has_cause]
+ * @param {string} [detail]
  */
-function descriptor_interpolation_error(error, value, context, index, has_cause = false) {
-	const detail = typeof value === 'symbol' ? ' Symbol values cannot be serialized as data.'
-		: error instanceof Error ? ` ${error.message}` : '';
-	const message = `Invalid JavaScript source interpolation in ${context}, template hole ${index + 1}: received ${describe_received(value)}.${detail}`;
+function descriptor_interpolation_error(error, value, context, index, has_cause = false, detail) {
+	const suffix = typeof value === 'symbol' ? ' Symbol values cannot be serialized as data.'
+		: detail === undefined ? '' : ` ${detail}`;
+	const message = `Invalid JavaScript source interpolation in ${context}, template hole ${index + 1}: received ${describe_received(value)}.${suffix}`;
 	const wrapped = has_cause ? new TypeError(message, { cause: error }) : new TypeError(message);
 	if (has_cause) descriptor_error_causes.set(wrapped, error);
 	return wrapped;
+}
+
+/**
+ * Preserves detailed messages only for the deepest error owned by this active graph walk.
+ * Private descriptor provenance can reveal that error without traversing public causes.
+ * @param {CapturedGraph} graph
+ * @param {unknown} error
+ */
+function descriptor_error_detail(graph, error) {
+	return graph_error_message(graph, descriptor_graph_error(error));
 }
 
 /**
