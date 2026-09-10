@@ -70,6 +70,87 @@ test('serializes graph values in construct and reachable capture expressions', a
 	for await (const block of result.tail) target.block(block);
 });
 
+test('populates sparse and null-object holes before repeated descriptor construction in every value region', async () => {
+	class Job {
+		constructor(value) {
+			this.value = value;
+			this.ready = new Promise(() => {});
+		}
+	}
+	for (const mode of ['head', 'folded', 'outcome']) {
+		const null_child = Object.assign(Object.create(null), { x: 42 });
+		const sparse_child = Array(3);
+		sparse_child[1] = null_child;
+		const job = new Job({ items: sparse_child });
+		const graph = { null_child, sparse_child, jobs: [job, job] };
+		const gate = deferred();
+		const value = mode === 'head' ? graph : mode === 'folded' ? Promise.resolve(graph) : gate.promise;
+		let constructions = 0;
+		const context = client();
+		context.context.construct = (value) => {
+			constructions++;
+			return { value, observed: value.items[1].x };
+		};
+		const result = await unevalStream(value, (value, js) => value instanceof Job && ({
+			type: 'async-value',
+			source: value.ready,
+			construct: () => js`construct(${value.value})`,
+			resolve: () => js``,
+			reject: () => js``
+		}), { id: `descriptor-construction-readiness-${mode}` });
+		let root = context.head(result.head);
+		if (mode === 'outcome') {
+			gate.resolve(graph);
+			context.block((await result.tail.next()).value);
+		}
+		if (mode !== 'head') root = await root;
+		assert.is(root.jobs[0], root.jobs[1]);
+		assert.is(root.jobs[0].value.items, root.sparse_child);
+		assert.is(root.sparse_child[1], root.null_child);
+		assert.is(root.jobs[0].observed, 42);
+		assert.is(constructions, 1);
+		await result.tail.return();
+	}
+});
+
+test('populates operation-hole children before nested descriptor construction', async () => {
+	class Job {
+		constructor(source, value) {
+			this.source = source;
+			this.value = value;
+		}
+	}
+	const outer_ready = deferred();
+	const child_ready = new Promise(() => {});
+	const null_child = Object.assign(Object.create(null), { x: 42 });
+	const sparse_child = Array(3);
+	sparse_child[1] = null_child;
+	const nested = new Job(child_ready, { items: sparse_child });
+	const outer = new Job(outer_ready.promise, null);
+	let constructions = 0;
+	const context = client();
+	context.context.construct = (value) => {
+		constructions++;
+		return { value, observed: value.items[1].x };
+	};
+	const result = await unevalStream(outer, (value, js) => value instanceof Job && ({
+		type: 'async-value',
+		source: value.source,
+		construct: () => value === outer ? js`({values:null})` : js`construct(${value.value})`,
+		resolve: ({ target }) => value === outer ? js`${target}.values=[${sparse_child},${null_child},${nested},${nested}]` : js``,
+		reject: () => js``
+	}), { id: 'descriptor-operation-construction-readiness' });
+	const root = context.head(result.head);
+	outer_ready.resolve();
+	context.block((await result.tail.next()).value);
+	assert.is(root.values[2], root.values[3]);
+	assert.is(root.values[2].value.items, root.values[0]);
+	assert.is(root.values[0][1], root.values[1]);
+	assert.is(root.values[2].observed, 42);
+	assert.is(constructions, 1);
+	await result.tail.return();
+});
+
 test('groups the complete descriptor construction expression after lowering holes', async () => {
 	const ready = deferred();
 	const job = {};

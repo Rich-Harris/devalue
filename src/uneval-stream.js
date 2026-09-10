@@ -1010,8 +1010,8 @@ class Session {
 		let name_count = 0;
 		for (const node of order) if (node.hoisted) node.name = `v${name_count++}`;
 
-		/** @type {Emission[]} */
-		const fill = [];
+		/** Population that must wait for a later declaration (a genuine back-edge). @type {Emission[]} */
+		const deferred_fill = [];
 		/** @type {Emission[]} */
 		const sidecars = [];
 		/** Best paths visited while retaining stable descendants from this region's sidecars. @type {Map<CapturedNode, number>} */
@@ -1108,48 +1108,89 @@ class Session {
 			}
 		};
 
-		/** @type {Emission[]} */
-		const early_declarations = [];
-		/** @type {Emission[]} */
-		const declarations = [];
+		/** Statements in construction order, before sidecars and persistent slots. @type {Emission[]} */
+		const construction = [];
+		/** Adjacent declarations waiting to be emitted as one compact `let`. @type {Emission[]} */
+		let declarations = [];
+		const flush_declarations = () => {
+			if (declarations.length === 0) return;
+			construction.push(join_sources(['let ', join_sources(declarations, ',')]));
+			declarations = [];
+		};
+		/** Emits the ready ordered prefix now and keeps the suffix for back-edge patching. @param {{ source: Emission, ready: boolean }[]} entries */
+		const populate = (entries) => {
+			let deferred = false;
+			for (const entry of entries) {
+				if (!entry.ready) deferred = true;
+				if (deferred) deferred_fill.push(entry.source);
+				else {
+					flush_declarations();
+					construction.push(entry.source);
+				}
+			}
+		};
+		// Shells needed across back-edges exist before any atomic initializer. Their
+		// population still occurs at the shell's post-order position below.
+		for (const node of order) {
+			if (!node.name || !node.early) continue;
+			switch (node.kind) {
+				case 'Array':
+					declarations.push(`${node.name}=Array(${node.data})`);
+					break;
+				case 'Object':
+				case 'NullObject':
+					declarations.push(`${node.name}=${node.kind === 'NullObject' ? 'Object.create(null)' : '{}'}`);
+					break;
+				case 'Set':
+					declarations.push(`${node.name}=new Set`);
+					break;
+				case 'Map':
+					declarations.push(`${node.name}=new Map`);
+					break;
+				default:
+					throw this.#error(`Cannot stringify value: a ${node.kind} node was scheduled for empty construction, but only mutable containers support it (internal emitter error)`, node.value);
+			}
+		}
 		for (const node of order) {
 			const name = node.name;
 			const children = node.children;
 			const keys = node.keys;
+			const limit = node.position;
+			/** @param {Child} child */
+			const available = (child) => latest_of(child) < limit;
 			if (name && node.early) {
-				// Declared empty ahead of every literal so atomic constructors can reference it.
+				/** @type {{ source: Emission, ready: boolean }[]} */
+				const entries = [];
 				switch (node.kind) {
 					case 'Array':
-						early_declarations.push(`${name}=Array(${node.data})`);
-						for (let i = 0; i < keys.length; i++) fill.push(join_sources([`${name}[${keys[i]}]=`, expression_child(children[i])]));
+						for (let i = 0; i < keys.length; i++) entries.push({ source: join_sources([`${name}[${keys[i]}]=`, expression_child(children[i])]), ready: available(children[i]) });
 						break;
 					case 'Object':
 					case 'NullObject':
-						early_declarations.push(`${name}=${node.kind === 'NullObject' ? 'Object.create(null)' : '{}'}`);
-						for (let i = 0; i < keys.length; i++) fill.push(join_sources([`${name}${prop(keys[i])}=`, expression_child(children[i])]));
+						for (let i = 0; i < keys.length; i++) entries.push({ source: join_sources([`${name}${prop(keys[i])}=`, expression_child(children[i])]), ready: available(children[i]) });
 						break;
 					case 'Set':
-						early_declarations.push(`${name}=new Set`);
-						for (let i = 0; i < children.length; i++) fill.push(join_sources([`${name}.add(`, expression_child(children[i]), ')']));
+						for (let i = 0; i < children.length; i++) entries.push({ source: join_sources([`${name}.add(`, expression_child(children[i]), ')']), ready: available(children[i]) });
 						break;
 					case 'Map':
-						early_declarations.push(`${name}=new Map`);
-						for (let i = 0; i < children.length; i += 2) fill.push(join_sources([`${name}.set(`, expression_child(children[i]), ',', expression_child(children[i + 1]), ')']));
+						for (let i = 0; i < children.length; i += 2) entries.push({
+							source: join_sources([`${name}.set(`, expression_child(children[i]), ',', expression_child(children[i + 1]), ')']),
+							ready: available(children[i]) && available(children[i + 1])
+						});
 						break;
-					default:
-						throw this.#error(`Cannot stringify value: a ${node.kind} node was scheduled for empty construction, but only mutable containers support it (internal emitter error)`, node.value);
 				}
+				populate(entries);
 			} else if (name) {
 				// A child can be embedded in this declaration if its expansion never reaches
 				// a name declared at or after this node; back-edges become fills instead.
-				const limit = node.position;
-				/** @param {Child} child */
-				const available = (child) => latest_of(child) < limit;
 				switch (node.kind) {
 					case 'Array': {
 						if (is_sparse(node)) {
 							declarations.push(`${name}=Array(${node.data})`);
-							for (let i = 0; i < keys.length; i++) fill.push(join_sources([`${name}[${keys[i]}]=`, expression_child(children[i])]));
+							populate(children.map((child, i) => ({
+								source: join_sources([`${name}[${keys[i]}]=`, expression_child(child)]),
+								ready: available(child)
+							})));
 							break;
 						}
 						/** @type {Emission[]} */
@@ -1159,7 +1200,7 @@ class Session {
 							if (available(child)) parts.push(expression_child(child));
 							else {
 								parts.push('');
-								fill.push(join_sources([`${name}[${keys[i]}]=`, expression_child(child)]));
+								deferred_fill.push(join_sources([`${name}[${keys[i]}]=`, expression_child(child)]));
 							}
 						}
 						// A trailing elision needs one extra comma to preserve length.
@@ -1179,7 +1220,7 @@ class Session {
 								// Once one key must wait for a later declaration, every following key is
 								// populated through ordered fills so no available value leapfrogs it.
 								filling = true;
-								fill.push(join_sources([`${name}${prop(keys[i])}=`, expression_child(child)]));
+								deferred_fill.push(join_sources([`${name}${prop(keys[i])}=`, expression_child(child)]));
 							}
 						}
 						declarations.push(join_sources([`${name}={`, join_sources(embedded, ','), '}']));
@@ -1187,7 +1228,10 @@ class Session {
 					}
 					case 'NullObject': {
 						declarations.push(`${name}=Object.create(null)`);
-						for (let i = 0; i < keys.length; i++) fill.push(join_sources([`${name}${prop(keys[i])}=`, expression_child(children[i])]));
+						populate(children.map((child, i) => ({
+							source: join_sources([`${name}${prop(keys[i])}=`, expression_child(child)]),
+							ready: available(child)
+						})));
 						break;
 					}
 					case 'Set': {
@@ -1196,7 +1240,10 @@ class Session {
 							declarations.push(join_sources([`${name}=`, set_literal(children)]));
 						} else {
 							declarations.push(`${name}=new Set`);
-							for (let i = 0; i < children.length; i++) fill.push(join_sources([`${name}.add(`, expression_child(children[i]), ')']));
+							populate(children.map((child) => ({
+								source: join_sources([`${name}.add(`, expression_child(child), ')']),
+								ready: available(child)
+							})));
 						}
 						break;
 					}
@@ -1205,7 +1252,13 @@ class Session {
 							declarations.push(join_sources([`${name}=`, map_literal(children)]));
 						} else {
 							declarations.push(`${name}=new Map`);
-							for (let i = 0; i < children.length; i += 2) fill.push(join_sources([`${name}.set(`, expression_child(children[i]), ',', expression_child(children[i + 1]), ')']));
+							/** @type {{ source: Emission, ready: boolean }[]} */
+							const entries = [];
+							for (let i = 0; i < children.length; i += 2) entries.push({
+								source: join_sources([`${name}.set(`, expression_child(children[i]), ',', expression_child(children[i + 1]), ')']),
+								ready: available(children[i]) && available(children[i + 1])
+							});
+							populate(entries);
 						}
 						break;
 					}
@@ -1231,6 +1284,7 @@ class Session {
 				}
 			}
 		}
+		flush_declarations();
 
 		const root = expression(value);
 		if (persistent) {
@@ -1244,10 +1298,9 @@ class Session {
 				this.#assign_references(node.value, reference, new Map(), retained_at);
 			}
 		}
-		const all_declarations = early_declarations.concat(declarations);
 		const statements = [
-			...(all_declarations.length ? [join_sources(['let ', join_sources(all_declarations, ',')])] : []),
-			...fill,
+			...construction,
+			...deferred_fill,
 			...sidecars,
 			...slots
 		];

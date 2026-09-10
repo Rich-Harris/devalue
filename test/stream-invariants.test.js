@@ -289,7 +289,17 @@ class ConstructionWrapper {
 
 function build_construction_graph() {
 	const child = { label: 'ready' };
+	const null_child = Object.assign(Object.create(null), { x: 42 });
+	const sparse_child = Array(3);
+	sparse_child[1] = 42;
+	const nested_null = Object.assign(Object.create(null), { x: 42 });
+	const nested_sparse = Array(3);
+	nested_sparse[1] = nested_null;
 	const repeated = new ConstructionWrapper('read', child);
+	const null_read = new ConstructionWrapper('null', null_child);
+	const sparse_read = new ConstructionWrapper('sparse', sparse_child);
+	const nested_read = new ConstructionWrapper('nested-containers', { items: nested_sparse });
+	const single_null = new ConstructionWrapper('null-single', Object.assign(Object.create(null), { x: 42 }));
 	const inner = new ConstructionWrapper('inner', { label: 'inner-ready' });
 	const nested = new ConstructionWrapper('nested', inner);
 	const hidden = new ConstructionWrapper('hidden', { label: 'hidden-ready' });
@@ -302,8 +312,27 @@ function build_construction_graph() {
 	const cycle = new ConstructionWrapper('cycle', holder);
 	holder.custom = cycle;
 	return {
-		root: { child, repeated: [repeated, repeated], inner, nested, inline, multiple, buffer, view, typed, holder, cycle },
-		wrappers: [repeated, inner, nested, hidden, inline, multiple, typed, cycle]
+		root: {
+			child,
+			null_child,
+			sparse_child,
+			nested_sparse,
+			repeated: [repeated, repeated],
+			null_read: [null_read, null_read],
+			sparse_read: [sparse_read, sparse_read],
+			nested_read: [nested_read, nested_read],
+			single_null,
+			inner,
+			nested,
+			inline,
+			multiple,
+			buffer,
+			view,
+			typed,
+			holder,
+			cycle
+		},
+		wrappers: [repeated, null_read, sparse_read, nested_read, single_null, inner, nested, hidden, inline, multiple, typed, cycle]
 	};
 }
 
@@ -328,6 +357,9 @@ function construction_client() {
 			if (kind === 'inline') this.observed = value.hidden.kind;
 			if (kind === 'multiple') this.observed = value === again;
 			if (kind === 'view') this.observed = value.view.buffer === value.buffer;
+			if (kind === 'null' || kind === 'null-single') this.observed = value.x;
+			if (kind === 'sparse') this.observed = value[1];
+			if (kind === 'nested-containers') this.observed = value.items[1].x;
 		}
 	}
 	return { target: client({ Constructed }), calls };
@@ -337,6 +369,16 @@ function verify_construction_graph(root, calls, label) {
 	assert.is(root.repeated[0], root.repeated[1], `${label}: repeated custom identity`);
 	assert.is(root.repeated[0].value, root.child, `${label}: acyclic child identity`);
 	assert.is(root.repeated[0].observed, 'ready', `${label}: ordinary child unavailable during construction`);
+	assert.is(root.null_read[0], root.null_read[1], `${label}: repeated null reader identity`);
+	assert.is(root.null_read[0].value, root.null_child, `${label}: null child identity`);
+	assert.is(root.null_read[0].observed, 42, `${label}: null child unavailable during construction`);
+	assert.is(root.sparse_read[0], root.sparse_read[1], `${label}: repeated sparse reader identity`);
+	assert.is(root.sparse_read[0].value, root.sparse_child, `${label}: sparse child identity`);
+	assert.is(root.sparse_read[0].observed, 42, `${label}: sparse child unavailable during construction`);
+	assert.is(root.nested_read[0], root.nested_read[1], `${label}: repeated nested reader identity`);
+	assert.is(root.nested_read[0].value.items, root.nested_sparse, `${label}: nested sparse child identity`);
+	assert.is(root.nested_read[0].observed, 42, `${label}: nested container child unavailable during construction`);
+	assert.is(root.single_null.observed, 42, `${label}: single-use null child unavailable during construction`);
 	assert.is(root.nested.value, root.inner, `${label}: nested custom identity`);
 	assert.is(root.nested.observed, 'inner', `${label}: nested constructor order`);
 	assert.is(root.inline.observed, 'hidden', `${label}: inline-container dependency order`);
@@ -348,24 +390,24 @@ function verify_construction_graph(root, calls, label) {
 	assert.is(root.typed.observed, true, `${label}: view buffer unavailable during construction`);
 	assert.is(root.cycle, root.holder.custom, `${label}: mutable-container back-edge`);
 	assert.is(root.cycle.value, root.holder, `${label}: mutable-container child`);
-	for (const kind of ['read', 'inner', 'nested', 'hidden', 'inline', 'multiple', 'view', 'cycle']) {
+	for (const kind of ['read', 'null', 'sparse', 'nested-containers', 'null-single', 'inner', 'nested', 'hidden', 'inline', 'multiple', 'view', 'cycle']) {
 		assert.is(calls.get(kind), 1, `${label}: ${kind} client constructor call count`);
 	}
 }
 
-test('retains synchronous custom construction parity in head and outcome regions', async () => {
-	for (const region of ['head', 'outcome']) {
+test('retains synchronous custom construction parity in head, folded, and outcome regions', async () => {
+	for (const region of ['head', 'folded', 'outcome']) {
 		const graph = build_construction_graph();
 		const replacer_calls = new Map();
 		const gate = deferred();
-		const value = region === 'head' ? graph.root : gate.promise;
+		const value = region === 'head' ? graph.root : region === 'folded' ? Promise.resolve(graph.root) : gate.promise;
 		const result = await unevalStream(value, construction_replacer(replacer_calls), { id: `construction-${region}` });
 		const { target, calls } = construction_client();
 		let root = target.head(result.head);
 		try {
 			if (region === 'outcome') gate.resolve(graph.root);
 			for await (const block of result.tail) target.block(block);
-			if (region === 'outcome') root = await root;
+			if (region !== 'head') root = await root;
 			verify_construction_graph(root, calls, region);
 			for (const wrapper of graph.wrappers) {
 				assert.is(replacer_calls.get(wrapper), 1, `${region}: represented replacer call count`);
