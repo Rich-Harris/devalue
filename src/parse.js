@@ -138,12 +138,40 @@ export function unflatten(parsed, revivers, options) {
 					case 'Object': {
 						const wrapped_index = value[1];
 
-						if (
-							typeof values[wrapped_index] === 'object' &&
-							values[wrapped_index][0] !== 'BigInt'
-						) {
-							// avoid infinite recusion in case of malformed input
-							throw new Error('Invalid input');
+						// Only a primitive can be boxed. The negative sentinels below are the
+						// ones `stringify` emits for boxed numbers; every other sentinel
+						// (`UNDEFINED`, `HOLE`, `SPARSE`) would box `undefined` into a plain
+						// `{}`, which is not a value `stringify` can produce.
+						const is_boxable_sentinel =
+							wrapped_index === NAN ||
+							wrapped_index === POSITIVE_INFINITY ||
+							wrapped_index === NEGATIVE_INFINITY ||
+							wrapped_index === NEGATIVE_ZERO;
+
+						if (!is_boxable_sentinel) {
+							// The index must be checked before it is used to look up `values`,
+							// otherwise a non-index (or an out-of-bounds one) reaches the
+							// `[0]` access below as `undefined` and throws a raw TypeError
+							// instead of the intended `Invalid input`.
+							if (
+								typeof wrapped_index !== 'number' ||
+								!Number.isInteger(wrapped_index) ||
+								wrapped_index < 0 ||
+								wrapped_index >= values.length
+							) {
+								throw new Error('Invalid input');
+							}
+
+							const wrapped = values[wrapped_index];
+
+							// `typeof null === 'object'`, so `null` also has to be rejected here
+							// rather than being indexed into.
+							const is_bigint = Array.isArray(wrapped) && wrapped[0] === 'BigInt';
+
+							if ((wrapped === null || typeof wrapped === 'object') && !is_bigint) {
+								// avoid infinite recusion in case of malformed input
+								throw new Error('Invalid input');
+							}
 						}
 
 						hydrated[index] = ops.box(hydrate(wrapped_index));
@@ -179,14 +207,27 @@ export function unflatten(parsed, revivers, options) {
 					case 'BigInt64Array':
 					case 'BigUint64Array':
 					case 'DataView': {
-						if (values[value[1]][0] !== 'ArrayBuffer') {
+						const buffer_index = value[1];
+
+						// `buffer_index` is checked before it is used as a lookup, otherwise a
+						// non-index reads `undefined` out of `values` and the `[0]` access
+						// below throws a raw TypeError instead of the intended `Invalid data`.
+						const buffer_value =
+							typeof buffer_index === 'number' &&
+							Number.isInteger(buffer_index) &&
+							buffer_index >= 0 &&
+							buffer_index < values.length
+								? values[buffer_index]
+								: undefined;
+
+						if (!Array.isArray(buffer_value) || buffer_value[0] !== 'ArrayBuffer') {
 							// without this, if we receive malformed input we could
 							// end up trying to hydrate in a circle or allocate
 							// huge amounts of memory when we call `new TypedArrayConstructor(buffer)`
 							throw new Error('Invalid data');
 						}
 
-						const buffer = hydrate(value[1]);
+						const buffer = hydrate(buffer_index);
 
 						hydrated[index] = ops.fromViewInfo(type, buffer, value[2], value[3]);
 
