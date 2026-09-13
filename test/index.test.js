@@ -1113,6 +1113,51 @@ const invalid = [
 		message: 'Invalid data'
 	},
 	{
+		name: 'typed array with out-of-bounds buffer index',
+		json: '[["Uint8Array", 9, 0, 1]]',
+		message: 'Invalid data'
+	},
+	{
+		name: 'typed array with negative buffer index',
+		json: '[["Uint8Array", -1, 0, 1]]',
+		message: 'Invalid data'
+	},
+	{
+		name: 'typed array with null buffer',
+		json: '[["Uint8Array", 1, 0, 1], null]',
+		message: 'Invalid data'
+	},
+	{
+		name: 'typed array with non-numeric buffer index',
+		json: '[["Uint8Array", "1", 0, 1], ["ArrayBuffer", "AQID"]]',
+		message: 'Invalid data'
+	},
+	{
+		name: 'DataView with out-of-bounds buffer index',
+		json: '[["DataView", 4, 0, 1]]',
+		message: 'Invalid data'
+	},
+	{
+		name: 'boxed primitive wrapping null',
+		json: '[["Object", 1], null]',
+		message: 'Invalid input'
+	},
+	{
+		name: 'boxed primitive with out-of-bounds index',
+		json: '[["Object", 9]]',
+		message: 'Invalid input'
+	},
+	{
+		name: 'boxed primitive with unboxable sentinel',
+		json: `[["Object", ${consts.UNDEFINED}]]`,
+		message: 'Invalid input'
+	},
+	{
+		name: 'boxed primitive with non-numeric index',
+		json: '[["Object", "1"], 1]',
+		message: 'Invalid input'
+	},
+	{
 		name: 'ArrayBuffer with non-string value',
 		json: '[["ArrayBuffer", { "length": 100 }]]',
 		message: 'Invalid ArrayBuffer encoding'
