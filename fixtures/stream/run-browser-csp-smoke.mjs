@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,6 +18,12 @@ const test_readiness_timeout = Number(process.env.DEVALUE_BROWSER_TEST_READINESS
 if (test_readiness_file && (!Number.isFinite(test_readiness_timeout) || test_readiness_timeout < 100 || test_readiness_timeout > 10_000)) {
 	throw new Error('DEVALUE_BROWSER_TEST_READINESS_TIMEOUT_MS must be a finite duration from 100 to 10000');
 }
+const test_setup_file = process.env.DEVALUE_BROWSER_TEST_SETUP_FILE;
+const test_setup_timeout = Number(process.env.DEVALUE_BROWSER_TEST_SETUP_TIMEOUT_MS ?? 5_000);
+if (test_setup_file && (!Number.isFinite(test_setup_timeout) || test_setup_timeout < 100 || test_setup_timeout > 10_000)) {
+	throw new Error('DEVALUE_BROWSER_TEST_SETUP_TIMEOUT_MS must be a finite duration from 100 to 10000');
+}
+const test_process_file = process.env.DEVALUE_BROWSER_TEST_PROCESS_FILE;
 
 const fixture = process.env.DEVALUE_BROWSER_SERVER_PATH ?? fileURLToPath(new URL('./browser-csp-smoke.mjs', import.meta.url));
 const profile = await mkdtemp(join(tmpdir(), 'devalue-browser-'));
@@ -59,6 +65,17 @@ function exited(state) {
 	if (!result) return;
 	if (result.error) throw new Error(`${state.label} failed to start: ${result.error.message}`, { cause: result.error });
 	throw new Error(`${state.label} exited early (${result.signal ? `signal ${result.signal}` : `code ${result.code}`})`);
+}
+
+async function wait_for_pid_file(label, path, state, milliseconds) {
+	await wait_for(label, async () => {
+		const value = (await readFile(path, 'utf8')).trim();
+		if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) <= 0) {
+			throw new Error(`invalid ${label} PID`);
+		}
+		if (Number(value) !== state.child.pid) throw new Error(`${label} PID did not match child`);
+		return true;
+	}, [state], milliseconds);
 }
 
 async function wait_for(label, callback, states = [], milliseconds = harness_timeout) {
@@ -183,6 +200,7 @@ function assert(value, message) {
 }
 
 let cdp;
+let browser;
 let primary_error;
 try {
 	const server = observe(spawn(process.execPath, [fixture, '0'], {
@@ -192,20 +210,16 @@ try {
 		first_line(server),
 		server.completion.then(() => exited(server))
 	]));
-	const browser = observe(spawn(chrome, [
+	browser = observe(spawn(chrome, [
 		'--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
 		'--remote-debugging-port=0', `--user-data-dir=${profile}`,
 		`${origin}/stream`
 	], { stdio: 'ignore' }), 'Chrome');
+	if (test_setup_file) {
+		await wait_for_pid_file('Chrome test setup', test_setup_file, browser, test_setup_timeout);
+	}
 	if (test_readiness_file) {
-		await wait_for('Chrome test readiness', async () => {
-			const value = (await readFile(test_readiness_file, 'utf8')).trim();
-			if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) <= 0) {
-				throw new Error('invalid Chrome test readiness PID');
-			}
-			if (Number(value) !== browser.child.pid) throw new Error('Chrome test readiness PID did not match child');
-			return true;
-		}, [browser], test_readiness_timeout);
+		await wait_for_pid_file('Chrome test readiness', test_readiness_file, browser, test_readiness_timeout);
 	}
 	const endpoint = await wait_for('Chrome DevTools endpoint', async () => {
 		const [port, path] = (await readFile(join(profile, 'DevToolsActivePort'), 'utf8')).trim().split('\n');
@@ -280,7 +294,18 @@ try {
 	cdp?.close();
 	const cleanup = await Promise.allSettled([...children].reverse().map(terminate));
 	const profile_cleanup = await Promise.allSettled([rm(profile, { recursive: true, force: true })]);
-	const failures = [...cleanup, ...profile_cleanup].filter((result) => result.status === 'rejected');
+	const process_evidence = [];
+	if (test_process_file && browser) {
+		if (browser.result && !browser.result.error) {
+			process_evidence.push(await Promise.resolve(writeFile(test_process_file, JSON.stringify({
+				pid: browser.child.pid,
+				exit: { code: browser.result.code, signal: browser.result.signal }
+			}))).then(() => ({ status: 'fulfilled' }), (reason) => ({ status: 'rejected', reason })));
+		} else {
+			process_evidence.push({ status: 'rejected', reason: new Error('Chrome process exit was not observed') });
+		}
+	}
+	const failures = [...cleanup, ...profile_cleanup, ...process_evidence].filter((result) => result.status === 'rejected');
 	if (primary_error) {
 		for (const failure of failures) console.error(`browser smoke cleanup failed: ${failure.reason?.stack ?? failure.reason}`);
 	} else if (failures.length > 0) {

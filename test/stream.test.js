@@ -18,6 +18,10 @@ function deferred() {
 	return { promise, resolve, reject };
 }
 
+function null_prototype_callable(callback) {
+	return Object.setPrototypeOf(callback, null);
+}
+
 function client(extra = {}) {
 	const context = vm.createContext({ ...extra });
 	context.globalThis = context;
@@ -1371,6 +1375,34 @@ test('feeds async iterable yields and return value into the client target', asyn
 	const source = { async *[Symbol.asyncIterator]() { yield 1; yield 2; return 3; } };
 	const { root } = await drain(await unevalStream(source, sequence_replacer(source), { id: 'sequence' }));
 	assert.equal(JSON.parse(JSON.stringify(root.events)), [['next', 1], ['next', 2], ['complete', 3]]);
+});
+
+test('uses null-prototype next callables for initial and resumed sequence pulls', async () => {
+	for (const native of [false, true]) {
+		let pulls = 0;
+		const receivers = [];
+		const argument_counts = [];
+		const iterator = {};
+		iterator.next = null_prototype_callable(function () {
+			pulls++;
+			receivers.push(this);
+			argument_counts.push(arguments.length);
+			return pulls < 3 ? { done: false, value: pulls } : { done: true, value: 3 };
+		});
+		const source = { [Symbol.asyncIterator]() { return iterator; } };
+		const result = await unevalStream(source, native ? undefined : sequence_replacer(source), { id: `null-next-${native}` });
+		const { root } = await drain(result);
+		if (native) {
+			assert.equal({ ...await root.next() }, { done: false, value: 1 });
+			assert.equal({ ...await root.next() }, { done: false, value: 2 });
+			assert.equal({ ...await root.next() }, { done: true, value: 3 });
+		} else {
+			assert.equal(JSON.parse(JSON.stringify(root.events)), [['next', 1], ['next', 2], ['complete', 3]]);
+		}
+		assert.is(pulls, 3);
+		assert.equal(receivers, [iterator, iterator, iterator]);
+		assert.equal(argument_counts, [0, 0, 0]);
+	}
 });
 
 test('natively reconstructs async iterables as buffered iterators', async () => {

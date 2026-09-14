@@ -43,6 +43,10 @@ function listeners(signal) {
 	return getEventListeners(signal, 'abort').length;
 }
 
+function null_prototype_callable(callback) {
+	return Object.setPrototypeOf(callback, null);
+}
+
 function sequence_descriptor(value, js, cancel) {
 	return {
 		type: 'async-sequence',
@@ -602,6 +606,133 @@ test('preserves descriptor and startup receivers and source read stages', async 
 		assert.is(operation_receiver, descriptor);
 		assert.is(method_receiver, observed);
 	}
+});
+
+test('ignores next call properties and invokes the cached callable while active', async () => {
+	const controller = new AbortController();
+	let call_reads = 0;
+	let pulls = 0;
+	const receivers = [];
+	const argument_counts = [];
+	const iterator = {};
+	const next = null_prototype_callable(function () {
+		pulls++;
+		receivers.push(this);
+		argument_counts.push(arguments.length);
+		return pulls === 1 ? { done: false, value: 1 } : { done: true, value: 2 };
+	});
+	Object.defineProperty(next, 'call', {
+		get() {
+			call_reads++;
+			controller.abort(0);
+			return () => assert.unreachable('next.call delegate must not run');
+		}
+	});
+	iterator.next = next;
+	const source = { [Symbol.asyncIterator]() { return iterator; } };
+	const result = await unevalStream(source, undefined, { signal: controller.signal });
+	for await (const _block of result.tail) {}
+	assert.is(controller.signal.aborted, false);
+	assert.is(call_reads, 0);
+	assert.is(pulls, 2);
+	assert.equal(receivers, [iterator, iterator]);
+	assert.equal(argument_counts, [0, 0]);
+});
+
+test('invokes null-prototype return and cancel callables without waiting for a pull', async () => {
+	const pending = deferred();
+	const calls = [];
+	let return_call_reads = 0;
+	let cancel_call_reads = 0;
+	const iterator = {};
+	iterator.next = () => pending.promise;
+	const return_method = null_prototype_callable(function () {
+		calls.push(['return', this, arguments.length]);
+		return { done: true };
+	});
+	Object.defineProperty(return_method, 'call', {
+		get() {
+			return_call_reads++;
+			throw new Error('return.call must not be read');
+		}
+	});
+	iterator.return = return_method;
+	const source = { [Symbol.asyncIterator]() { return iterator; } };
+	let descriptor;
+	const cancel = null_prototype_callable(function () {
+		calls.push(['cancel', this, arguments.length]);
+	});
+	Object.defineProperty(cancel, 'call', {
+		get() {
+			cancel_call_reads++;
+			throw new Error('cancel.call must not be read');
+		}
+	});
+	const job = {};
+	const result = await unevalStream(job, (value, js) => value === job && (descriptor = {
+		type: 'async-sequence', source,
+		construct: () => js`0`, next: () => js``, complete: () => js``, error: () => js``, cancel
+	}));
+	const next_result = settled(result.tail.next());
+	assert.equal(await result.tail.return(), { done: true, value: undefined });
+	assert.equal(await next_result, { ok: true, value: { done: true, value: undefined } });
+	assert.is(return_call_reads, 0);
+	assert.is(cancel_call_reads, 0);
+	assert.is(calls.length, 2);
+	assert.equal(calls.map(([name]) => name), ['return', 'cancel']);
+	assert.is(calls[0][1], iterator);
+	assert.is(calls[1][1], descriptor);
+	assert.equal(calls.map(([, , count]) => count), [0, 0]);
+	pending.resolve({ done: true });
+});
+
+test('stops before a next body when next acquisition aborts', async () => {
+	const controller = new AbortController();
+	let body_calls = 0;
+	let returns = 0;
+	let cancels = 0;
+	const iterator = {
+		get next() {
+			controller.abort(0);
+			return null_prototype_callable(function () { body_calls++; return { done: true }; });
+		},
+		return() { returns++; return { done: true }; }
+	};
+	const source = { [Symbol.asyncIterator]() { return iterator; } };
+	const job = {};
+	assert.is(await rejected(unevalStream(job, (value, js) => value === job && ({
+		type: 'async-sequence', source,
+		construct: () => js`0`, next: () => js``, complete: () => js``, error: () => js``,
+		cancel() { cancels++; }
+	}), { signal: controller.signal })), 0);
+	assert.is(body_calls, 0);
+	assert.is(returns, 1);
+	assert.is(cancels, 1);
+});
+
+test('preserves a falsy abort raised inside a running next body', async () => {
+	const controller = new AbortController();
+	let pulls = 0;
+	let returns = 0;
+	let cancels = 0;
+	const iterator = {
+		next() {
+			pulls++;
+			controller.abort(0);
+			return { done: false, value: 1 };
+		},
+		return() { returns++; return { done: true }; }
+	};
+	const source = { [Symbol.asyncIterator]() { return iterator; } };
+	const job = {};
+	assert.is(await rejected(unevalStream(job, (value, js) => value === job && ({
+		type: 'async-sequence', source,
+		construct: () => js`0`, next: () => js``, complete: () => js``, error: () => js``,
+		cancel() { cancels++; }
+	}), { signal: controller.signal })), 0);
+	assert.is(pulls, 1);
+	assert.is(returns, 1);
+	assert.is(cancels, 1);
 });
 
 for (const phase of ['resolve', 'next', 'complete']) {

@@ -84,6 +84,107 @@ test('serializes graph values in construct and reachable capture expressions', a
 	for await (const block of result.tail) target.block(block);
 });
 
+test('ignores manages_pending fields and deletes reachable custom controls', async () => {
+	for (const property of ['true', 'false', 'inherited', 'throwing']) {
+		const ready = deferred();
+		const keepalive = deferred();
+		const job = {};
+		let reads = 0;
+		let descriptor;
+		const result = await unevalStream({ job, keepalive: keepalive.promise }, (value, js) => {
+			if (value !== job) return;
+			descriptor = {
+				type: 'async-value',
+				source: ready.promise,
+				construct: (capture) => js`({control:${capture(js`[]`)},value:null})`,
+				resolve({ target, control }, outcome) {
+					return js`globalThis.control_was_present=Object.hasOwn(globalThis.__d[${`pending-${property}`}].p,0);globalThis.control_matched=${control}===${target}.control;${target}.value=${outcome}`;
+				},
+				reject: () => js``
+			};
+			if (property === 'true' || property === 'false') descriptor.manages_pending = property === 'true';
+			if (property === 'inherited') Object.setPrototypeOf(descriptor, { manages_pending: true });
+			if (property === 'throwing') {
+				Object.defineProperty(descriptor, 'manages_pending', {
+					get() { reads++; throw new Error('manages_pending must not be read'); }
+				});
+			}
+			return descriptor;
+		}, { id: `pending-${property}` });
+		const target = client();
+		const root = target.head(result.head);
+		const session = target.context.__d[`pending-${property}`];
+		assert.ok(Object.hasOwn(session.p, 0));
+		ready.resolve(7);
+		target.block((await result.tail.next()).value);
+		assert.is(root.job.value, 7);
+		assert.is(target.context.control_was_present, true);
+		assert.is(target.context.control_matched, true);
+		assert.is(Object.hasOwn(session.p, 0), false);
+		assert.ok(Object.hasOwn(target.context.__d, `pending-${property}`));
+		assert.is(reads, 0);
+		keepalive.resolve();
+		for await (const block of result.tail) target.block(block);
+		assert.is(Object.hasOwn(target.context.__d, `pending-${property}`), false);
+	}
+});
+
+test('retains custom sequence controls through next and deletes them on completion', async () => {
+	const first = deferred();
+	const complete = deferred();
+	const keepalive = deferred();
+	const iterator = {
+		pulls: 0,
+		next() { return ++this.pulls === 1 ? first.promise : complete.promise; }
+	};
+	const source = { [Symbol.asyncIterator]() { return iterator; } };
+	const job = {};
+	const id = 'pending-sequence';
+	const result = await unevalStream({ job, keepalive: keepalive.promise }, (value, js) => value === job && ({
+		type: 'async-sequence', source,
+		construct: (capture) => js`({control:${capture(js`[]`)},events:[]})`,
+		next: ({ target, control }, outcome) => js`globalThis.next_control_present=Object.hasOwn(globalThis.__d[${id}].p,0);${target}.events.push(${control}===${target}.control,${outcome})`,
+		complete: ({ target, control }, outcome) => js`globalThis.complete_control_present=Object.hasOwn(globalThis.__d[${id}].p,0);${target}.events.push(${control}===${target}.control,${outcome})`,
+		error: () => js``
+	}), { id });
+	const target = client();
+	const root = target.head(result.head);
+	const session = target.context.__d[id];
+	first.resolve({ done: false, value: 1 });
+	target.block((await result.tail.next()).value);
+	assert.is(target.context.next_control_present, true);
+	assert.is(Object.hasOwn(session.p, 0), true);
+	complete.resolve({ done: true, value: 2 });
+	target.block((await result.tail.next()).value);
+	assert.is(target.context.complete_control_present, true);
+	assert.is(Object.hasOwn(session.p, 0), false);
+	assert.equal(Array.from(root.job.events), [true, 1, true, 2]);
+	keepalive.resolve();
+	for await (const block of result.tail) target.block(block);
+});
+
+test('keeps called but discarded captures unreachable', async () => {
+	const ready = deferred();
+	const keepalive = deferred();
+	const job = {};
+	let control;
+	const result = await unevalStream({ job, keepalive: keepalive.promise }, (value, js) => value === job && ({
+		type: 'async-value', source: ready.promise,
+		construct(capture) { capture(js`[${new Promise(() => {})}]`); return js`({value:null})`; },
+		resolve(reference, outcome) { control = reference.control; return js`${reference.target}.value=${outcome}`; },
+		reject: () => js``
+	}), { id: 'discarded-capture' });
+	const target = client();
+	const root = target.head(result.head);
+	assert.is(Object.hasOwn(target.context.__d['discarded-capture'].p, 0), false);
+	ready.resolve(1);
+	target.block((await result.tail.next()).value);
+	assert.is(control, undefined);
+	assert.is(root.job.value, 1);
+	keepalive.resolve();
+	for await (const block of result.tail) target.block(block);
+});
+
 test('populates sparse and null-object holes before repeated descriptor construction in every value region', async () => {
 	class Job {
 		constructor(value) {

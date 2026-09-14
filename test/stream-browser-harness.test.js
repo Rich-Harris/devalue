@@ -20,7 +20,7 @@ function run(cwd, environment) {
 		cwd,
 		env: { ...process.env, DEVALUE_BROWSER_HARNESS_TIMEOUT_MS: '500', ...environment },
 		encoding: 'utf8',
-		timeout: 8_000
+		timeout: 10_000
 	});
 }
 
@@ -34,6 +34,24 @@ async function fake_browser(directory) {
 	await copyFile(child_fixture, executable);
 	await chmod(executable, 0o755);
 	return executable;
+}
+
+async function absent(path) {
+	let failure;
+	try {
+		await readFile(path, 'utf8');
+	} catch (error) {
+		failure = error;
+	}
+	assert.is(failure?.code, 'ENOENT');
+}
+
+async function process_evidence(path, signal) {
+	const evidence = JSON.parse(await readFile(path, 'utf8'));
+	assert.ok(Number.isSafeInteger(evidence.pid) && evidence.pid > 0);
+	assert.equal(evidence.exit, { code: null, signal });
+	assert.throws(() => process.kill(evidence.pid, 0), /ESRCH/);
+	return evidence.pid;
 }
 
 test('reports a missing browser from any cwd and removes only its created profile', async () => {
@@ -127,41 +145,114 @@ for (const setup_delay of [0, 500]) test(`waits for ${setup_delay}ms stubborn br
 	}
 });
 
-test('times out in the readiness phase and force-terminates a browser that never publishes ready', async () => {
+test('times out in readiness before setup without requiring child-written evidence', async () => {
 	const parent = await temporary_directory();
 	const pid_file = join(parent, 'child.pid');
+	const setup_file = join(parent, 'child.setup');
 	const ready_file = join(parent, 'child.ready');
 	const sigterm_file = join(parent, 'child.sigterm');
+	const process_file = join(parent, 'child.process.json');
+	const caller_profile = 'devalue-browser-caller-owned';
+	const sentinel_file = join(parent, caller_profile, 'sentinel');
+	try {
+		await mkdir(join(parent, caller_profile));
+		await writeFile(sentinel_file, 'caller-owned');
+		const executable = await fake_browser(parent);
+		const result = run(process.cwd(), {
+			TMPDIR: parent,
+			CHROME_PATH: executable,
+			DEVALUE_BROWSER_TEST_CHILD_MODE: 'never-setup',
+			DEVALUE_BROWSER_HARNESS_TIMEOUT_MS: '200',
+			DEVALUE_BROWSER_TEST_READINESS_TIMEOUT_MS: '300',
+			DEVALUE_BROWSER_TEST_PID_FILE: pid_file,
+			DEVALUE_BROWSER_TEST_READY_FILE: ready_file,
+			DEVALUE_BROWSER_TEST_SIGTERM_FILE: sigterm_file,
+			DEVALUE_BROWSER_TEST_PROCESS_FILE: process_file
+		});
+		assert.is(result.signal, null, result.error?.message);
+		assert.is(result.status, 1, result.stderr || result.stdout);
+		assert.match(result.stderr, /Chrome test readiness timed out after 300ms/);
+		await process_evidence(process_file, 'SIGTERM');
+		await absent(pid_file);
+		await absent(setup_file);
+		await absent(ready_file);
+		await absent(sigterm_file);
+		assert.is(await readFile(sentinel_file, 'utf8'), 'caller-owned');
+		await no_profiles(parent, [caller_profile]);
+	} finally {
+		await rm(parent, { recursive: true, force: true });
+	}
+});
+
+test('times out in the setup phase when setup is never acknowledged', async () => {
+	const parent = await temporary_directory();
+	const setup_file = join(parent, 'child.setup');
+	const ready_file = join(parent, 'child.ready');
+	const process_file = join(parent, 'child.process.json');
 	try {
 		const executable = await fake_browser(parent);
 		const result = run(process.cwd(), {
 			TMPDIR: parent,
 			CHROME_PATH: executable,
-			DEVALUE_BROWSER_TEST_CHILD_MODE: 'never-ready',
-			DEVALUE_BROWSER_HARNESS_TIMEOUT_MS: '200',
-			DEVALUE_BROWSER_TEST_READINESS_TIMEOUT_MS: '300',
-			DEVALUE_BROWSER_TEST_PID_FILE: pid_file,
+			DEVALUE_BROWSER_TEST_CHILD_MODE: 'never-setup',
+			DEVALUE_BROWSER_TEST_SETUP_FILE: setup_file,
+			DEVALUE_BROWSER_TEST_SETUP_TIMEOUT_MS: '300',
 			DEVALUE_BROWSER_TEST_READY_FILE: ready_file,
-			DEVALUE_BROWSER_TEST_SIGTERM_FILE: sigterm_file
+			DEVALUE_BROWSER_TEST_READINESS_TIMEOUT_MS: '300',
+			DEVALUE_BROWSER_TEST_PROCESS_FILE: process_file
 		});
 		assert.is(result.signal, null, result.error?.message);
 		assert.is(result.status, 1, result.stderr || result.stdout);
-		assert.match(result.stderr, /Chrome test readiness timed out after 300ms/);
-		const pid = Number(await readFile(pid_file, 'utf8'));
-		assert.is(Number(await readFile(sigterm_file, 'utf8')), pid);
-		assert.throws(() => process.kill(pid, 0), /ESRCH/);
-		let readiness_error;
-		try {
-			await readFile(ready_file, 'utf8');
-		} catch (error) {
-			readiness_error = error;
-		}
-		assert.is(readiness_error?.code, 'ENOENT');
+		assert.match(result.stderr, /Chrome test setup timed out after 300ms/);
+		assert.not.match(result.stderr, /test readiness timed out|DevTools endpoint timed out/);
+		await process_evidence(process_file, 'SIGTERM');
+		await absent(setup_file);
+		await absent(ready_file);
 		await no_profiles(parent);
 	} finally {
 		await rm(parent, { recursive: true, force: true });
 	}
 });
+
+const inherited_setup_delay = Number(process.env.DEVALUE_BROWSER_TEST_SETUP_DELAY_MS ?? 500);
+for (const [label, setup_delay] of [['immediate', 0], ['configured', inherited_setup_delay]]) {
+	test(`times out in readiness after ${label} setup and observes forced child exit`, async () => {
+		const parent = await temporary_directory();
+		const pid_file = join(parent, 'child.pid');
+		const setup_file = join(parent, 'child.setup');
+		const ready_file = join(parent, 'child.ready');
+		const sigterm_file = join(parent, 'child.sigterm');
+		const process_file = join(parent, 'child.process.json');
+		try {
+			const executable = await fake_browser(parent);
+			const result = run(process.cwd(), {
+				TMPDIR: parent,
+				CHROME_PATH: executable,
+				DEVALUE_BROWSER_TEST_CHILD_MODE: 'never-ready',
+				DEVALUE_BROWSER_TEST_SETUP_DELAY_MS: String(setup_delay),
+				DEVALUE_BROWSER_TEST_SETUP_FILE: setup_file,
+				DEVALUE_BROWSER_TEST_SETUP_TIMEOUT_MS: '1500',
+				DEVALUE_BROWSER_TEST_READY_FILE: ready_file,
+				DEVALUE_BROWSER_TEST_READINESS_TIMEOUT_MS: '300',
+				DEVALUE_BROWSER_TEST_PID_FILE: pid_file,
+				DEVALUE_BROWSER_TEST_SIGTERM_FILE: sigterm_file,
+				DEVALUE_BROWSER_TEST_PROCESS_FILE: process_file
+			});
+			assert.is(result.signal, null, result.error?.message);
+			assert.is(result.status, 1, result.stderr || result.stdout);
+			assert.match(result.stderr, /Chrome test readiness timed out after 300ms/);
+			assert.not.match(result.stderr, /test setup timed out|DevTools endpoint timed out/);
+			const parent_pid = await process_evidence(process_file, 'SIGKILL');
+			assert.is(Number(await readFile(pid_file, 'utf8')), parent_pid);
+			assert.is(Number(await readFile(setup_file, 'utf8')), parent_pid);
+			assert.is(Number(await readFile(sigterm_file, 'utf8')), parent_pid);
+			await absent(ready_file);
+			await no_profiles(parent);
+		} finally {
+			await rm(parent, { recursive: true, force: true });
+		}
+	});
+}
 
 test('reports an early browser exit during readiness and removes its profile', async () => {
 	const parent = await temporary_directory();
