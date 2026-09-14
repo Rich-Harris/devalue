@@ -13,6 +13,11 @@ const harness_timeout = Number(process.env.DEVALUE_BROWSER_HARNESS_TIMEOUT_MS ??
 if (!Number.isFinite(harness_timeout) || harness_timeout < 100 || harness_timeout > 30_000) {
 	throw new Error('DEVALUE_BROWSER_HARNESS_TIMEOUT_MS must be a finite duration from 100 to 30000');
 }
+const test_readiness_file = process.env.DEVALUE_BROWSER_TEST_READY_FILE;
+const test_readiness_timeout = Number(process.env.DEVALUE_BROWSER_TEST_READINESS_TIMEOUT_MS ?? 5_000);
+if (test_readiness_file && (!Number.isFinite(test_readiness_timeout) || test_readiness_timeout < 100 || test_readiness_timeout > 10_000)) {
+	throw new Error('DEVALUE_BROWSER_TEST_READINESS_TIMEOUT_MS must be a finite duration from 100 to 10000');
+}
 
 const fixture = process.env.DEVALUE_BROWSER_SERVER_PATH ?? fileURLToPath(new URL('./browser-csp-smoke.mjs', import.meta.url));
 const profile = await mkdtemp(join(tmpdir(), 'devalue-browser-'));
@@ -192,6 +197,16 @@ try {
 		'--remote-debugging-port=0', `--user-data-dir=${profile}`,
 		`${origin}/stream`
 	], { stdio: 'ignore' }), 'Chrome');
+	if (test_readiness_file) {
+		await wait_for('Chrome test readiness', async () => {
+			const value = (await readFile(test_readiness_file, 'utf8')).trim();
+			if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) <= 0) {
+				throw new Error('invalid Chrome test readiness PID');
+			}
+			if (Number(value) !== browser.child.pid) throw new Error('Chrome test readiness PID did not match child');
+			return true;
+		}, [browser], test_readiness_timeout);
+	}
 	const endpoint = await wait_for('Chrome DevTools endpoint', async () => {
 		const [port, path] = (await readFile(join(profile, 'DevToolsActivePort'), 'utf8')).trim().split('\n');
 		if (!/^\d+$/.test(port) || !path?.startsWith('/')) throw new Error('invalid DevToolsActivePort');
@@ -265,9 +280,10 @@ try {
 	cdp?.close();
 	const cleanup = await Promise.allSettled([...children].reverse().map(terminate));
 	const profile_cleanup = await Promise.allSettled([rm(profile, { recursive: true, force: true })]);
-	if (!primary_error) {
-		const failure = cleanup.find((result) => result.status === 'rejected');
-		if (failure) throw failure.reason;
-		if (profile_cleanup[0].status === 'rejected') throw profile_cleanup[0].reason;
+	const failures = [...cleanup, ...profile_cleanup].filter((result) => result.status === 'rejected');
+	if (primary_error) {
+		for (const failure of failures) console.error(`browser smoke cleanup failed: ${failure.reason?.stack ?? failure.reason}`);
+	} else if (failures.length > 0) {
+		throw failures[0].reason;
 	}
 }

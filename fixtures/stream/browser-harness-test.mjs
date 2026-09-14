@@ -6,11 +6,21 @@ import http from 'node:http';
 
 if (process.env.DEVALUE_BROWSER_TEST_CHILD_MODE === 'exit') process.exit(7);
 
-if (process.env.DEVALUE_BROWSER_TEST_CHILD_MODE === 'stubborn') {
+if (process.env.DEVALUE_BROWSER_TEST_CHILD_MODE === 'stubborn' || process.env.DEVALUE_BROWSER_TEST_CHILD_MODE === 'never-ready') {
 	const argument = process.argv.find((value) => value.startsWith('--user-data-dir='));
 	if (!argument) throw new Error('missing profile argument');
+	const setup_delay = Number(process.env.DEVALUE_BROWSER_TEST_SETUP_DELAY_MS ?? 0);
+	if (!Number.isFinite(setup_delay) || setup_delay < 0 || setup_delay > 2_000) {
+		throw new Error('DEVALUE_BROWSER_TEST_SETUP_DELAY_MS must be a finite duration from 0 to 2000');
+	}
+	if (setup_delay > 0) await new Promise((resolve) => setTimeout(resolve, setup_delay));
+	process.on('SIGTERM', () => {
+		writeFileSync(process.env.DEVALUE_BROWSER_TEST_SIGTERM_FILE, String(process.pid));
+	});
 	writeFileSync(process.env.DEVALUE_BROWSER_TEST_PID_FILE, String(process.pid));
-	process.on('SIGTERM', () => {});
+	if (process.env.DEVALUE_BROWSER_TEST_CHILD_MODE === 'stubborn') {
+		writeFileSync(process.env.DEVALUE_BROWSER_TEST_READY_FILE, String(process.pid));
+	}
 	setInterval(() => {}, 1_000);
 }
 
