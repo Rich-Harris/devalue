@@ -6,6 +6,7 @@ import { stringify_primitive } from './utils.js';
 import {
 	capture_source,
 	definitions_source,
+	descriptor_source_values,
 	describe_received,
 	expression_source,
 	is_stream_instruction,
@@ -154,6 +155,28 @@ test('ordinary instruction-shaped objects remain data holes', () => {
 	const inherited = Object.create({ type: 'outcome' });
 	const values = [{ type: 'reference' }, { type: 'capture' }, { type: 'outcome' }, inherited];
 	assert.equal(source_values(js`${values[0]}${js`${values[1]}`}${values[2]}${inherited}`), values);
+});
+
+test('collects nested source holes in occurrence order without deduplicating fragments', () => {
+	const first = { first: true };
+	const second = { second: true };
+	const shaped = { type: 'capture', source: js`${{ hidden: false }}` };
+	const reused = js`${first},${undefined},${shaped}`;
+	const source = js`${js`[${0},${reused}`}${js`,${second},${reused}]`}`;
+	assert.equal(source_values(source), [0, first, undefined, shaped, second, first, undefined, shaped]);
+});
+
+test('skips identifier tokens and branded instructions while descriptor collection descends into captures', () => {
+	const token = js.identifier();
+	const captured = { captured: true };
+	const expressed = { expressed: true };
+	const node = /** @type {any} */ ({});
+	const capture = capture_source(0, js`[${captured}]`);
+	const source = js`${token}${capture}${expression_source(js`${expressed}`)}${reference_source(node, undefined)}${runtime_source('v')}${promise_source(1)}${definitions_source()}`;
+	assert.equal(source_values(source), []);
+	assert.equal(descriptor_source_values(capture).map(({ value, capture }) => ({ value, capture })), [
+		{ value: captured, capture: true }
+	]);
 });
 
 test('keeps resolved emission as strings, including expressions and statements', () => {

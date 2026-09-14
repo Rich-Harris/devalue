@@ -228,6 +228,25 @@ test('keeps overlapping opaque-root retention proportional to captured nodes', (
 	}
 });
 
+test('collects nested synchronous source holes with linear append work', () => {
+	const fixture = fileURLToPath(new URL('../fixtures/stream/source-values-scaling.mjs', import.meta.url));
+	const child = spawnSync(process.execPath, [fixture, '100', '200', '400', '800'], {
+		encoding: 'utf8',
+		timeout: 30_000
+	});
+	assert.is(child.error, undefined, child.error?.stack);
+	assert.is(child.signal, null, child.stderr || child.stdout);
+	assert.is(child.status, 0, child.stderr || child.stdout);
+	const measurement = JSON.parse(child.stdout);
+	assert.is(measurement.fixture, 'left-nested JavaScriptSource with one ordinary object hole per fragment');
+	assert.is(measurement.counting, 'Array.prototype.push arguments during source_values(source)');
+	assert.equal(measurement.results.map((result) => result.count), [100, 200, 400, 800]);
+	for (const result of measurement.results) {
+		assert.is(result.holes, result.count, JSON.stringify(measurement));
+		assert.ok(result.appended <= result.count * 2, JSON.stringify(measurement));
+	}
+});
+
 test('preserves same-batch identities without reading paths before their event exists', async () => {
 	class Wrapper {
 		constructor(value) {
@@ -852,6 +871,35 @@ test('preserves identity when one custom child source is repeated', async () => 
 		return js`[${child},${child}]`;
 	}));
 	assert.is(root[0], root[1]);
+});
+
+test('preserves composed repeated custom holes in synchronous and streamed regions', async () => {
+	class Wrapper { constructor(value) { this.value = value; } }
+	const synchronous = new Wrapper({ region: 'head' });
+	const streamed = new Wrapper({ region: 'tail' });
+	const pending = deferred();
+	const calls = new Map();
+	const result = await unevalStream({ synchronous, streamed: pending.promise }, (value, js) => {
+		if (!(value instanceof Wrapper)) return;
+		calls.set(value, (calls.get(value) ?? 0) + 1);
+		const partial = js`[${value.value}`;
+		const repeated = js`${value.value}`;
+		return js`${partial},${repeated}]`;
+	}, { id: 'composed-repeated-holes' });
+	const target = client();
+	const root = target.head(result.head);
+	assert.is(root.synchronous[0], root.synchronous[1]);
+	assert.is(root.synchronous[0].region, 'head');
+	assert.is(calls.get(synchronous), 1);
+	assert.is(calls.has(streamed), false);
+
+	pending.resolve(streamed);
+	target.block((await result.tail.next()).value);
+	const revived = await root.streamed;
+	assert.is(revived[0], revived[1]);
+	assert.is(revived[0].region, 'tail');
+	assert.is(calls.get(streamed), 1);
+	assert.equal(await result.tail.next(), { done: true, value: undefined });
 });
 
 test('serializes primitive holes in custom source', async () => {

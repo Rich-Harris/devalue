@@ -205,10 +205,15 @@ export function template_source(source) {
 export function source_values(source) {
 	/** @type {unknown[]} */
 	const values = [];
-	for (const value of source[SOURCE].values) {
-		if (is_source(value)) values.push(...source_values(value));
-		else if (!is_stream_instruction(value)) values.push(value);
-	}
+	/** @param {JavaScriptSource} fragment */
+	const walk = (fragment) => {
+		if (is_identifier(fragment)) return;
+		for (const value of fragment[SOURCE].values) {
+			if (is_source(value)) walk(value);
+			else if (!is_stream_instruction(value)) values.push(value);
+		}
+	};
+	walk(source);
 	return values;
 }
 
