@@ -144,19 +144,21 @@ test('keeps nested commits provisional when a later terminal callback aborts the
 	assert.not.ok(cancels.includes('nested'));
 });
 
-test('continues cleanly after external and owned graph failures', async () => {
+test('continues cleanly after external, expired, and fresh owned graph failures', async () => {
 	class Job {
 		constructor(name, ready) {
 			this.name = name;
 			this.ready = ready;
 		}
 	}
-	const gates = [deferred(), deferred(), deferred(), deferred(), deferred()];
+	const gates = [deferred(), deferred(), deferred(), deferred(), deferred(), deferred(), deferred()];
 	const external_job = new Job('external', gates[0]);
-	const graph_job = new Job('graph', gates[1]);
-	const healthy_job = new Job('healthy', gates[2]);
-	const provisional = new Job('provisional', gates[3]);
-	const nested = new Job('nested', gates[4]);
+	const symbol_job = new Job('symbol', gates[1]);
+	const reused_job = new Job('reused', gates[2]);
+	const graph_job = new Job('graph', gates[3]);
+	const healthy_job = new Job('healthy', gates[4]);
+	const provisional = new Job('provisional', gates[5]);
+	const nested = new Job('nested', gates[6]);
 	const shared = { value: 42 };
 	const external_value = {};
 	const external_root = {};
@@ -164,12 +166,14 @@ test('continues cleanly after external and owned graph failures', async () => {
 	Object.freeze(external);
 	const external_hole = { provisional };
 	Object.defineProperty(external_hole, 'prop', { enumerable: true, get() { throw external; } });
+	const reused_hole = { provisional };
+	Object.defineProperty(reused_hole, 'prop', { enumerable: true, get() { throw reports[1]; } });
 	const bad = () => {};
 	const graph_hole = { deep: { bad } };
 	const starts = [];
 	const cancels = [];
 	const reports = [];
-	const result = await unevalStream({ shared, jobs: [external_job, graph_job, healthy_job] }, (value, js) => value instanceof Job && ({
+	const result = await unevalStream({ shared, jobs: [external_job, symbol_job, reused_job, graph_job, healthy_job] }, (value, js) => value instanceof Job && ({
 		type: 'async-value',
 		source: {
 			get then() {
@@ -180,6 +184,7 @@ test('continues cleanly after external and owned graph failures', async () => {
 		construct: () => js`({name:${value.name},value:null})`,
 		resolve: ({ target }) => {
 			if (value === external_job) return js`${external_hole}`;
+			if (value === reused_job) return js`${reused_hole}`;
 			if (value === graph_job) return js`${graph_hole}`;
 			if (value === healthy_job) return js`${target}.value={shared:${shared},again:${shared},nested:${nested}}`;
 			return js`${target}.value="done"`;
@@ -189,7 +194,7 @@ test('continues cleanly after external and owned graph failures', async () => {
 	}), { id: 'owned-error-rollback', onerror: (error) => reports.push(error) });
 	const target = client();
 	const root = target.head(result.head);
-	assert.equal(starts, ['external', 'graph', 'healthy']);
+	assert.equal(starts, ['external', 'symbol', 'reused', 'graph', 'healthy']);
 
 	gates[0].resolve(1);
 	target.block((await result.tail.next()).value);
@@ -200,26 +205,40 @@ test('continues cleanly after external and owned graph failures', async () => {
 	assert.ok(!starts.includes('provisional'));
 	assert.ok(!cancels.includes('provisional'));
 
-	gates[1].resolve(2);
+	const symbol = Symbol('reported');
+	gates[1].resolve(symbol);
 	target.block((await result.tail.next()).value);
-	assert.is(reports[1].cause.value, bad);
-	assert.is(reports[1].cause.path, '.deep.bad');
+	assert.instance(reports[1], DevalueError);
+	assert.is(reports[1].value, symbol);
+	assert.is(reports[1].path, '');
 
-	gates[2].resolve(3);
+	gates[2].resolve(1);
+	target.block((await result.tail.next()).value);
+	assert.is(reports[2].cause, reports[1]);
+	assert.is(reports[1].path, '');
+	assert.ok(!starts.includes('provisional'));
+	assert.ok(!cancels.includes('provisional'));
+
+	gates[3].resolve(2);
+	target.block((await result.tail.next()).value);
+	assert.is(reports[3].cause.value, bad);
+	assert.is(reports[3].cause.path, '.deep.bad');
+
+	gates[4].resolve(3);
 	const healthy_block = (await result.tail.next()).value;
 	target.block(healthy_block);
-	assert.equal(starts, ['external', 'graph', 'healthy', 'nested']);
-	assert.is(root.jobs[2].value.shared, root.shared);
-	assert.is(root.jobs[2].value.again, root.shared);
-	assert.is(root.jobs[2].value.nested.name, 'nested');
+	assert.equal(starts, ['external', 'symbol', 'reused', 'graph', 'healthy', 'nested']);
+	assert.is(root.jobs[4].value.shared, root.shared);
+	assert.is(root.jobs[4].value.again, root.shared);
+	assert.is(root.jobs[4].value.nested.name, 'nested');
 	assert.match(healthy_block, /\.a\[1\]/);
 	assert.not.match(healthy_block, /\.a\[2\]/);
 	assert.is(target.context.__d['owned-error-rollback'].a.length, 2);
 
-	gates[4].resolve(4);
+	gates[6].resolve(4);
 	target.block((await result.tail.next()).value);
-	assert.is(root.jobs[2].value.nested.value, 'done');
-	assert.is(reports.length, 2);
+	assert.is(root.jobs[4].value.nested.value, 'done');
+	assert.is(reports.length, 4);
 	await result.tail.return();
 	assert.equal(cancels, []);
 });

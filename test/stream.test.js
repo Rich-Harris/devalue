@@ -939,6 +939,53 @@ test('rejects Symbols in descriptor construct capture and operation phases', asy
 	assert.match(reports[0].message, /resolve\(\), template hole 1: received a Symbol/);
 });
 
+test('does not retain ownership of reported Symbol outcomes', async () => {
+	for (const mode of ['writable', 'frozen', 'hostile message']) {
+		const first = deferred();
+		const scalar = deferred();
+		const reused = deferred();
+		const symbol = Symbol(mode);
+		const reports = [];
+		let message_reads = 0;
+		const result = await unevalStream({ first: first.promise, scalar: scalar.promise, reused: reused.promise }, undefined, {
+			id: `expired-native-symbol-${mode}`,
+			onerror: (error) => reports.push(error)
+		});
+		const target = client();
+		target.head(result.head);
+
+		first.resolve(symbol);
+		target.block((await result.tail.next()).value);
+		assert.is(reports.length, 1);
+		const original = reports[0];
+		assert.is(original.name, 'DevalueError');
+		assert.is(original.message, 'Cannot stringify a Symbol primitive');
+		const fields = { path: original.path, value: original.value, root: original.root };
+		if (mode === 'frozen') Object.freeze(original);
+		if (mode === 'hostile message') {
+			Object.defineProperty(original, 'message', {
+				configurable: true,
+				get() { message_reads++; throw new Error('stale message inspected'); }
+			});
+		}
+
+		// Successful primitive capture must not be what retires ownership.
+		scalar.resolve(1);
+		target.block((await result.tail.next()).value);
+		const throwing = {};
+		Object.defineProperty(throwing, 'prop', { enumerable: true, get() { throw original; } });
+		reused.resolve(throwing);
+		target.block((await result.tail.next()).value);
+
+		assert.is(reports.length, 2);
+		assert.is(reports[1], original);
+		assert.is(original.path, fields.path);
+		assert.is(original.value, fields.value);
+		assert.is(original.root, fields.root);
+		assert.is(message_reads, 0);
+	}
+});
+
 test('accepts exactly the synchronous replacer fallback set', async () => {
 	for (const fallback of [undefined, null, false]) {
 		const { root } = await drain(await unevalStream({ value: 1 }, () => fallback));

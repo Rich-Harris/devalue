@@ -478,6 +478,70 @@ for (const frozen of [false, true]) {
 	});
 }
 
+test('does not reuse reported Symbol ownership while lowering descriptor holes', async () => {
+	for (const mode of ['writable', 'frozen', 'hostile message']) {
+		const gates = [deferred(), deferred()];
+		const jobs = [{ index: 0 }, { index: 1 }];
+		const reports = [];
+		let original;
+		let message_reads = 0;
+		const throwing = {};
+		Object.defineProperty(throwing, 'prop', { enumerable: true, get() { throw original; } });
+		const result = await unevalStream(jobs, (value, js) => jobs.includes(value) && ({
+			type: 'async-value', source: gates[value.index].promise,
+			construct: () => js`({})`,
+			resolve: () => value.index === 1 ? js`${throwing}` : js``,
+			reject: () => js``
+		}), { id: `expired-descriptor-symbol-${mode}`, onerror: (error) => reports.push(error) });
+		const target = client();
+		target.head(result.head);
+
+		const symbol = Symbol(mode);
+		gates[0].resolve(symbol);
+		target.block((await result.tail.next()).value);
+		assert.is(reports.length, 1);
+		original = reports[0];
+		assert.is(original.name, 'DevalueError');
+		assert.is(original.message, 'Cannot stringify a Symbol primitive');
+		const fields = { path: original.path, value: original.value, root: original.root };
+		if (mode === 'frozen') Object.freeze(original);
+		if (mode === 'hostile message') {
+			Object.defineProperty(original, 'message', {
+				configurable: true,
+				get() { message_reads++; throw new Error('stale message inspected'); }
+			});
+		}
+
+		gates[1].resolve(1);
+		target.block((await result.tail.next()).value);
+		assert.is(reports.length, 2);
+		assert.instance(reports[1], TypeError);
+		assert.match(reports[1].message, /async descriptor resolve\(\), template hole 1: received an object/);
+		assert.is(reports[1].cause, original);
+		assert.is(original.path, fields.path);
+		assert.is(original.value, fields.value);
+		assert.is(original.root, fields.root);
+		assert.is(message_reads, 0);
+	}
+});
+
+test('keeps nested Symbol ownership active until descriptor rollback adds its path', async () => {
+	const symbol = Symbol('nested');
+	const nested = { deep: { bad: symbol } };
+	const job = {};
+	const error = await rejected(unevalStream(job, (value, js) => value === job && ({
+		type: 'async-value', source: new Promise(() => {}),
+		construct: () => js`${nested}`,
+		resolve: () => js``, reject: () => js``
+	})));
+	assert.instance(error, TypeError);
+	assert.match(error.message, /async descriptor construct\(\), template hole 1/);
+	assert.instance(error.cause, DevalueError);
+	assert.is(error.cause.value, symbol);
+	assert.is(error.cause.root, job);
+	assert.is(error.cause.path, '.deep.bad');
+});
+
 for (const mode of ['construct', 'capture']) {
 	test(`preserves an external cause during initial descriptor ${mode}`, async () => {
 		const reason = new Error(`external ${mode} failure`);

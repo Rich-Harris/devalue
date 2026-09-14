@@ -261,7 +261,15 @@ class Session {
 		// Primitive capture cannot append graph or source state. Validate it directly so
 		// common scalar outcomes do not open even a small graph transaction.
 		if (is_primitive(value)) {
-			const node = discover(this.#graph, value);
+			let node;
+			try {
+				node = discover(this.#graph, value);
+			} catch (error) {
+				// Symbol discovery still creates graph-owned diagnostic state. Finalize that
+				// ownership before exposing the error beyond this top-level capture boundary.
+				roll_back(this.#graph, this.#graph.nodes.length, error);
+				throw error;
+			}
 			if (!this.#is_active()) throw this.#terminal_reason();
 			if (root) this.#root = node;
 			return node;
