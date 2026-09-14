@@ -7,7 +7,7 @@ const test = suite('stream client runtime');
 
 function buffered_iterator() {
 	const context = vm.createContext({});
-	const iterator = vm.runInContext(`(${RUNTIMES.f})(g=>{globalThis.update=g})`, context);
+	const iterator = vm.runInContext(`(${RUNTIMES.f('s')})(g=>{globalThis.update=g})`, context);
 	return { iterator, update: context.update };
 }
 

@@ -257,18 +257,6 @@ export function source_helpers(source) {
 }
 
 /**
- * Renders one complete structured source. `definitions` are inserted only at an explicit
- * definitions instruction, allowing helper discovery to happen before the single text render.
- * @param {Emission} source
- * @param {(keyof typeof RUNTIMES)[]} [definitions]
- */
-export function render_stream_source(source, definitions = []) {
-	return render_stream_source_with_names(source, definitions, 's', () => {
-		throw new TypeError('Unresolved stream identifier: no generated name was assigned before rendering (internal emitter error)');
-	});
-}
-
-/**
  * Renders structured stream source with the coordinated session binding and identifier allocator.
  * @param {Emission} source
  * @param {(keyof typeof RUNTIMES)[]} definitions
@@ -277,7 +265,7 @@ export function render_stream_source(source, definitions = []) {
  */
 export function render_stream_source_with_names(source, definitions, session, render_identifier) {
 	if (typeof source === 'string') return source;
-	const definition_source = definitions.map((key) => `${session}.${key}=${render_runtime(key, session)}`).join(';');
+	const definition_source = definitions.map((key) => `${session}.${key}=${RUNTIMES[key](session)}`).join(';');
 	/** @param {Emission} fragment */
 	const render = (fragment) => {
 		if (typeof fragment === 'string') return fragment;
@@ -394,8 +382,9 @@ export function append_reference(reference, segment) {
  * repeatedly shifting potentially large buffers. Keep this as the authoritative
  * implementation evaluated by runtime tests and emitted to clients.
  */
+/** @type {Record<'f' | 'w' | 'r' | 'v', (session: string) => string>} */
 export const RUNTIMES = {
-	f: `(c)=>{
+	f: (session) => `(c)=>{
 	let q=[],i=0; // buffered yields and next unread index
 	let w=[],j=0; // pending reads and next unsettled index
 	let t=0,e,x=0; // server terminal type, value/reason, and consumed flag
@@ -448,18 +437,10 @@ export const RUNTIMES = {
 		async throw(v){k(v,1);throw v}
 	};
 }`,
-	w: 'i=>{let p=new Promise((a,b)=>{s.p[i]=[a,b]});p.catch(()=>{});return p}',
-	r: '(i,j,v)=>(s.p[i][j](v),delete s.p[i])',
-	v: 'v=>(s.a.push(v),v)'
+	w: (session) => `i=>{let p=new Promise((c,d)=>{${session}.p[i]=[c,d]});p.catch(()=>{});return p}`,
+	r: (session) => `(i,j,v)=>(${session}.p[i][j](v),delete ${session}.p[i])`,
+	v: (session) => `v=>(${session}.a.push(v),v)`
 };
-
-/** @param {keyof typeof RUNTIMES} key @param {string} session */
-function render_runtime(key, session) {
-	if (key === 'w') return `i=>{let p=new Promise((c,d)=>{${session}.p[i]=[c,d]});p.catch(()=>{});return p}`;
-	if (key === 'r') return `(i,j,v)=>(${session}.p[i][j](v),delete ${session}.p[i])`;
-	if (key === 'v') return `v=>(${session}.a.push(v),v)`;
-	return RUNTIMES[key];
-}
 
 /** @typedef {import('./javascript-source.js').JavaScriptSource} JavaScriptSource */
 /** Generated text or a fragment carrying unresolved semantics. Not a user interpolation type. @typedef {string | JavaScriptSource} Emission */

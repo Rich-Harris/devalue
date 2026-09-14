@@ -2525,6 +2525,34 @@ test('does not promote a repeated short path when unprofitable', async () => {
 	assert.is((await root.pending)[0], root.x);
 });
 
+test('keeps equal-length alias encounter order across the slot digit boundary', async () => {
+	class Wrapper {
+		constructor(value) {
+			this.value = value;
+		}
+	}
+	const pending = deferred();
+	const first = {};
+	const other = {};
+	const opaque = Array.from({ length: 9 }, (_, index) => new Wrapper({ index }));
+	const result = await unevalStream({
+		opaque,
+		first: { veryLongPropertyName: first },
+		other: { veryLongPropertyName: other },
+		pending: pending.promise
+	}, (value, js) => value instanceof Wrapper && js`({value:${value.value}})`, { id: 'alias-digit-boundary' });
+	const target = client();
+	const root = target.head(result.head);
+	pending.resolve([other, other, other, first, first, first]);
+	const block = (await result.tail.next()).value;
+	assert.match(block, /\.s\[9\]=[a-z]+\.a\[0\]\.other\.veryLongPropertyName/);
+	assert.match(block, /\.s\[10\]=[a-z]+\.a\[0\]\.first\.veryLongPropertyName/);
+	target.block(block);
+	const values = await root.pending;
+	assert.is(values[0], root.other.veryLongPropertyName);
+	assert.is(values[3], root.first.veryLongPropertyName);
+});
+
 test('composes descriptor references without replacing similar source text', async () => {
 	const pending = deferred();
 	const marker = '"0"';

@@ -14,7 +14,6 @@ import {
 	map_source,
 	promise_source,
 	reference_source,
-	render_stream_source,
 	render_stream_source_with_names,
 	runtime_source,
 	source_helpers,
@@ -24,6 +23,13 @@ import {
 } from './stream-source.js';
 
 const test = suite('structured stream source');
+
+/** Test convenience for the real name-aware renderer with its ordinary session binding. */
+function render_stream_source(source, definitions = []) {
+	return render_stream_source_with_names(source, definitions, 's', () => {
+		throw new TypeError('Unresolved stream identifier: no generated name was assigned before rendering (internal emitter error)');
+	});
+}
 
 test('brands instructions with a private non-enumerable symbol rather than shape', () => {
 	const node = /** @type {any} */ ({});
@@ -74,6 +80,30 @@ test('renders helper definitions before structured uses', () => {
 	assert.ok(rendered.indexOf('s.r=') < rendered.indexOf('s.r(12'));
 	assert.is((rendered.match(/s\.w=/g) ?? []).length, 1);
 	assert.is((rendered.match(/\.catch\(\(\)=>\{\}\)/g) ?? []).length, 1);
+});
+
+test('renders and executes authoritative helpers for short and long session bindings', async () => {
+	for (const session of ['s', 'sessionBinding']) {
+		const source = join_sources([
+			definitions_source(),
+			';globalThis.promise=', promise_source(0),
+			';', runtime_source('r'), '(0,0,42)',
+			';globalThis.anchor=', runtime_source('v'), '("x")'
+		]);
+		const definitions = source_helpers(source);
+		assert.equal(definitions, ['w', 'r', 'v']);
+		const rendered = render_stream_source_with_names(source, definitions, session, () => {
+			assert.unreachable('rendered an identifier');
+		});
+		const context = vm.createContext({ [session]: { a: [], p: [] } });
+		context.globalThis = context;
+		vm.runInContext(rendered, context);
+		assert.is(await context.promise, 42);
+		assert.is(context.anchor, 'x');
+		assert.equal(Array.from(context[session].a), ['x']);
+		assert.ok(rendered.indexOf(`${session}.w=`) < rendered.indexOf(`${session}.w(0)`));
+		assert.match(rendered, /new Promise\(\(c,d\)=>/);
+	}
 });
 
 test('groups capture assignments', () => {

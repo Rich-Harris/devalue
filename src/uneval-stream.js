@@ -188,7 +188,7 @@ class Session {
 			while (this.#flushing && this.#is_active());
 			if (!this.#is_active()) return await this.#throw_failure(undefined);
 
-			const head_region = this.#emit_region(value, true, undefined, 0, 0);
+			const head_region = this.#emit_region(value, true, 0, 0);
 			this.#assign_references(value, { kind: 'anchor', index: 0, segments: [] }, new Map(), 0);
 			// anything that settled within the window is folded into the head rather than shipped as a block
 			const operations = this.#batch_ready
@@ -545,9 +545,8 @@ class Session {
 	 * @param {JavaScriptSource} source
 	 * @param {string} context
 	 * @param {number} retained_at
-	 * @param {Set<CapturedNode>} references
 	 */
-	#lower_descriptor_source(source, context, retained_at, references) {
+	#lower_descriptor_source(source, context, retained_at) {
 		const entries = descriptor_source_values(source);
 		if (entries.length === 0) return { prerequisites: [], source };
 		if (entries.every((entry) => is_primitive(entry.value))) {
@@ -583,14 +582,13 @@ class Session {
 				if (is_primitive(entry.value)) continue;
 				const node = nodes.get(/** @type {object} */ (entry.value));
 				if (!node || bindings.has(node)) continue;
-				references.add(node);
 				const retained = this.#reference_at(node, retained_at);
 				/** @type {Emission} */
 				let expression;
 				if (retained) {
 					expression = reference_source(node, retained.path);
 				} else {
-					const region = this.#emit_region(node.value, true, references, retained_at, retained_at);
+					const region = this.#emit_region(node.value, true, retained_at, retained_at);
 					this.#resolve_references(region, retained_at);
 					const index = this.#anchor++;
 					const path = { kind: /** @type {const} */ ('anchor'), index, segments: [] };
@@ -945,12 +943,11 @@ class Session {
 	 *
 	 * @param {unknown} value
 	 * @param {boolean} persistent
-	 * @param {Set<CapturedNode>} [references]
 	 * @param {number} [available] Paths usable while constructing this region.
 	 * @param {number} [retained_at] Boundary after which paths created by this region exist.
 	 * @returns {Emission}
 	 */
-	#emit_region(value, persistent, references, available = this.#availability, retained_at = available) {
+	#emit_region(value, persistent, available = this.#availability, retained_at = available) {
 		// A primitive region has neither graph planning nor unresolved source dependencies.
 		if (is_primitive(value)) {
 			if (typeof value === 'symbol') throw this.#error('Cannot stringify a Symbol primitive', value);
@@ -1112,7 +1109,6 @@ class Session {
 		const expression_node = (node) => {
 			const retained = this.#reference_at(node, available);
 			if (retained && node.region_id !== region_id) {
-				references?.add(node);
 				return reference_source(node, retained.path);
 			}
 			if (node.region_id === region_id && node.name) return node.name;
@@ -1203,6 +1199,37 @@ class Session {
 				}
 			}
 		};
+		/**
+		 * Creates ordered fills for an already allocated mutable container.
+		 * Allocation and inline-prefix policy remain with each construction branch.
+		 * @param {CapturedNode} node
+		 * @param {string} name
+		 * @param {(child: Child) => boolean} available
+		 * @returns {{ source: Emission, ready: boolean }[]}
+		 */
+		const fill_entries = (node, name, available) => {
+			const children = node.children;
+			const keys = node.keys;
+			if (node.kind === 'Array') return children.map((child, i) => ({
+				source: join_sources([`${name}[${keys[i]}]=`, expression_child(child)]),
+				ready: available(child)
+			}));
+			if (node.kind === 'Object' || node.kind === 'NullObject') return children.map((child, i) => ({
+				source: join_sources([`${name}${prop(keys[i])}=`, expression_child(child)]),
+				ready: available(child)
+			}));
+			if (node.kind === 'Set') return children.map((child) => ({
+				source: join_sources([`${name}.add(`, expression_child(child), ')']),
+				ready: available(child)
+			}));
+			/** @type {{ source: Emission, ready: boolean }[]} */
+			const entries = [];
+			for (let i = 0; i < children.length; i += 2) entries.push({
+				source: join_sources([`${name}.set(`, expression_child(children[i]), ',', expression_child(children[i + 1]), ')']),
+				ready: available(children[i]) && available(children[i + 1])
+			});
+			return entries;
+		};
 		// Shells needed across back-edges exist before any atomic initializer. Their
 		// population still occurs at the shell's post-order position below.
 		for (const node of order) {
@@ -1233,27 +1260,7 @@ class Session {
 			/** @param {Child} child */
 			const available = (child) => latest_of(child) < limit;
 			if (name && node.early) {
-				/** @type {{ source: Emission, ready: boolean }[]} */
-				const entries = [];
-				switch (node.kind) {
-					case 'Array':
-						for (let i = 0; i < keys.length; i++) entries.push({ source: join_sources([`${name}[${keys[i]}]=`, expression_child(children[i])]), ready: available(children[i]) });
-						break;
-					case 'Object':
-					case 'NullObject':
-						for (let i = 0; i < keys.length; i++) entries.push({ source: join_sources([`${name}${prop(keys[i])}=`, expression_child(children[i])]), ready: available(children[i]) });
-						break;
-					case 'Set':
-						for (let i = 0; i < children.length; i++) entries.push({ source: join_sources([`${name}.add(`, expression_child(children[i]), ')']), ready: available(children[i]) });
-						break;
-					case 'Map':
-						for (let i = 0; i < children.length; i += 2) entries.push({
-							source: join_sources([`${name}.set(`, expression_child(children[i]), ',', expression_child(children[i + 1]), ')']),
-							ready: available(children[i]) && available(children[i + 1])
-						});
-						break;
-				}
-				populate(entries);
+				populate(fill_entries(node, name, available));
 			} else if (name) {
 				// A child can be embedded in this declaration if its expansion never reaches
 				// a name declared at or after this node; back-edges become fills instead.
@@ -1261,10 +1268,7 @@ class Session {
 					case 'Array': {
 						if (is_sparse(node)) {
 							declarations.push(`${name}=Array(${node.data})`);
-							populate(children.map((child, i) => ({
-								source: join_sources([`${name}[${keys[i]}]=`, expression_child(child)]),
-								ready: available(child)
-							})));
+							populate(fill_entries(node, name, available));
 							break;
 						}
 						/** @type {Emission[]} */
@@ -1302,10 +1306,7 @@ class Session {
 					}
 					case 'NullObject': {
 						declarations.push(`${name}=Object.create(null)`);
-						populate(children.map((child, i) => ({
-							source: join_sources([`${name}${prop(keys[i])}=`, expression_child(child)]),
-							ready: available(child)
-						})));
+						populate(fill_entries(node, name, available));
 						break;
 					}
 					case 'Set': {
@@ -1314,10 +1315,7 @@ class Session {
 							declarations.push(join_sources([`${name}=`, set_literal(children)]));
 						} else {
 							declarations.push(`${name}=new Set`);
-							populate(children.map((child) => ({
-								source: join_sources([`${name}.add(`, expression_child(child), ')']),
-								ready: available(child)
-							})));
+							populate(fill_entries(node, name, available));
 						}
 						break;
 					}
@@ -1326,13 +1324,7 @@ class Session {
 							declarations.push(join_sources([`${name}=`, map_literal(children)]));
 						} else {
 							declarations.push(`${name}=new Map`);
-							/** @type {{ source: Emission, ready: boolean }[]} */
-							const entries = [];
-							for (let i = 0; i < children.length; i += 2) entries.push({
-								source: join_sources([`${name}.set(`, expression_child(children[i]), ',', expression_child(children[i + 1]), ')']),
-								ready: available(children[i]) && available(children[i + 1])
-							});
-							populate(entries);
+							populate(fill_entries(node, name, available));
 						}
 						break;
 					}
@@ -1531,8 +1523,6 @@ class Session {
 			const block_start = this.#availability;
 			/** @type {Emission[]} */
 			const operations = [];
-			/** @type {Set<CapturedNode>} */
-			const references = new Set();
 			/** @type {Source[]} */
 			const close = [];
 			for (const event of events) {
@@ -1541,7 +1531,6 @@ class Session {
 			const node = source.node;
 			const available = this.#availability;
 			const retained_at = ++this.#availability;
-			references.add(node);
 			const target = reference_source(node, this.#reference_at(node, available)?.path);
 			const control = node.data.captured ? raw_source(`${block_session}.p[${node.data.pending}]`) : undefined;
 			const reference = {
@@ -1565,7 +1554,7 @@ class Session {
 					} else {
 						// Persistent: async outcomes must retain Map/Set element and opaque custom
 						// child identities for future regions, exactly like the head region.
-						const region = this.#emit_region(event.value, true, references, available, retained_at);
+						const region = this.#emit_region(event.value, true, available, retained_at);
 						this.#resolve_references(region, available);
 						const index = this.#anchor++;
 						const path = { kind: /** @type {const} */ ('anchor'), index, segments: [] };
@@ -1592,7 +1581,7 @@ class Session {
 						value_source = template_source(expression);
 					}
 				} else {
-					const region = this.#emit_region(event.value, true, references, available, retained_at);
+					const region = this.#emit_region(event.value, true, available, retained_at);
 					this.#resolve_references(region, available);
 					value_source = template_source(region);
 				}
@@ -1616,7 +1605,7 @@ class Session {
 				else operation = source.descriptor.error(reference, value_source);
 				if (!this.#is_active()) throw this.#terminal_reason();
 				if (!is_source(operation)) throw new TypeError(`Invalid async descriptor operation: ${event.type}() returned ${describe_received(operation)}. It must synchronously return a js tagged template containing client statements; use js\`\` for an empty operation.`);
-				const lowered = this.#lower_descriptor_source(operation, `async descriptor ${event.type}()`, retained_at, references);
+				const lowered = this.#lower_descriptor_source(operation, `async descriptor ${event.type}()`, retained_at);
 				if (materialization) operations.push(materialization);
 				operations.push(...lowered.prerequisites, source.immediate ? lowered.source : complete_statement_source(lowered.source));
 				if (lowered.checkpoint) this.#commit_transaction(lowered.checkpoint, false);
@@ -1645,7 +1634,7 @@ class Session {
 					if (!this.#is_active()) throw this.#terminal_reason();
 					if (!is_source(fallback)) throw new TypeError(`Invalid async descriptor operation: fallback ${source.type === 'sequence' ? 'error' : 'reject'}() returned ${describe_received(fallback)}. It must synchronously return a js tagged template containing client statements; use js\`\` for an empty operation.`);
 					const context = source.type === 'sequence' ? 'async descriptor fallback error()' : 'async descriptor fallback reject()';
-					const lowered = this.#lower_descriptor_source(fallback, context, retained_at, references);
+					const lowered = this.#lower_descriptor_source(fallback, context, retained_at);
 					operations.push(...lowered.prerequisites, source.immediate ? lowered.source : complete_statement_source(lowered.source));
 					if (lowered.checkpoint) this.#commit_transaction(lowered.checkpoint, false);
 					event.type = source.type === 'sequence' ? 'error' : 'reject';
@@ -1661,7 +1650,7 @@ class Session {
 				if (source.type === 'sequence' && event.type === 'error') close.push(source);
 			}
 			}
-			const rendered = this.#render_operations(operations, references, block_start, block_session);
+			const rendered = this.#render_operations(operations, block_start, block_session);
 			if (block && this.#active === 0 && this.#batch.length === 0) {
 				rendered.push(this.#cleanup_source());
 			}
@@ -1683,12 +1672,11 @@ class Session {
 	 * this batch, then retains those aliases as the nodes' shortest references.
 	 *
 	 * @param {Emission[]} operations
-	 * @param {Set<CapturedNode>} references
 	 * @param {number} available Paths committed before this batch began.
 	 * @param {string} session Generated client-session binding in this operation scope.
 	 * @returns {Emission[]}
 	 */
-	#render_operations(operations, references, available, session) {
+	#render_operations(operations, available, session) {
 		/** @type {Map<CapturedNode, number>} */
 		const uses = new Map();
 		for (const operation of operations) {
@@ -1699,10 +1687,9 @@ class Session {
 		}
 		/** @type {{ node: CapturedNode, path: ClientPath, uses: number }[]} */
 		const candidates = [];
-		for (const node of references) {
+		for (const [node, count] of uses) {
 			const reference = this.#reference_at(node, available)?.path;
 			if (!reference || reference.kind === 'slot') continue;
-			const count = uses.get(node) ?? 0;
 			if (count < 2) continue;
 			candidates.push({ node, path: reference, uses: count });
 		}
