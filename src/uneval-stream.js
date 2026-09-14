@@ -1086,8 +1086,8 @@ class Session {
 		const deferred_fill = [];
 		/** @type {Emission[]} */
 		const sidecars = [];
-		/** Best paths visited while retaining stable descendants from this region's sidecars. @type {Map<CapturedNode, number>} */
-		const sidecar_seen = new Map();
+		/** Best paths fully traversed while retaining stable descendants at this boundary. @type {Map<CapturedNode, number>} */
+		const retained_seen = new Map();
 		/** @type {Emission[]} */
 		const slots = [];
 		/**
@@ -1353,7 +1353,7 @@ class Session {
 					const index = this.#collection++;
 					sidecars.push(join_sources([`${this.#session_name}.c[${index}]=[`, join_sources(elements.map(expression_node), ','), ']']));
 					for (let i = 0; i < elements.length; i++) {
-						this.#assign_references_node(elements[i], { kind: 'collection', index, segments: [`[${i}]`] }, sidecar_seen, retained_at);
+						this.#assign_references_node(elements[i], { kind: 'collection', index, segments: [`[${i}]`] }, retained_seen, retained_at);
 					}
 				}
 			}
@@ -1369,7 +1369,7 @@ class Session {
 				/** @type {ClientPath} */
 				const reference = { kind: 'slot', index, segments: [] };
 				this.#reference_node(node, reference, retained_at);
-				this.#assign_references(node.value, reference, new Map(), retained_at);
+				this.#assign_references(node.value, reference, retained_seen, retained_at);
 			}
 		}
 		const statements = [

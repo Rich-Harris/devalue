@@ -209,6 +209,25 @@ test('keeps scalar Promise transaction copying proportional to changed state', (
 	}
 });
 
+test('keeps overlapping opaque-root retention proportional to captured nodes', () => {
+	const fixture = fileURLToPath(new URL('../fixtures/stream/retained-scaling.mjs', import.meta.url));
+	const child = spawnSync(process.execPath, [fixture, '100', '200', '400', '800'], {
+		encoding: 'utf8',
+		timeout: 30_000
+	});
+	assert.is(child.error, undefined, child.error?.stack);
+	assert.is(child.signal, null, child.stderr || child.stdout);
+	assert.is(child.status, 0, child.stderr || child.stdout);
+	const measurement = JSON.parse(child.stdout);
+	assert.is(measurement.fixture, 'ascending overlapping opaque chain with one pending Promise');
+	assert.equal(measurement.results.map((result) => result.count), [100, 200, 400, 800]);
+	for (const result of measurement.results) {
+		assert.ok(result.map_gets <= 80 * result.count + 1_000, JSON.stringify(measurement));
+		assert.is(result.slots, result.count, JSON.stringify(measurement));
+		assert.ok(result.bytes > 0);
+	}
+});
+
 test('preserves same-batch identities without reading paths before their event exists', async () => {
 	class Wrapper {
 		constructor(value) {
@@ -642,6 +661,138 @@ test('preserves custom child identity from the shared replacer session', async (
 	const { root } = await drain(result);
 	assert.is(calls, 1);
 	assert.is(root.shared, root.wrapped.value);
+});
+
+test('retains overlapping opaque descendants across root orders and availability boundaries', async () => {
+	class Wrapper {
+		constructor(value) {
+			this.value = value;
+		}
+	}
+	class Job {
+		constructor() {
+			this.ready = deferred();
+		}
+	}
+	for (const reverse of [false, true]) {
+		for (const streaming of [false, true]) {
+			const buffer = new Uint8Array([1, 2, 3, 4]).buffer;
+			const view = new Uint16Array(buffer);
+			const sparse = Array(4);
+			const null_object = Object.create(null);
+			const leaf = { label: 'leaf', sparse, null_object, view, buffer };
+			leaf.self = leaf;
+			sparse[2] = leaf;
+			null_object.leaf = leaf;
+			let node = leaf;
+			const nodes = [];
+			for (let i = 0; i < 12; i++) {
+				nodes.push(node);
+				node = { child: node };
+			}
+			const wrappers = nodes.map((value) => new Wrapper(value));
+			if (reverse) wrappers.reverse();
+			const index_by_node = new Map(nodes.map((value, index) => [value, index]));
+			const pending = streaming ? deferred() : undefined;
+			const later = streaming ? deferred() : undefined;
+			const job = streaming ? new Job() : undefined;
+			const input = streaming ? { wrappers, pending: pending.promise, later: later.promise, job } : { wrappers };
+			const result = await unevalStream(input, (value, js) => {
+				if (value instanceof Wrapper) return js`({value:${value.value}})`;
+				if (value instanceof Job) return {
+					type: 'async-value',
+					source: value.ready.promise,
+					construct: () => js`({value:null})`,
+					resolve: ({ target }) => js`${target}.value=${nodes[4]}`,
+					reject: () => js``
+				};
+			}, { id: `overlapping-opaque-${reverse}-${streaming}` });
+			const target = client();
+			const root = target.head(result.head);
+			if (streaming) {
+				pending.resolve(nodes[6]);
+				later.resolve(leaf);
+				job.ready.resolve(1);
+				for await (const block of result.tail) target.block(block);
+			}
+			const revived_by_node = [];
+			for (let i = 0; i < wrappers.length; i++) revived_by_node[index_by_node.get(wrappers[i].value)] = root.wrappers[i].value;
+			for (let i = 1; i < revived_by_node.length; i++) assert.is(revived_by_node[i].child, revived_by_node[i - 1]);
+			const revived_leaf = revived_by_node[0];
+			assert.is(revived_leaf.self, revived_leaf);
+			assert.is(revived_leaf.sparse[2], revived_leaf);
+			assert.is(revived_leaf.null_object.leaf, revived_leaf);
+			assert.is(revived_leaf.view.buffer, revived_leaf.buffer);
+			if (streaming) {
+				assert.is(await root.pending, revived_by_node[6]);
+				assert.is(await root.later, revived_leaf);
+				assert.is(root.job.value, revived_by_node[4]);
+			}
+		}
+	}
+});
+
+test('propagates a shorter opaque slot path after traversing a longer collection path', async () => {
+	class Wrapper {
+		constructor(value) {
+			this.value = value;
+		}
+	}
+	const pending = deferred();
+	const child = { retained: true };
+	const shared = { child };
+	const holder = { veryLongPropertyName: { anotherLongPropertyName: shared } };
+	const result = await unevalStream(
+		{ collection: new Set([holder]), wrapped: new Wrapper(shared), pending: pending.promise },
+		(value, js) => value instanceof Wrapper && js`({value:${value.value}})`,
+		{ id: 'shorter-opaque-path' }
+	);
+	const target = client();
+	const root = target.head(result.head);
+	pending.resolve(child);
+	const block = (await result.tail.next()).value;
+	assert.match(block, /\.s\[0\]\.child/);
+	assert.not.match(block, /veryLongPropertyName|anotherLongPropertyName/);
+	target.block(block);
+	assert.is(await root.pending, root.wrapped.value.child);
+	assert.is(root.wrapped.value, Array.from(root.collection)[0].veryLongPropertyName.anotherLongPropertyName);
+});
+
+test('retains overlapping opaque roots introduced by an outcome for same and later batches', async () => {
+	class Wrapper {
+		constructor(value) {
+			this.value = value;
+		}
+	}
+	for (const reverse of [false, true]) {
+		const introduced = deferred();
+		const same = deferred();
+		const later = deferred();
+		const leaf = { retained: true };
+		const parent = { child: leaf };
+		parent.self = parent;
+		const wrappers = [new Wrapper(leaf), new Wrapper(parent)];
+		if (reverse) wrappers.reverse();
+		const result = await unevalStream(
+			{ introduced: introduced.promise, same: same.promise, later: later.promise },
+			(value, js) => value instanceof Wrapper && js`({value:${value.value}})`,
+			{ id: `outcome-overlapping-opaque-${reverse}` }
+		);
+		const target = client();
+		const root = target.head(result.head);
+		introduced.resolve(wrappers);
+		same.resolve(leaf);
+		target.block((await result.tail.next()).value);
+		const revived = await root.introduced;
+		const revived_leaf = revived.find((wrapper) => wrapper.value.retained).value;
+		const revived_parent = revived.find((wrapper) => wrapper.value.child).value;
+		assert.is(revived_parent.child, revived_leaf);
+		assert.is(revived_parent.self, revived_parent);
+		assert.is(await root.same, revived_leaf);
+		later.resolve(leaf);
+		target.block((await result.tail.next()).value);
+		assert.is(await root.later, revived_leaf);
+	}
 });
 
 test('plans legacy custom emission synchronously and invokes replacers once', async () => {

@@ -180,6 +180,49 @@ function scalar_scaling_benchmark(count) {
 	};
 }
 
+/** @param {number} count */
+function retained_scaling_benchmark(count) {
+	let described = false;
+	const run = async () => {
+		let node = { leaf: 1 };
+		const nodes = [];
+		for (let i = 0; i < count; i++) {
+			nodes.push(node);
+			node = { child: node };
+		}
+		const pending = deferred();
+		const wrappers = nodes.map((value) => new Wrapper(value));
+		const result = await unevalStream(
+			{ wrappers, pending: pending.promise },
+			replacer,
+			{ id: 'retained-scaling' }
+		);
+		const root = Function(`return (${result.head})`)();
+		pending.resolve(nodes[Math.floor(count / 2)]);
+		let bytes = result.head.length;
+		for await (const block of result.tail) {
+			bytes += block.length;
+			Function(block)();
+		}
+		for (let i = 1; i < count; i++) {
+			if (root.wrappers[i].value.child !== root.wrappers[i - 1].value) throw new Error('retained scaling chain identity failed');
+		}
+		if (await root.pending !== root.wrappers[Math.floor(count / 2)].value) throw new Error('retained scaling outcome identity failed');
+		blackhole += bytes + wrappers.length;
+		if (!described) {
+			described = true;
+			console.log(`  ${process.version}; ascending overlapping opaque chain + pending Promise; N=${count}; generated=${bytes} bytes; warmup=1; median samples=3`);
+		}
+	};
+	return {
+		label: `unevalStream stream/retained scaling ${count}`,
+		async fn() {
+			await run();
+			return median_test(3, run);
+		}
+	};
+}
+
 /** @param {Awaited<ReturnType<typeof unevalStream>>} result */
 async function consume(result) {
 	blackhole += result.head.length;
@@ -206,6 +249,7 @@ const benchmarks = [
 	sync_benchmark('unevalStream custom/nested', custom_graph(), 100, replacer),
 	sync_benchmark('unevalStream custom/atomic cycle', atomic_graph(), 150, replacer),
 	...([100, 400, 1000, 4000].map(scalar_scaling_benchmark)),
+	...([100, 200, 400, 800].map(retained_scaling_benchmark)),
 	{
 		label: 'unevalStream stream/resolved head',
 		async fn() {

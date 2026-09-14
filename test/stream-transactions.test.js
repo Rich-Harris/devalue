@@ -224,4 +224,52 @@ test('continues cleanly after external and owned graph failures', async () => {
 	assert.equal(cancels, []);
 });
 
+test('keeps head-retained opaque descendants usable after an operation rollback', async () => {
+	class Wrapper {
+		constructor(value) {
+			this.value = value;
+		}
+	}
+	class Job {
+		constructor(ready, fails) {
+			this.ready = ready;
+			this.fails = fails;
+		}
+	}
+	const failed_gate = deferred();
+	const healthy_gate = deferred();
+	const failed = new Job(failed_gate, true);
+	const healthy = new Job(healthy_gate, false);
+	const leaf = { retained: true };
+	const parent = { child: leaf };
+	const reports = [];
+	const result = await unevalStream({
+		wrappers: [new Wrapper(leaf), new Wrapper(parent)],
+		failed,
+		healthy
+	}, (value, js) => {
+		if (value instanceof Wrapper) return js`({value:${value.value}})`;
+		if (!(value instanceof Job)) return;
+		return {
+			type: 'async-value',
+			source: value.ready.promise,
+			construct: () => js`({value:null})`,
+			resolve: ({ target }) => value.fails ? js`${{ invalid: () => {} }}` : js`${target}.value=${leaf}`,
+			reject: ({ target }) => js`${target}.value=${leaf}`
+		};
+	}, { id: 'opaque-operation-rollback', onerror: (error) => reports.push(error) });
+	const target = client();
+	const root = target.head(result.head);
+	failed_gate.resolve(1);
+	healthy_gate.resolve(2);
+	const block = (await result.tail.next()).value;
+	target.block(block);
+	assert.is(reports.length, 1);
+	assert.is(root.failed.value, root.wrappers[0].value);
+	assert.is(root.healthy.value, root.wrappers[0].value);
+	assert.is(root.wrappers[1].value.child, root.wrappers[0].value);
+	assert.match(block, /\.s\[0\]/);
+	assert.equal(await result.tail.next(), { done: true, value: undefined });
+});
+
 test.run();
