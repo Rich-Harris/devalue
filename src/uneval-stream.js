@@ -421,14 +421,27 @@ class Session {
 			}
 			if (result === undefined || result === null || result === false) {
 				// Explicitly the complete fallback set. Every other result is validated below.
-			} else if (typeof result === 'object' && Object.hasOwn(result, 'type') && result.type === 'async-value') {
-				const source = this.#validate_value_descriptor(result);
-				this.#add_source(node, result, 'value', false, source);
-				return true;
-			} else if (typeof result === 'object' && Object.hasOwn(result, 'type') && result.type === 'async-sequence') {
-				const source = this.#validate_sequence_descriptor(result);
-				this.#add_source(node, result, 'sequence', false, source);
-				return true;
+			} else if (typeof result === 'object') {
+				const has_type = Object.hasOwn(result, 'type');
+				if (!this.#is_active()) throw this.#terminal_reason();
+				if (!has_type) throw new TypeError(`Invalid unevalStream replacer result: received ${describe_received(result)}. Return a js tagged template, a descriptor with its own type of "async-value" or "async-sequence", or undefined, null, or false to serialize normally. The replacer must be synchronous; Promise results are not supported.`);
+				const type = result.type;
+				if (!this.#is_active()) throw this.#terminal_reason();
+				if (type === 'async-value') {
+					const source = this.#validate_value_descriptor(result);
+					if (!this.#is_active()) throw this.#terminal_reason();
+					this.#add_source(node, result, 'value', false, source);
+					return true;
+				}
+				const sequence_type = result.type;
+				if (!this.#is_active()) throw this.#terminal_reason();
+				if (sequence_type === 'async-sequence') {
+					const source = this.#validate_sequence_descriptor(result);
+					if (!this.#is_active()) throw this.#terminal_reason();
+					this.#add_source(node, result, 'sequence', false, source);
+					return true;
+				}
+				throw new TypeError(`Invalid unevalStream replacer result: received ${describe_received(result)}. Return a js tagged template, a descriptor with its own type of "async-value" or "async-sequence", or undefined, null, or false to serialize normally. The replacer must be synchronous; Promise results are not supported.`);
 			} else {
 				throw new TypeError(`Invalid unevalStream replacer result: received ${describe_received(result)}. Return a js tagged template, a descriptor with its own type of "async-value" or "async-sequence", or undefined, null, or false to serialize normally. The replacer must be synchronous; Promise results are not supported.`);
 			}
@@ -508,7 +521,9 @@ class Session {
 			capture_called = true;
 			return capture_source(pending, expression, immediate);
 		};
-		const source = descriptor.construct(control);
+		const construct = descriptor.construct;
+		if (!this.#is_active()) throw this.#terminal_reason();
+		const source = Reflect.apply(construct, descriptor, [control]);
 		if (!this.#is_active()) throw this.#terminal_reason();
 		if (!is_source(source)) throw new TypeError(`Invalid async descriptor construct result: construct() returned ${describe_received(source)}. It must synchronously return a js tagged template representing the client construction expression.`);
 		// Reserve the control index and provisional source before recursive hole discovery.
@@ -679,14 +694,17 @@ class Session {
 	 */
 	#validate_value_descriptor(descriptor) {
 		const source = descriptor.source;
+		if (!this.#is_active()) throw this.#terminal_reason();
 		if ((typeof source !== 'object' || source === null) && typeof source !== 'function') {
 			throw new TypeError(`Invalid async-value source: received ${describe_received(source)}. The source must be a Promise or a Promise-like object or function with a callable then method.`);
 		}
 		for (const key of ['construct', 'resolve', 'reject']) {
 			const method = descriptor[key];
+			if (!this.#is_active()) throw this.#terminal_reason();
 			if (typeof method !== 'function') throw new TypeError(`Invalid async-value ${key}: received ${describe_received(method)}. The descriptor must provide a ${key}() function.`);
 		}
 		const cancel = descriptor.cancel;
+		if (!this.#is_active()) throw this.#terminal_reason();
 		if (cancel !== undefined && typeof cancel !== 'function') {
 			throw new TypeError(`Invalid async-value cancel: received ${describe_received(cancel)}. Omit cancel or provide a cleanup function.`);
 		}
@@ -700,14 +718,17 @@ class Session {
 	 */
 	#validate_sequence_descriptor(descriptor) {
 		const source = descriptor.source;
+		if (!this.#is_active()) throw this.#terminal_reason();
 		if ((typeof source !== 'object' || source === null) && typeof source !== 'function') {
 			throw new TypeError(`Invalid async-sequence source: received ${describe_received(source)}. The source must be an async iterable with a callable Symbol.asyncIterator method.`);
 		}
 		for (const key of ['construct', 'next', 'complete', 'error']) {
 			const method = descriptor[key];
+			if (!this.#is_active()) throw this.#terminal_reason();
 			if (typeof method !== 'function') throw new TypeError(`Invalid async-sequence ${key}: received ${describe_received(method)}. The descriptor must provide a ${key}() function.`);
 		}
 		const cancel = descriptor.cancel;
+		if (!this.#is_active()) throw this.#terminal_reason();
 		if (cancel !== undefined && typeof cancel !== 'function') {
 			throw new TypeError(`Invalid async-sequence cancel: received ${describe_received(cancel)}. Omit cancel or provide a cleanup function.`);
 		}
@@ -748,12 +769,16 @@ class Session {
 			return;
 		}
 		try {
-			const then = source.descriptor.source.then;
+			const observed = source.descriptor.source;
+			if (!this.#is_active()) return;
+			const then = observed.then;
 			if (!this.#is_active()) return;
 			if (typeof then !== 'function') throw new TypeError('then is not callable');
+			const receiver = source.descriptor.source;
+			if (!this.#is_active()) return;
 			new Promise((resolve, reject) => {
 				try {
-					then.call(source.descriptor.source, resolve, reject);
+					Reflect.apply(then, receiver, [resolve, reject]);
 				} catch (error) {
 					reject(error);
 				}
@@ -774,10 +799,14 @@ class Session {
 	#start_sequence(source) {
 		source.acquiring = true;
 		try {
-			const method = source.descriptor.source[Symbol.asyncIterator];
+			const observed = source.descriptor.source;
+			if (!this.#is_active()) return this.#finish_acquisition(source);
+			const method = observed[Symbol.asyncIterator];
 			if (!this.#is_active()) return this.#finish_acquisition(source);
 			if (typeof method !== 'function') throw new TypeError('async iterator is not callable');
-			const iterator = method.call(source.descriptor.source);
+			const receiver = source.descriptor.source;
+			if (!this.#is_active()) return this.#finish_acquisition(source);
+			const iterator = Reflect.apply(method, receiver, []);
 			if ((typeof iterator !== 'object' || iterator === null) && typeof iterator !== 'function') {
 				throw new TypeError('async iterator is not an object');
 			}
@@ -1605,12 +1634,9 @@ class Session {
 			if (!value_source) throw this.#error('Cannot stringify value: an async outcome has no materialized client expression before operation generation (internal emitter error)', event.value);
 
 			try {
-				let operation;
-				if (event.type === 'resolve') operation = source.descriptor.resolve(reference, value_source);
-				else if (event.type === 'reject') operation = source.descriptor.reject(reference, value_source);
-				else if (event.type === 'next') operation = source.descriptor.next(reference, value_source);
-				else if (event.type === 'complete') operation = source.descriptor.complete(reference, value_source);
-				else operation = source.descriptor.error(reference, value_source);
+				const method = source.descriptor[event.type];
+				if (!this.#is_active()) throw this.#terminal_reason();
+				const operation = Reflect.apply(method, source.descriptor, [reference, value_source]);
 				if (!this.#is_active()) throw this.#terminal_reason();
 				if (!is_source(operation)) throw new TypeError(`Invalid async descriptor operation: ${event.type}() returned ${describe_received(operation)}. It must synchronously return a js tagged template containing client statements; use js\`\` for an empty operation.`);
 				const lowered = this.#lower_descriptor_source(operation, `async descriptor ${event.type}()`, retained_at);
@@ -1636,9 +1662,9 @@ class Session {
 						operations.push(`const ${local}=new Error("devalue: failed to serialize asynchronous value")`);
 						fallback_value = raw_source(local);
 					}
-					const fallback = source.type === 'sequence'
-						? source.descriptor.error(reference, fallback_value)
-						: source.descriptor.reject(reference, fallback_value);
+					const method = source.type === 'sequence' ? source.descriptor.error : source.descriptor.reject;
+					if (!this.#is_active()) throw this.#terminal_reason();
+					const fallback = Reflect.apply(method, source.descriptor, [reference, fallback_value]);
 					if (!this.#is_active()) throw this.#terminal_reason();
 					if (!is_source(fallback)) throw new TypeError(`Invalid async descriptor operation: fallback ${source.type === 'sequence' ? 'error' : 'reject'}() returned ${describe_received(fallback)}. It must synchronously return a js tagged template containing client statements; use js\`\` for an empty operation.`);
 					const context = source.type === 'sequence' ? 'async descriptor fallback error()' : 'async descriptor fallback reject()';

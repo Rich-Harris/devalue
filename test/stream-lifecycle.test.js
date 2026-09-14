@@ -317,6 +317,293 @@ test('abort during operation generation stops later callbacks', async () => {
 	assert.equal(calls, ['first']);
 });
 
+test('stops descriptor validation and construction after getter-triggered aborts', async () => {
+	{
+		const controller = new AbortController();
+		const reason = { trigger: 'descriptor discriminant presence' };
+		let type_reads = 0;
+		const descriptor = new Proxy({}, {
+			getOwnPropertyDescriptor(_target, key) {
+				if (key === 'type') controller.abort(reason);
+				return { configurable: true, enumerable: true, value: 'async-value' };
+			},
+			get(_target, key) {
+				if (key === 'type') type_reads++;
+			}
+		});
+		assert.is(await rejected(unevalStream({}, () => descriptor, { signal: controller.signal })), reason);
+		assert.is(type_reads, 0);
+	}
+	const cases = [
+		{ kind: 'value', trigger: 'type', expected: ['type'] },
+		{ kind: 'sequence', trigger: 'type', expected: ['type', 'type'] },
+		{ kind: 'value', trigger: 'source', expected: ['type', 'source'] },
+		{ kind: 'sequence', trigger: 'source', expected: ['type', 'type', 'source'] },
+		{ kind: 'value', trigger: 'resolve', expected: ['type', 'source', 'get:construct', 'get:resolve'] },
+		{ kind: 'sequence', trigger: 'next', expected: ['type', 'type', 'source', 'get:construct', 'get:next'] },
+		{ kind: 'value', trigger: 'cancel', expected: ['type', 'source', 'get:construct', 'get:resolve', 'get:reject', 'get:cancel'] },
+		{ kind: 'sequence', trigger: 'cancel', expected: ['type', 'type', 'source', 'get:construct', 'get:next', 'get:complete', 'get:error', 'get:cancel'] }
+	];
+	for (const current of cases) {
+		const controller = new AbortController();
+		const reason = { kind: current.kind, trigger: current.trigger };
+		const calls = [];
+		const descriptor = {};
+		Object.defineProperty(descriptor, 'type', {
+			enumerable: true,
+			get() {
+				calls.push('type');
+				if (current.trigger === 'type' && (current.kind === 'value' || calls.length === 2)) controller.abort(reason);
+				return current.kind === 'value' ? 'async-value' : 'async-sequence';
+			}
+		});
+		const promise = new Promise(() => {});
+		const iterable = { [Symbol.asyncIterator]() { return this; }, next() { return new Promise(() => {}); } };
+		Object.defineProperty(descriptor, 'source', {
+			enumerable: true,
+			get() {
+				calls.push('source');
+				if (current.trigger === 'source') controller.abort(reason);
+				return current.kind === 'value' ? promise : iterable;
+			}
+		});
+		const keys = current.kind === 'value'
+			? ['construct', 'resolve', 'reject']
+			: ['construct', 'next', 'complete', 'error'];
+		for (const key of keys) {
+			Object.defineProperty(descriptor, key, {
+				enumerable: true,
+				get() {
+					calls.push(`get:${key}`);
+					if (current.trigger === key) controller.abort(reason);
+					return () => { calls.push(`call:${key}`); };
+				}
+			});
+		}
+		Object.defineProperty(descriptor, 'cancel', {
+			enumerable: true,
+			get() {
+				calls.push('get:cancel');
+				if (current.trigger === 'cancel') controller.abort(reason);
+				return () => { calls.push('call:cancel'); };
+			}
+		});
+		assert.is(await rejected(unevalStream({}, () => descriptor, { signal: controller.signal })), reason);
+		assert.equal(calls, current.expected);
+	}
+});
+
+test('does not invoke a construct method acquired after nested cancellation', async () => {
+	const controller = new AbortController();
+	const gate = deferred();
+	const reason = { kind: 'construct getter abort' };
+	const calls = [];
+	class Outer {}
+	class Nested {}
+	const outer = new Outer();
+	const result = await unevalStream(outer, (value, js) => {
+		if (value === outer) return {
+			type: 'async-value', source: gate.promise,
+			construct: () => js`0`, resolve: (_reference, outcome) => js`${outcome}`,
+			reject: () => js``, cancel() { calls.push('outer:cancel'); }
+		};
+		if (value instanceof Nested) {
+			let reads = 0;
+			const descriptor = {
+				type: 'async-value', source: new Promise(() => {}),
+				resolve: () => js``, reject: () => js``,
+				cancel() { calls.push('nested:cancel'); }
+			};
+			Object.defineProperty(descriptor, 'construct', {
+				get() {
+					calls.push(`nested:get construct:${++reads}`);
+					if (reads === 2) controller.abort(reason);
+					return () => { calls.push('nested:construct'); return js`0`; };
+				}
+			});
+			return descriptor;
+		}
+	}, { signal: controller.signal });
+	const waiting = settled(result.tail.next());
+	gate.resolve(new Nested());
+	const outcome = await waiting;
+	assert.is(outcome.ok, false);
+	assert.is(outcome.reason, reason);
+	assert.equal(calls, ['nested:get construct:1', 'nested:get construct:2', 'outer:cancel']);
+});
+
+test('guards startup source, method, and receiver acquisition boundaries', async () => {
+	for (const kind of ['value', 'sequence']) {
+		for (const trigger of ['source', 'method', 'receiver']) {
+			const controller = new AbortController();
+			const reason = { kind, trigger };
+			const calls = [];
+			let tag;
+			let source_reads = 0;
+			const iterator = { next() { calls.push('pull'); return new Promise(() => {}); } };
+			const observed = {};
+			Object.defineProperty(observed, kind === 'value' ? 'then' : Symbol.asyncIterator, {
+				get() {
+					calls.push('method');
+					if (trigger === 'method') controller.abort(reason);
+					return function (resolve) {
+						calls.push('invoke');
+						if (kind === 'value') resolve(1);
+						else return iterator;
+					};
+				}
+			});
+			const descriptor = {
+				type: kind === 'value' ? 'async-value' : 'async-sequence',
+				construct: (_capture) => tag`0`,
+				resolve: () => tag``, reject: () => tag``,
+				next: () => tag``, complete: () => tag``, error: () => tag``,
+				cancel() { calls.push('cancel'); }
+			};
+			Object.defineProperty(descriptor, 'source', {
+				get() {
+					calls.push(`source:${++source_reads}`);
+					if ((trigger === 'source' && source_reads === 2) || (trigger === 'receiver' && source_reads === 3)) {
+						controller.abort(reason);
+					}
+					return observed;
+				}
+			});
+			assert.is(await rejected(unevalStream({}, (_value, js) => { tag = js; return descriptor; }, { signal: controller.signal })), reason);
+			const expected = trigger === 'source'
+				? ['source:1', 'source:2', 'cancel']
+				: trigger === 'method'
+					? ['source:1', 'source:2', 'method', 'cancel']
+					: ['source:1', 'source:2', 'method', 'source:3', 'cancel'];
+			assert.equal(calls, expected);
+		}
+	}
+});
+
+test('does not invoke operation or fallback methods acquired after cancellation', async () => {
+	for (const phase of ['resolve', 'reject', 'next', 'complete', 'error', 'fallback reject', 'fallback error']) {
+		const sequence = phase === 'next' || phase === 'complete' || phase === 'error' || phase === 'fallback error';
+		const fallback = phase.startsWith('fallback');
+		const method_name = fallback ? (sequence ? 'error' : 'reject') : phase;
+		const controller = new AbortController();
+		const reason = phase === 'resolve' ? 0 : { phase };
+		const gate = deferred();
+		const calls = [];
+		let tag;
+		let method_reads = 0;
+		let method_calls = 0;
+		let pulls = 0;
+		let returns = 0;
+		const iterable = {
+			[Symbol.asyncIterator]() { return this; },
+			next() { pulls++; return gate.promise; },
+			return() { returns++; return { done: true }; }
+		};
+		const descriptor = {
+			type: sequence ? 'async-sequence' : 'async-value',
+			source: sequence ? iterable : gate.promise,
+			construct: () => tag`0`,
+			resolve() { calls.push('resolve'); return fallback ? null : tag``; },
+			reject() { calls.push('reject'); return tag``; },
+			next() { calls.push('next'); return fallback ? null : tag``; },
+			complete() { calls.push('complete'); return tag``; },
+			error() { calls.push('error'); return tag``; },
+			cancel() { calls.push('cancel'); }
+		};
+		Object.defineProperty(descriptor, method_name, {
+			get() {
+				method_reads++;
+				if (method_reads === 2) controller.abort(reason);
+				const method = function () {
+					method_calls++;
+					return tag``;
+				};
+				Object.defineProperty(method, 'call', {
+					value: () => assert.unreachable('operation must not consult method.call')
+				});
+				return method;
+			}
+		});
+		const reports = [];
+		const result = await unevalStream({}, (_value, js) => { tag = js; return descriptor; }, {
+			signal: controller.signal,
+			onerror: (error) => reports.push(error)
+		});
+		const waiting = settled(result.tail.next());
+		if (!sequence) {
+			if (phase === 'reject') gate.reject({ phase });
+			else gate.resolve(1);
+		} else if (phase === 'error') {
+			gate.reject({ phase });
+		} else {
+			gate.resolve({ done: phase === 'complete', value: 1 });
+		}
+		const outcome = await waiting;
+		assert.is(outcome.ok, false);
+		assert.is(outcome.reason, reason);
+		assert.is(method_reads, 2);
+		assert.is(method_calls, 0);
+		assert.is(pulls, sequence ? 1 : 0);
+		assert.is(returns, sequence ? 1 : 0);
+		assert.is(calls.at(-1), 'cancel');
+		assert.is(reports.length, fallback ? 1 : 0);
+	}
+});
+
+test('preserves descriptor and startup receivers and source read stages', async () => {
+	for (const kind of ['value', 'sequence']) {
+		let tag;
+		let source_reads = 0;
+		let constructs = 0;
+		let operations = 0;
+		let method_receiver;
+		let operation_receiver;
+		let construct_receiver;
+		const iterator = {
+			next() { return { done: true, value: 1 }; }
+		};
+		const observed = {};
+		Object.defineProperty(observed, kind === 'value' ? 'then' : Symbol.asyncIterator, {
+			get() {
+				const method = function (resolve) {
+					method_receiver = this;
+					if (kind === 'value') resolve(1);
+					else return iterator;
+				};
+				Object.defineProperty(method, 'call', {
+					value: () => assert.unreachable('startup must not consult method.call')
+				});
+				return method;
+			}
+		});
+		const descriptor = {
+			type: kind === 'value' ? 'async-value' : 'async-sequence',
+			construct() { constructs++; construct_receiver = this; return tag`0`; },
+			resolve() { operations++; operation_receiver = this; return tag``; },
+			reject() { operations++; operation_receiver = this; return tag``; },
+			next() { operations++; operation_receiver = this; return tag``; },
+			complete() { operations++; operation_receiver = this; return tag``; },
+			error() { operations++; operation_receiver = this; return tag``; }
+		};
+		for (const key of ['construct', 'resolve', 'reject', 'next', 'complete', 'error']) {
+			Object.defineProperty(descriptor[key], 'call', {
+				value: () => assert.unreachable(`${key} must not consult method.call`)
+			});
+		}
+		Object.defineProperty(descriptor, 'source', {
+			get() { source_reads++; return observed; }
+		});
+		const result = await unevalStream({}, (_value, js) => { tag = js; return descriptor; });
+		for await (const _block of result.tail) {}
+		assert.is(source_reads, 3);
+		assert.is(constructs, 1);
+		assert.is(operations, 1);
+		assert.is(construct_receiver, descriptor);
+		assert.is(operation_receiver, descriptor);
+		assert.is(method_receiver, observed);
+	}
+});
+
 for (const phase of ['resolve', 'next', 'complete']) {
 	test(`does not invoke ${phase} fallback after onerror aborts`, async () => {
 		const controller = new AbortController();
