@@ -170,7 +170,9 @@ class Session {
 			// walk the graph and capture the synchronous values and the first layer of async sources
 			this.#capture(value, true);
 			this.#active = this.#sources.length;
-			if (!this.#is_active()) return await this.#throw_failure(undefined);
+      if (!this.#is_active()) {
+        await this.#throw_failure(undefined)
+      };
 
 			if (this.#sources.length === 0) {
 				const head = render_stream_source_with_names(this.#emit_region(value, false), [], 's', this.#render_identifier);
@@ -184,9 +186,12 @@ class Session {
 			this.#start_sources();
 			// Give newly started sources the same host-scheduled flush window used by tail
 			// batching. This is an operational scheduling window, not a task-count guarantee.
-			do await macrotask();
-			while (this.#flushing && this.#is_active());
-			if (!this.#is_active()) return await this.#throw_failure(undefined);
+      do {
+        await macrotask();
+      } while (this.#flushing && this.#is_active());
+      if (!this.#is_active()) {
+        await this.#throw_failure(undefined)
+      }
 
 			const head_region = this.#emit_region(value, true, 0, 0);
 			this.#assign_references(value, { kind: 'anchor', index: 0, segments: [] }, new Map(), 0);
@@ -258,8 +263,8 @@ class Session {
 	 * @returns {CapturedNode | undefined}
 	 */
 	#capture(value, root = false) {
-		// Primitive capture cannot append graph or source state. Validate it directly so
-		// common scalar outcomes do not open even a small graph transaction.
+		// Primitive capture cannot append graph or source state, so we can optimize here
+		// by directly analyzing it instead of opening a transaction like we normally would.
 		if (is_primitive(value)) {
 			let node;
 			try {
@@ -309,7 +314,10 @@ class Session {
 		};
 	}
 
-	/** @param {TransactionCheckpoint} checkpoint @param {boolean} commit_sources */
+	/**
+	 * @param {TransactionCheckpoint} checkpoint
+	 * @param {boolean} commit_sources
+	 */
 	#commit_transaction(checkpoint, commit_sources) {
 		if (commit_sources) {
 			for (let i = checkpoint.sources; i < this.#sources.length; i++) this.#sources[i].committed = true;
