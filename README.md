@@ -14,6 +14,7 @@ Like `JSON.stringify`, but handles
 - `Temporal`
 - custom types via replacers, reducers and revivers
 - promises (via `stringifyAsync`)
+- streamed promises and async iterables (via `unevalStream`)
 
 Try it out [here](https://svelte.dev/repl/138d70def7a748ce9eda736ef1c71239?version=3.49.0).
 
@@ -86,6 +87,135 @@ devalue.parse(stringified); // { quick: 'data', slow: { ... } }
 ```
 
 Promises are awaited and their resolved values are serialized. The output format is identical to `stringify`, so `parse` and `unflatten` work unchanged.
+
+### `unevalStream`
+
+`unevalStream` returns executable source before every asynchronous value has settled. Native Promises and ordinary AsyncIterables work without a replacer:
+
+```js
+import { unevalStream } from 'devalue';
+
+const { head, tail } = await unevalStream({
+	quick: 'data',
+	slow: fetch('/api/slow').then((response) => response.json())
+});
+
+const data = (0, eval)(`(${head})`);
+for await (const block of tail) (0, eval)(block);
+```
+
+`head` is a self-contained JavaScript expression whose result is the reconstructed root. Each value from `tail` is a self-contained statement beginning with `;`. Evaluate `head` once, then evaluate every tail block exactly once, in yield order, in the same global realm. Concatenation is also valid:
+
+```js
+const blocks = [];
+for await (const block of tail) blocks.push(block);
+const root = new Function(`const root=(${head});${blocks.join('')};return root`)();
+```
+
+The first ready asynchronous event schedules a zero-delay flush. Events observed before that callback runs are emitted as one ordered batch; already-settled events may therefore be included in `head`. This is an operational host-scheduling window, not a portable guarantee about exact task counts or boundaries. A flush makes the current batch eligible for delivery, but later events can still join it until the consumer takes it. Each source contributes at most one ready sequence item, and that source is pulled again only after its previous item is yielded in a tail batch or included in `head`.
+
+#### Immutable streaming graphs
+
+`unevalStream` is designed for finite, request-scoped hydration, not as an indefinitely running event bus. It retains captured graph nodes and enough client paths to preserve identity across the whole session. Server sequence pulling is bounded—there is at most one outstanding pull and one unconsumed ready item per source—but total memory is not necessarily bounded: unique identities are retained for the session, generated blocks may be buffered by the transport, and reconstructed native async iterators buffer yields until the application reads them. Callers must eventually finish or cancel the finite stream.
+
+From the first traversal until the server tail completes, the represented server graph must remain structurally and state immutable. From evaluating `head` until the tail completes and every delivered block has been evaluated, the reconstructed client graph has the same requirement. Do not change properties, array elements or lengths, Map or Set membership/order, buffers, views, built-in scalar state, or any other devalue-visible value. Devalue captures container edges and scalar reconstruction metadata during traversal. ArrayBuffer bytes are an exception: the captured byte data is a retained live view, not a copied snapshot, and is safe only under this immutable-input contract. The library does not deep-freeze values. A future capture-once design could copy bytes, but this API does not currently perform or promise that copy. On the client, application changes can invalidate retained identity paths; Promise settlement and descriptor-generated updates may mutate only the client targets they own.
+
+An object already captured by the session must not be mutated and reused as a later sequence item to represent a new state. Allocate a new object for each new state instead. Ordinary application mutation becomes unrestricted only after `tail` has completed, every delivered block—including the final block—has been evaluated, and no more transport delivery remains. Server completion alone is not sufficient.
+
+#### Namespacing and cancellation
+
+Active sessions are held in a private null-prototype table stored at `globalThis.__d` by default. The head initializes this table; applications must not initialize or replace it. Pass `options.scope` to use another trusted, assignable JavaScript expression, and `options.id` for a deterministic session key:
+
+```js
+const controller = new AbortController();
+const stream = await unevalStream(data, replacer, {
+	scope: 'globalThis.appStreams',
+	id: 'request-42',
+	signal: controller.signal
+});
+```
+
+`scope` is trusted source configuration, not data, and must resolve to the same table location for every block. Devalue owns that private namespace: if it is defined, it is assumed to be the null-prototype session table. Application replacement, corruption, deletion, or direct session access is unsupported. Deterministic `options.id` values must be unique among concurrent streams in the client realm; duplicates are unsupported and may overwrite a session. Automatically generated IDs are collision-resistant identifiers, not secrets.
+
+The tail is one-shot. `tail.return()` and `AbortSignal` cancellation synchronously stop accepting source events and starting new pulls. For every committed source, devalue initiates the sequence iterator's `return()` and then its descriptor `cancel()` before awaiting any cleanup result; each hook is invoked at most once. An explicit AbortSignal reason or source-generation failure remains the primary reason, including when it is `null`, `0`, `false`, or an empty string. Without such a reason, `tail.return()` reports the first cleanup failure in source-discovery order (`return()` before `cancel()` for one source) and reports secondary failures through `onerror`.
+
+Cleanup does not wait for an outstanding iterator `next()` merely to finish, and a source without `return()` cannot make cancellation wait on that pull. Devalue does await cleanup hooks it actually invokes, so cancellation can still remain pending if user cleanup never settles. In particular, a native async generator queues `return()` behind an in-flight `next()`; awaited work inside such a generator needs its own cooperative external cancellation mechanism. Native Promises themselves cannot be canceled, only ignored after termination.
+
+The tail behaves like an async generator: concurrent `tail.next()` calls settle in order, and once it has completed or thrown, further calls resolve `{ done: true }`. Successful completion immediately detaches server lifecycle listeners and never invokes cancellation hooks; this happens when the final block is delivered, without requiring another `tail.next()`. Normal exhaustion deletes the completed client session entry only when that final emitted block is evaluated; the owned empty table remains at `scope` for reuse.
+
+Generated blocks travel one way and have no client-to-server control channel. Cancellation, abort, a dropped transport, or an abandoned tail cannot execute pending client operations, while client-side `return()` cannot cancel server pulling. Removing the namespace entry identified by `id` can release that lookup entry after abandonment, but it does not settle reconstructed Promises or iterators and is not a disposal protocol. Use `tail.return()` or the stream's `AbortSignal` for cooperative server cancellation, and keep the transport alive until all required blocks have arrived and been evaluated. Future detached or independently disposable hydration is outside this API.
+
+Native AsyncIterables reconstruct as buffered `AsyncIterableIterator` values. Their `next()` calls may be concurrent and preserve server yield order. Buffered yields are delivered before the server's return value or error. That terminal outcome is delivered once—to the first `next()` after the yield queue empties—and later `next()` calls resolve `{ done: true, value: undefined }`. With several pending reads, yields settle them FIFO, the first remaining read receives the return value or error, and all other reads complete with `undefined`.
+
+Client-side `return(value)` and `throw(reason)` are local, including after a server terminal update has arrived. Both discard buffered yields and an unconsumed server outcome and make future `next()` calls complete with `undefined`. `return(value)` resolves pending reads as done with `undefined` and itself returns `{ done: true, value }`; `throw(reason)` rejects pending reads and itself with the exact reason. Repeated local close calls follow the same method-level result, while later generated updates are ignored. Generated blocks have no reverse channel, so local closure does not close the server iterator. Use `tail.return()` or the stream's `AbortSignal` to cancel server pulling and invoke the source iterator's `return()`.
+
+Reconstructed native Promises have an internal no-op rejection observer from construction time so a rejection delivered before application hydration handlers are attached does not become an unhandled rejection. The original Promise is returned unchanged and remains rejected with the original reason. This applies only to the built-in native Promise adapter, not custom descriptors.
+
+#### Custom asynchronous values
+
+A replacer receives a `js` template tag and may return a synchronous source fragment, an `AsyncValueDescriptor`, or an `AsyncSequenceDescriptor`. Ordinary template holes are serialized values; nested fragments created by `js` compose as source. This example adapts a nonthenable server object whose completion is Promise-like:
+
+```js
+class ServerJob {
+	constructor(completion) {
+		this.completion = completion;
+	}
+}
+
+class RemoteJob {
+	resolve(value) {
+		this.value = value;
+	}
+
+	reject(reason) {
+		this.error = reason;
+	}
+}
+
+const replacer = (value, js) => {
+	if (!(value instanceof ServerJob)) return;
+
+	return {
+		type: 'async-value',
+		source: value.completion,
+		construct: () => js`new RemoteJob()`,
+		resolve: ({ target }, payload) => js`${target}.resolve(${payload})`,
+		reject: ({ target }, reason) => js`${target}.reject(${reason})`
+	};
+};
+
+const { head, tail } = await unevalStream(new ServerJob(jobPromise), replacer);
+```
+
+`construct` returns one synchronous client expression and runs exactly once. It may call its `capture(expression)` argument zero or one times to store a private controller, subsequently available as `reference.control`. Ordinary values interpolated into the returned construction or its composed capture expression are serialized through the same session graph, so they preserve identity with the head, payloads, and later operations. `resolve` and `reject` receive the target reference and an already serialized source expression. Custom Promise-like sources are supported only through a descriptor; arbitrary thenables are not recognized automatically. The user replacer runs before native Promise recognition and can override it.
+
+AsyncIterables need no replacer when the client should receive a buffered async iterator. A descriptor can instead adapt one into a custom multi-shot client value:
+
+```js
+const sequenceReplacer = (value, js) => {
+	if (!value?.events) return;
+
+	return {
+		type: 'async-sequence',
+		source: value.events,
+		construct: () => js`new RemoteSequence()`,
+		next: ({ target }, item) => js`${target}.next(${item})`,
+		complete: ({ target }, result) => js`${target}.complete(${result})`,
+		error: ({ target }, reason) => js`${target}.error(${reason})`,
+		cancel: () => value.close()
+	};
+};
+```
+
+The iterable's yields, return value and failure are serialized through `next`, `complete` and `error`. Only one pull is outstanding and one ready item is unconsumed at a time. If a sequence fails or yields an unserializable value, its generated client error is delivered without waiting for the iterator's `return()`; a later close failure is observed and reported through `onerror`. This individual-sequence failure does not by itself invoke the descriptor's cancellation hook.
+
+Replacer results are strict: `undefined`, `null` and `false` mean no replacement; a fragment returned by `js` is a synchronous replacement; valid discriminated descriptors are asynchronous replacements; all other values, including raw strings, throw. Replacers are synchronous, not async, and run once per represented object. Fragment creation is lazy: values interpolated into fragments that are never returned or composed are not discovered.
+
+Descriptor constructors and operation callbacks return `js` fragments. A constructor fragment represents one expression; an operation fragment may contain statements. Their target, optional control, payload and reason arguments are themselves composable fragments. Every other hole is an ordinary value serialized once through the shared session graph before the constructor or operation uses it, including objects, arrays, collections, buffers/views, and nested asynchronous values supported by the replacer. Static template text is trusted executable JavaScript; interpolate dynamic values so devalue escapes and serializes them. Names such as `RemoteJob` and `RemoteSequence` in the examples must exist in the global realm where the generated source is evaluated. Client constructor or generated-operation failures are unrecoverable.
+
+Custom stream source is trusted and is not scope-analyzed. When a descriptor constructor or operation needs its own local, create it with `js.identifier()` and interpolate the same token at its declaration and references, including inside parameter lists, destructuring, nested fragments, or `capture(...)` expressions. The token receives one private spelling coordinated with devalue's generated stream bindings; distinct tokens receive distinct spellings. Do not inspect that spelling or write it into literal source. This avoids collisions with generated bindings but does not provide lexical hygiene for handwritten literal identifiers. Property names and serialized data are unaffected. See the [ordinary `uneval` example](#custom-types) for the same token pattern.
+
+Initial traversal, classification and construction-validation errors reject `unevalStream`. After an async boundary is established, an unserializable result transitions that client value to rejection/error using a generic Error; a serializable rejection reason retains graph identity. Failures in trusted `reject`/`error` operation generation terminate tail iteration and cancel server sources.
 
 ### `unflatten`
 

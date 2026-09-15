@@ -52,7 +52,10 @@ export interface JavaScriptTag {
 	(strings: TemplateStringsArray, ...values: unknown[]): JavaScriptSource;
 	/**
 	 * Creates a reusable generated identifier for interpolation into trusted JavaScript source.
-	 * Reusing the token preserves its name; the generated spelling is private.
+	 * Reusing the token preserves its name; the generated spelling is private and coordinated with
+	 * serializer bindings. Stream descriptor constructors and operations should use these tokens for
+	 * local declarations and references when collision freedom from generated bindings is required.
+	 * Literal source remains trusted and is not scope-analyzed.
 	 */
 	identifier(): JavaScriptSource;
 }
@@ -66,6 +69,230 @@ export type UnevalReplacer = (
 	value: unknown,
 	js: JavaScriptTag
 ) => JavaScriptSource | false | null | void;
+
+/** JavaScript source references for a reconstructed async value and its optional private control. */
+export interface ClientReference {
+	/**
+	 * The source expression for "the whole thing" created by the `construct`. For example, if
+	 * `construct` returned `new Promise()`, `target` would be the source expression that evaluates to
+	 * that promise.
+	 */
+	target: JavaScriptSource;
+	/**
+	 * The source expression for the expression passed to the `capture` callback of `construct`. For example,
+	 * if `construct` was:
+	 *
+	 * ```js
+	 * (capture) =>
+	 * 	js`new Promise((resolve, reject) => { ${capture(js`[resolve, reject]`)} })`
+	 * ```
+	 *
+	 * ...this would be the source expression that evaluates to the captured `[resolve, reject]` tuple.
+   */
+	control?: JavaScriptSource;
+}
+
+/**
+ * Describes how to serialize an asynchronous value. `source` is the value
+ * represented as a `Promise`. The built-in native Promise adapter immediately attaches a no-op
+ * rejection observer to its reconstructed Promise, but returns that original Promise unchanged so
+ * application handlers still receive the original rejection. Custom descriptors are not observed.
+ */
+export interface AsyncValueDescriptor<T = unknown> {
+	type: 'async-value';
+	/** A Promise-like representation of the asynchronous value. */
+	source: PromiseLike<T>;
+	/**
+	 * To serialize an asynchronous value, `unevalStream` needs a way to synchronously construct its
+	 * unresolved client representation. To do this, it calls `construct`. For a native Promise,
+	 * `construct` looks like this:
+	 *
+	 * ```ts
+	 * (capture) =>
+	 * 	js`new Promise((resolve, reject) => { ${capture(js`[resolve, reject]`)} })`
+	 * ```
+	 *
+	 * This creates a synchronously constructed unresolved Promise. `capture` accepts an expression
+	 * (in this case, `[resolve, reject]`), then replaces it with an equivalent expression that _also_
+	 * stashes the result of the expression so that it can be passed back to `resolve` and `reject` as
+	 * `reference.control`. `construct` returns one client expression. Ordinary values interpolated in
+	 * that returned fragment, including its composed capture expression, are serialized through the
+	 * same session graph; fragments created but not returned or composed remain undiscovered.
+	 */
+	construct(capture: (expression: JavaScriptSource) => JavaScriptSource): JavaScriptSource;
+	/**
+	 * When `source` resolves, `unevalStream` needs to generate code that uses the serialized server
+	 * value to resolve the client value. It calls `resolve` with a reference to the value returned by
+	 * `construct`, the private control stashed by `capture`, and the source expression for the resolved
+	 * value. For a native Promise, `resolve` looks like this:
+	 *
+	 * ```ts
+	 * ({ control }, valueSource) => js`${control}[0](${valueSource})`
+	 * ```
+	 *
+	 * The result is equivalent to `resolve(expression)`: `control` is the array captured in
+	 * `construct`, so index 0 contains the client `resolve` function, and `valueSource` evaluates to
+	 * the value that the server `source` resolved to.
+	 */
+	resolve(reference: ClientReference, valueSource: JavaScriptSource): JavaScriptSource;
+	/**
+	 * When `source` rejects, `unevalStream` calls `reject` to generate code that rejects the client
+	 * value with the serialized server reason. It receives the same references as `resolve`, plus the
+	 * source expression for the rejection reason. For a native Promise, `reject` looks like this:
+	 *
+	 * ```ts
+	 * ({ control }, reasonSource) => js`${control}[1](${reasonSource})`
+	 * ```
+	 *
+	 * The result is equivalent to `reject(expression)`: index 1 of the captured control contains the
+	 * client `reject` function, and `reasonSource` evaluates to the reason from the server.
+	 */
+	reject(reference: ClientReference, reasonSource: JavaScriptSource): JavaScriptSource;
+	/**
+	 * Optional server-side cancellation cleanup. Devalue invokes this at most once for explicit
+	 * `tail.return()` or AbortSignal cancellation, but not after successful completion.
+	 */
+	cancel?(): void | Promise<void>;
+}
+
+/**
+ * Describes how to serialize an asynchronous sequence. The native AsyncIterable adapter constructs
+ * a buffered client `AsyncIterableIterator`, captures a private function that updates its buffer,
+ * then calls that function as the server iterator yields, returns, or throws. Custom descriptors can
+ * use the same lifecycle with any synchronous client representation. The native adapter delivers
+ * buffered yields FIFO, then delivers the server return value or exact error once; subsequent reads
+ * complete with `undefined`. Local `return(value)` and `throw(reason)` discard buffered and terminal
+ * server state, settle pending reads with done/undefined or the exact reason respectively, and ignore
+ * later updates. They cannot close the server source because generated blocks have no reverse channel.
+ */
+export interface AsyncSequenceDescriptor<T = unknown, TReturn = unknown> {
+	type: 'async-sequence';
+	/**
+	 * The server-only sequence. `unevalStream` acquires its async iterator and pulls one value at a
+	 * time, but never serializes the source or iterator themselves. The third generic is `unknown`:
+	 * generated client updates provide no reverse-channel values to `next(value)`.
+	 */
+	source: AsyncIterable<T, TReturn, unknown>;
+	/**
+	 * Returns the source expression that synchronously constructs the client sequence before any
+	 * values are pulled from `source`. The native adapter creates a buffered `AsyncIterableIterator`
+	 * and uses `capture` to retain its private update function. In schematic form, it looks like this:
+	 *
+	 * ```ts
+	 * (capture) => {
+	 * 	const controlSource = capture(
+	 * 		js`(type, value) => updateBufferedIterator(type, value)`
+	 * 	);
+	 *	return js`createBufferedAsyncIterator(${controlSource})`;
+	 * }
+	 * ```
+	 *
+	 * `capture` stashes the update function and evaluates to that same function. It is subsequently
+	 * available to `next`, `complete`, and `error` as `reference.control`.
+	 */
+	construct(capture: (expression: JavaScriptSource) => JavaScriptSource): JavaScriptSource;
+	/**
+	 * Called for each value yielded by the server iterator. `valueSource` is the source expression for
+	 * that serialized value. The native adapter calls its captured control with opcode 0, which queues
+	 * the value or resolves a pending client `next()` call:
+	 *
+	 * ```ts
+	 * ({ control }, valueSource) => js`${control}(0,${valueSource})`
+	 * ```
+	 *
+	 * For example, this may generate `s.p[0](0,s.a[1])`, delivering the value retained at `s.a[1]`.
+	 */
+	next(reference: ClientReference, valueSource: JavaScriptSource): JavaScriptSource;
+	/**
+	 * Called when the server iterator returns. `returnValueSource` is the source expression for the
+	 * serialized return value, or `void 0` when none is available. The native adapter calls its control
+	 * with opcode 1, which marks the client iterator complete and resolves pending `next()` calls:
+	 *
+	 * ```ts
+	 * ({ control }, returnValueSource) => js`${control}(1,${returnValueSource})`
+	 * ```
+	 */
+	complete(reference: ClientReference, returnValueSource: JavaScriptSource): JavaScriptSource;
+	/**
+	 * Called when acquiring or pulling the server iterator fails. `reasonSource` is the source
+	 * expression for the serialized error reason. The native adapter calls its control with opcode 2,
+	 * which marks the client iterator failed and rejects pending `next()` calls:
+	 *
+	 * ```ts
+	 * ({ control }, reasonSource) => js`${control}(2,${reasonSource})`
+	 * ```
+	 */
+	error(reference: ClientReference, reasonSource: JavaScriptSource): JavaScriptSource;
+	/**
+	 * Optional server-side cancellation cleanup. This does not generate client source. On explicit
+	 * `tail.return()` or AbortSignal cancellation, devalue initiates `iterator.return()` and then this
+	 * hook, without awaiting one source before notifying the next. Each is invoked at most once. A
+	 * sequence event failure closes the iterator diagnostically but does not invoke this hook by itself.
+	 */
+	cancel?(): void | Promise<void>;
+}
+
+/**
+ * A synchronous replacer compatible with `uneval`, extended with one-shot and sequence descriptors.
+ * `undefined`, `null`, and `false` mean no replacement. Replacers must not be async. A synchronous
+ * replacement might return `js` source such as ``js`new Point(${value.x},${value.y})` ``.
+ */
+export type UnevalStreamReplacer = (
+	value: unknown,
+	js: JavaScriptTag
+) => JavaScriptSource | AsyncValueDescriptor | AsyncSequenceDescriptor | false | null | void;
+
+/** Configures the shared client session table, session ID, and server-side cancellation signal. */
+export interface UnevalStreamOptions {
+	/**
+	 * Trusted assignable JavaScript expression for the private session table. The default is
+	 * `globalThis.__d`; it must resolve to the same location for every block.
+	 */
+	scope?: string;
+	/**
+	 * Optional deterministic per-stream key. It must be unique among concurrent streams in the
+	 * client realm; duplicate caller-supplied IDs are unsupported and may overwrite a session.
+	 * A collision-resistant key is generated otherwise.
+	 */
+	id?: string;
+	/**
+	 * Cancels server-side observation and sequence pulling. The exact signal reason is authoritative,
+	 * including falsy reasons. Cleanup is cooperative: invoked return/cancel hooks are awaited, but an
+	 * outstanding `next()` is not, and native async generators may queue return behind that pull.
+	 */
+	signal?: AbortSignal;
+	/**
+	 * Diagnostic callback for recoverable failures the stream survives: an asynchronous
+	 * outcome that cannot be serialized (replaced by a generic client-side error; receives the
+	 * failure and the unserializable outcome), a failed sequence's nonblocking `return()` failure,
+	 * or cleanup failures secondary to an authoritative cancellation/generation reason (cleanup
+	 * diagnostics receive the failure and source). Exceptions thrown by the callback are ignored.
+	 */
+	onerror?: (error: unknown, value: unknown) => void;
+}
+
+/**
+ * A one-shot iterator of executable statement blocks for finite hydration. Evaluate every block in
+ * yield order. Pulling is bounded per source, but the transport and client may buffer delivered data.
+ */
+export interface UnevalStreamTail extends AsyncIterableIterator<string> {
+	[Symbol.asyncIterator](): UnevalStreamTail;
+	return(): Promise<IteratorResult<string, void>>;
+}
+
+/**
+ * Executable source for the initial graph plus the iterator that applies asynchronous updates.
+ * Identity paths and captured graph nodes are retained for the finite session. Inputs and reconstructed
+ * state must remain immutable until the tail completes and every delivered block has been evaluated.
+ */
+export interface UnevalStreamResult {
+	/** Self-contained JavaScript expression, for example `({answer:42})`. */
+	head: string;
+	/** Executable statement blocks such as `;(()=>{s.p[0][0](42)})()`. */
+	tail: UnevalStreamTail;
+	/** Session key such as `request-42`, useful for explicit cleanup after transport abandonment. */
+	id: string;
+}
 
 /**
  * The introspection/extraction operations `stringify` performs on the value

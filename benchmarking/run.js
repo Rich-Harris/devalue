@@ -1,4 +1,5 @@
 import typed_array_benchmarks from './benchmarks/typed-array.js';
+import uneval_stream_benchmarks from './benchmarks/uneval-stream.js';
 
 // e.g. `pnpm bench typedarray` to only run the typedarray benchmarks
 const filters = process.argv.slice(2);
@@ -10,6 +11,10 @@ const suites = [
 	{
 		name: 'TypedArray benchmarks',
 		benchmarks: typed_array_benchmarks.filter(filter_fn)
+	},
+	{
+		name: 'unevalStream benchmarks',
+		benchmarks: uneval_stream_benchmarks.filter(filter_fn)
 	}
 ].filter((suite) => suite.benchmarks.length > 0);
 
