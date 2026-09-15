@@ -136,11 +136,72 @@ If a function passed to `stringify` returns a truthy value, it's treated as a ma
 You can also use custom types with `uneval` by specifying a custom replacer:
 
 ```js
-devalue.uneval(vector, (value, uneval) => {
+devalue.uneval(vector, (value, js) => {
 	if (value instanceof Vector) {
-		return `new Vector(${value.x},${value.y})`;
+		return js`new Vector(${value.x},${value.y})`;
 	}
 }); // `new Vector(30,40)`
+```
+
+The replacer must return a source created with the supplied `js` tag, or `undefined`, `null` or `false` to serialize the value normally. Each value "hole" is recursively serialized. Create local bindings with `js.identifier()` so they cannot collide with generated names, and interpolate the returned identifier wherever that binding is declared or referenced:
+
+```js
+devalue.uneval(vector, (value, js) => {
+	if (value instanceof Vector) {
+		const result = js.identifier();
+		return js`(()=>{const ${result}=new Vector(${value.x},${value.y});return ${result}})()`;
+	}
+});
+```
+
+Repeated interpolation of one identifier token uses the same generated name, while separate tokens use separate names.
+
+In most cases, cyclic references are supported, but some rare direct custom dependencies are not, and will throw an error. For example:
+
+```js
+class Atomic {
+	constructor() {
+		this.other = undefined;
+	}
+}
+
+const a = new Atomic();
+const b = new Atomic();
+
+a.other = b;
+b.other = a;
+
+uneval(a, (value, js) => {
+	if (value instanceof Atomic) {
+		return js`Object.assign(new Atomic(), { other: ${value.other} })`;
+	}
+});
+```
+Here, a and b are the original Atomic instances being serialized. Reconstructing them would conceptually require:
+
+```js
+const a = Object.assign(new Atomic(), { other: b });
+const b = Object.assign(new Atomic(), { other: a });
+```
+
+Neither initializer can run first because each needs the other's final identity, and because `devalue` can't know how to construct an `Atomic`, it can't allocate it first and then assign to `other`.
+
+In contrast, moving the cycle through a native serialized object provides an allocatable shell:
+
+```js
+const container = {};
+const a = new Atomic();
+
+a.other = container;
+container.owner = a;
+```
+
+This can be reconstructed in phases:
+
+```js
+const container = {};
+const a = Object.assign(new Atomic(), { other: container });
+container.owner = a;
 ```
 
 Note that any variables referenced in the resulting JavaScript (like `Vector` in the example above) must be in scope when it runs.

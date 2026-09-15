@@ -922,15 +922,15 @@ const fixtures = {
 		{
 			name: 'Custom type',
 			value: [instance, instance],
-			js: '(function(a){return [a,a]}(new Foo({bar:new Bar({answer:42})})))',
+			js: '(function(a){return [a,a]}((new Foo({bar:(new Bar({answer:42})\n)})\n)))',
 			json: '[[1,1],["Foo",2],{"bar":3},["Bar",4],{"answer":5},42]',
-			replacer: (value, uneval) => {
+			replacer: (value, js) => {
 				if (value instanceof Foo) {
-					return `new Foo(${uneval(value.value)})`;
+					return js`new Foo(${value.value})`;
 				}
 
 				if (value instanceof Bar) {
-					return `new Bar(${uneval(value.value)})`;
+					return js`new Bar(${value.value})`;
 				}
 			},
 			// test for https://github.com/Rich-Harris/devalue/pull/80
@@ -955,9 +955,9 @@ const fixtures = {
 		{
 			name: 'Custom fallback',
 			value: date,
-			js: "new Date('')",
+			js: "(new Date('')\n)",
 			json: '[["Date",""]]',
-			replacer: (value) => value instanceof Date && `new Date('')`,
+			replacer: (value, js) => value instanceof Date && js`new Date('')`,
 			reducers: {
 				Date: (value) => value instanceof Date && ''
 			},
@@ -985,12 +985,11 @@ const fixtures = {
 			{
 				name: 'Function wrapped in custom type',
 				value: new FunctionRef(testFn),
-				js: 'new FunctionRef((x) => x * 2)',
+				js: '(new FunctionRef((x) => x * 2)\n)',
 				json: '[["FunctionRef",1],"(x) => x * 2"]',
-				replacer: (value, uneval) => {
+				replacer: (value, js) => {
 					if (value instanceof FunctionRef) {
-						// Serialize the function code directly as a string
-						return `new FunctionRef(${value.fn.toString()})`;
+						return js`new FunctionRef((x) => x * 2)`;
 					}
 				},
 				reducers: {
@@ -1018,12 +1017,11 @@ const fixtures = {
 			{
 				name: 'Function in nested structure',
 				value: { fn: testFn, nested: { data: 42 } },
-				js: '{fn:(x) => x * 2,nested:{data:42}}',
+				js: '{fn:((x) => x * 2\n),nested:{data:42}}',
 				json: '[{"fn":1,"nested":3},["FunctionRef",2],"(x) => x * 2",{"data":4},42]',
-				replacer: (value, uneval) => {
+				replacer: (value, js) => {
 					if (typeof value === 'function') {
-						// Serialize the function code directly
-						return value.toString();
+						return js`(x) => x * 2`;
 					}
 				},
 				reducers: {
@@ -1059,6 +1057,508 @@ for (const [name, tests] of Object.entries(fixtures)) {
 	}
 	test.run();
 }
+
+const custom_source_test = uvu.suite('uneval: custom source');
+custom_source_test('preserves identities referenced by custom source', () => {
+	class Wrapper {
+		constructor(inner) {
+			this.inner = inner;
+		}
+	}
+	const shared = { hello: 'world' };
+	const source = uneval({ wrapped: new Wrapper(shared), shared }, (value, js) =>
+		value instanceof Wrapper ? js`new Wrapper(${value.inner})` : undefined
+	);
+	const result = eval(source);
+	assert.is(result.wrapped.inner, result.shared);
+});
+custom_source_test('generates collision-free custom source identifiers', () => {
+	class Wrapper {
+		constructor(inner, total) {
+			this.inner = inner;
+			this.total = total;
+		}
+	}
+
+	const container = {};
+	const wrapper = new Wrapper(container, 0);
+	container.wrapper = wrapper;
+	const source = uneval([wrapper, wrapper, container], (value, js) => {
+		if (value instanceof Wrapper) {
+			const a = js.identifier();
+			const o0 = js.identifier();
+			const result = js.identifier();
+			return js`(()=>{const ${a}=1,${o0}=2;const read=({value:${result}},${a})=>${result}+${a};return new Wrapper(${value.inner},read({value:${o0}},${a}))})()`;
+		}
+	});
+	const result = vm.runInNewContext(source, { Wrapper });
+
+	assert.ok(source.startsWith('(function(b){var a;'));
+	assert.ok(source.includes('const c=1,d=2;const read=({value:e},c)=>e+c'));
+	assert.is(result[0], result[1]);
+	assert.is(result[0].inner, result[2]);
+	assert.is(result[0].inner.wrapper, result[0]);
+	assert.is(result[0].total, 3);
+
+	class Marker {}
+	const left = {};
+	const right = {};
+	left.peer = right;
+	right.peer = left;
+	const cycle_source = uneval([left, new Marker()], (value, js) => {
+		if (!(value instanceof Marker)) return;
+		const local = js.identifier();
+		return js`(()=>{const ${local}=42;return ${local}})()`;
+	});
+	const cycle = vm.runInNewContext(cycle_source);
+	assert.ok(cycle_source.startsWith('(function(a,b)'));
+	assert.ok(cycle_source.includes('const c=42;return c'));
+	assert.is(cycle[0].peer.peer, cycle[0]);
+	assert.is(cycle[1], 42);
+});
+custom_source_test('constructs a repeated wrapper after its shared child is populated', () => {
+	class Wrapper {
+		static calls = 0;
+
+		constructor(inner) {
+			Wrapper.calls += 1;
+			this.inner = inner;
+			this.answer = inner.answer;
+		}
+	}
+
+	const child = { answer: 42 };
+	const wrapper = new Wrapper(child);
+	Wrapper.calls = 0;
+	let replacer_calls = 0;
+	const source = uneval([wrapper, wrapper, child], (value, js) => {
+		if (value instanceof Wrapper) {
+			replacer_calls += 1;
+			return js`new Wrapper(${value.inner})`;
+		}
+	});
+	const result = vm.runInNewContext(source, { Wrapper });
+
+	assert.ok(source.startsWith('(function(b){var a;'));
+	assert.ok(source.endsWith('}({}))'));
+	assert.is(replacer_calls, 1);
+	assert.is(Wrapper.calls, 1);
+	assert.is(result[0], result[1]);
+	assert.is(result[0].inner, result[2]);
+	assert.is(result[0].answer, 42);
+});
+custom_source_test('orders nested custom dependencies', () => {
+	class Inner {
+		static calls = 0;
+
+		constructor(value) {
+			Inner.calls += 1;
+			this.value = value;
+		}
+	}
+	class Outer {
+		static calls = 0;
+
+		constructor(inner) {
+			Outer.calls += 1;
+			this.inner = inner;
+			this.answer = inner.value.answer;
+		}
+	}
+
+	const child = { answer: 42 };
+	const inner = new Inner(child);
+	const outer = new Outer(inner);
+	Inner.calls = 0;
+	Outer.calls = 0;
+	const replacer_calls = new Map();
+	const source = uneval([outer, outer, inner, inner, child], (value, js) => {
+		if (value instanceof Outer) {
+			replacer_calls.set(value, (replacer_calls.get(value) ?? 0) + 1);
+			return js`new Outer(${value.inner})`;
+		}
+		if (value instanceof Inner) {
+			replacer_calls.set(value, (replacer_calls.get(value) ?? 0) + 1);
+			return js`new Inner(${value.value})`;
+		}
+	});
+	const result = vm.runInNewContext(source, { Inner, Outer });
+
+	assert.is(replacer_calls.get(inner), 1);
+	assert.is(replacer_calls.get(outer), 1);
+	assert.is(Inner.calls, 1);
+	assert.is(Outer.calls, 1);
+	assert.is(result[0], result[1]);
+	assert.is(result[0].inner, result[2]);
+	assert.is(result[2], result[3]);
+	assert.is(result[2].value, result[4]);
+	assert.is(result[0].answer, 42);
+});
+custom_source_test('finds custom dependencies inside inline containers', () => {
+	class Inner {
+		static calls = 0;
+
+		constructor(value) {
+			Inner.calls += 1;
+			this.value = value;
+		}
+	}
+	class Outer {
+		static calls = 0;
+
+		constructor(options) {
+			Outer.calls += 1;
+			this.inner = options.inner;
+			this.answer = options.inner.value.answer;
+		}
+	}
+
+	const inner = new Inner({ answer: 42 });
+	const outer = new Outer({ inner });
+	Inner.calls = 0;
+	Outer.calls = 0;
+	const source = uneval([outer, outer, inner], (value, js) => {
+		if (value instanceof Outer) return js`new Outer(${{ inner: value.inner }})`;
+		if (value instanceof Inner) return js`new Inner(${value.value})`;
+	});
+	const result = vm.runInNewContext(source, { Inner, Outer });
+
+	assert.is(Inner.calls, 1);
+	assert.is(Outer.calls, 1);
+	assert.is(result[0], result[1]);
+	assert.is(result[0].inner, result[2]);
+	assert.is(result[0].answer, 42);
+});
+custom_source_test('preserves a child used by multiple source holes', () => {
+	class Pair {
+		constructor(left, right) {
+			this.left = left;
+			this.right = right;
+		}
+	}
+
+	const child = { answer: 42 };
+	const source = uneval(new Pair(child, child), (value, js) =>
+		value instanceof Pair ? js`new Pair(${value.left},${value.right})` : undefined
+	);
+	const result = vm.runInNewContext(source, { Pair });
+
+	assert.is(result.left, result.right);
+	assert.is(result.left.answer, 42);
+});
+custom_source_test('keeps dependency-free custom constructions in IIFE arguments', () => {
+	class Wrapper {}
+
+	const wrapper = new Wrapper();
+	const source = uneval([wrapper, wrapper], (value, js) =>
+		value instanceof Wrapper ? js`new Wrapper()` : undefined
+	);
+
+	assert.is(source, '(function(a){return [a,a]}((new Wrapper()\n)))');
+	const result = vm.runInNewContext(source, { Wrapper });
+	assert.is(result[0], result[1]);
+});
+custom_source_test('orders a shared typed view after its backing buffer', () => {
+	class Wrapper {
+		static calls = 0;
+
+		constructor(view, buffer) {
+			Wrapper.calls += 1;
+			this.view = view;
+			this.buffer = buffer;
+			this.first = view[0];
+		}
+	}
+
+	const view = new Uint8Array([1, 2, 3]);
+	const wrapper = new Wrapper(view, view.buffer);
+	Wrapper.calls = 0;
+	let replacer_calls = 0;
+	const source = uneval([wrapper, wrapper, view, view.buffer], (value, js) => {
+		if (value instanceof Wrapper) {
+			replacer_calls += 1;
+			return js`new Wrapper(${value.view},${value.buffer})`;
+		}
+	});
+	const result = vm.runInNewContext(source, { Wrapper });
+
+	assert.is(replacer_calls, 1);
+	assert.is(Wrapper.calls, 1);
+	assert.is(result[0], result[1]);
+	assert.is(result[0].view, result[2]);
+	assert.is(result[2].buffer, result[3]);
+	assert.is(result[0].buffer, result[3]);
+	assert.is(result[0].first, 1);
+});
+custom_source_test('reconstructs custom cycles through mutable containers', () => {
+	class Wrapper {
+		static calls = 0;
+
+		constructor(inner) {
+			Wrapper.calls += 1;
+			this.inner = inner;
+		}
+	}
+
+	const container = {};
+	const wrapper = new Wrapper(container);
+	container.wrapper = wrapper;
+	Wrapper.calls = 0;
+	let replacer_calls = 0;
+	const source = uneval(wrapper, (value, js) => {
+		if (value instanceof Wrapper) {
+			replacer_calls += 1;
+			return js`new Wrapper(${value.inner})`;
+		}
+	});
+	const result = vm.runInNewContext(source, { Wrapper });
+
+	assert.is(replacer_calls, 1);
+	assert.is(Wrapper.calls, 1);
+	assert.is(result.inner.wrapper, result);
+});
+custom_source_test('preserves property order around cyclic references', () => {
+	class Marker {}
+
+	for (const prototype of [Object.prototype, null]) {
+		for (const position of ['first', 'middle', 'last']) {
+			const value = Object.create(prototype);
+			const completed = { done: true };
+			if (position !== 'first') value.before = completed;
+			value.self = value;
+			if (position !== 'last') value.after = 42;
+
+			const source = uneval([value, new Marker()], (item, js) =>
+				item instanceof Marker ? js`new Marker()` : undefined
+			);
+			const [result] = vm.runInNewContext(source, { Marker });
+			const expected = [
+				...(position === 'first' ? [] : ['before']),
+				'self',
+				...(position === 'last' ? [] : ['after'])
+			];
+
+			assert.equal(Object.keys(result), expected);
+			assert.is(result.self, result);
+			if (position !== 'first') assert.is(result.before.done, true);
+		}
+	}
+});
+custom_source_test('preserves Map and Set order around cyclic references', () => {
+	class Marker {}
+
+	for (const position of ['first', 'middle', 'last']) {
+		const completed = { done: true };
+		const map = new Map();
+		if (position !== 'first') map.set('before', completed);
+		map.set('self', map);
+		if (position !== 'last') map.set('after', 42);
+
+		const set = new Set();
+		if (position !== 'first') set.add(completed);
+		set.add(set);
+		if (position !== 'last') set.add(42);
+
+		const source = uneval([map, set, new Marker()], (item, js) =>
+			item instanceof Marker ? js`new Marker()` : undefined
+		);
+		const [result_map, result_set] = vm.runInNewContext(source, { Marker });
+		const map_entries = Array.from(result_map);
+		const set_values = Array.from(result_set);
+
+		assert.equal(
+			map_entries.map(([key]) => key),
+			[...(position === 'first' ? [] : ['before']), 'self', ...(position === 'last' ? [] : ['after'])]
+		);
+		assert.is(map_entries[position === 'first' ? 0 : 1][1], result_map);
+		assert.is(set_values[position === 'first' ? 0 : 1], result_set);
+		if (position !== 'first') {
+			assert.is(map_entries[0][1].done, true);
+			assert.is(set_values[0].done, true);
+		}
+		if (position !== 'last') {
+			assert.is(map_entries.at(-1)[1], 42);
+			assert.is(set_values.at(-1), 42);
+		}
+	}
+});
+custom_source_test('preserves order in mutual and custom cycles', () => {
+	class Wrapper {
+		constructor(inner) {
+			this.inner = inner;
+			this.before = inner.before.done;
+		}
+	}
+
+	const left = {};
+	const right = {};
+	left.peer = right;
+	left.tail = 'left';
+	right.peer = left;
+	right.tail = 'right';
+
+	const container = {};
+	container.before = { done: true };
+	const wrapper = new Wrapper(container);
+	container.wrapper = wrapper;
+	container.tail = 42;
+
+	const source = uneval([left, right, wrapper], (item, js) =>
+		item instanceof Wrapper ? js`new Wrapper(${item.inner})` : undefined
+	);
+	const [result_left, result_right, result_wrapper] = vm.runInNewContext(source, { Wrapper });
+
+	assert.equal(Object.keys(result_left), ['peer', 'tail']);
+	assert.equal(Object.keys(result_right), ['peer', 'tail']);
+	assert.is(result_left.peer, result_right);
+	assert.is(result_right.peer, result_left);
+	assert.equal(Object.keys(result_wrapper.inner), ['before', 'wrapper', 'tail']);
+	assert.is(result_wrapper.inner.wrapper, result_wrapper);
+	assert.is(result_wrapper.before, true);
+	assert.is(result_wrapper.inner.tail, 42);
+});
+custom_source_test('rejects cycles made entirely of custom constructions', () => {
+	class Atomic {
+		constructor() {
+			this.other = undefined;
+		}
+	}
+
+	const a = new Atomic();
+	const b = new Atomic();
+	a.other = b;
+	b.other = a;
+	const self = new Atomic();
+	self.other = self;
+	for (const value of [a, self]) {
+		assert.throws(
+			() =>
+				uneval(value, (item, js) =>
+					item instanceof Atomic
+						? js`Object.assign(new Atomic(),{other:${item.other}})`
+						: undefined
+				),
+			(error) =>
+				error.name === 'DevalueError' &&
+				error.message === 'Cannot stringify a circular chain of atomic values'
+		);
+	}
+});
+custom_source_test('accepts only documented fallback values', () => {
+	for (const fallback of [undefined, null, false]) {
+		assert.is(uneval({ answer: 42 }, () => fallback), '{answer:42}');
+	}
+
+	for (const invalid of ['', 0, 1, true, Promise.resolve(), {}]) {
+		assert.throws(
+			() => uneval({ answer: 42 }, () => invalid),
+			(error) => error instanceof TypeError && error.message === 'Invalid uneval replacer result'
+		);
+	}
+});
+custom_source_test('treats replacer results as expressions', () => {
+	class Replacement {
+		constructor(source) {
+			this.source = source;
+		}
+	}
+
+	const comma = new Replacement('comma');
+	const conditional = new Replacement('conditional');
+	const object = new Replacement('object');
+	const nested = new Replacement('nested');
+	const escaped = new Replacement('escaped');
+	const slashes = new Replacement('slashes');
+	const block = new Replacement('block');
+	const partial = new Replacement('partial');
+	const source = uneval(
+		[comma, conditional, object, nested, escaped, slashes, block, partial],
+		(value, js) => {
+			if (!(value instanceof Replacement)) return;
+			switch (value.source) {
+				case 'comma':
+					return js`1,2`;
+				case 'conditional':
+					return js`false?1:2`;
+				case 'object':
+					return js`{answer:42}`;
+				case 'nested':
+					return js`${js`Math.max(`}${1},${2}${js`)`}`;
+				case 'escaped':
+					return js`${'</script>'}`;
+				case 'slashes':
+					return js`"https://example.com//path"`;
+				case 'block':
+					return js`/* before */ ({answer:42}) /* after */`;
+				case 'partial':
+					return js`${js`(()=>{ // comment from a partial fragment`}${js`\nreturn `}${42}${js`;})()`}`;
+			}
+		}
+	);
+	const result = vm.runInNewContext(source);
+
+	assert.is(result.length, 8);
+	assert.is(result[0], 2);
+	assert.is(result[1], 2);
+	assert.is(result[2].answer, 42);
+	assert.is(result[3], 2);
+	assert.is(result[4], '</script>');
+	assert.is(result[5], 'https://example.com//path');
+	assert.is(result[6].answer, 42);
+	assert.is(result[7], 42);
+	assert.ok(!source.includes('</script>'));
+});
+custom_source_test('terminates complete custom expressions after line comments', () => {
+	class Replacement {
+		constructor(value) {
+			this.value = value;
+		}
+	}
+
+	const root_source = uneval(new Replacement(42), (value, js) =>
+		value instanceof Replacement ? js`({value:${value.value}}) // root comment` : undefined
+	);
+	const root = vm.runInNewContext(root_source);
+	assert.is(root.value, 42);
+
+	const argument = new Replacement(1);
+	const child = { answer: 42 };
+	const initializer = new Replacement(child);
+	const nested_source = uneval(
+		[argument, argument, initializer, initializer, child],
+		(value, js) =>
+			value instanceof Replacement
+				? js`({value:${value.value}}) // nested comment`
+				: undefined
+	);
+	const nested = vm.runInNewContext(nested_source);
+	assert.is(nested[0], nested[1]);
+	assert.is(nested[0].value, 1);
+	assert.is(nested[2], nested[3]);
+	assert.is(nested[2].value, nested[4]);
+	assert.is(nested[4].answer, 42);
+});
+custom_source_test('groups a root object-literal replacement', () => {
+	class Replacement {}
+
+	const source = uneval(new Replacement(), (value, js) =>
+		value instanceof Replacement ? js`{answer:42}` : undefined
+	);
+	assert.is(source, '({answer:42}\n)');
+	assert.is(vm.runInNewContext(source).answer, 42);
+});
+custom_source_test('requires js to be used as a tagged template', () => {
+	for (const invoke of [
+		(js) => js('new Date()'),
+		(js) => js(['new Date()'])
+	]) {
+		assert.throws(
+			() => uneval(new Date(), (value, js) => value instanceof Date ? invoke(js) : undefined),
+			'`js` must be used as a tagged template, but was called as a regular function'
+		);
+	}
+});
+custom_source_test.run();
 
 for (const [name, tests] of Object.entries(fixtures)) {
 	const test = uvu.suite(`stringify: ${name}`);
@@ -1948,6 +2448,7 @@ circularCustomTypes.run();
 		const value = { a: shared, b: shared.slice() };
 
 		const serialized = uneval(value);
+		assert.ok(serialized.includes('arguments[0]'));
 		const roundtripped = new Function('return ' + serialized)();
 
 		assert.equal(roundtripped.a.length, 70000);
@@ -1955,6 +2456,22 @@ circularCustomTypes.run();
 		assert.equal(roundtripped.a[69999].i, 69999);
 		// the two arrays share object identity
 		assert.ok(roundtripped.a[123] === roundtripped.b[123]);
+	});
+
+	test('packs oversized custom-graph IIFE arguments into one array', () => {
+		class Marker {}
+		const shared = Array.from({ length: 65536 }, (_, i) => ({ i }));
+		const marker = new Marker();
+		const value = { a: shared, b: shared.slice(), marker };
+
+		const serialized = uneval(value, (item, js) =>
+			item instanceof Marker ? js`({custom:true})` : undefined
+		);
+		assert.ok(serialized.includes('arguments[0]'));
+		const roundtripped = new Function('return ' + serialized)();
+
+		assert.is(roundtripped.a[65535], roundtripped.b[65535]);
+		assert.is(roundtripped.marker.custom, true);
 	});
 
 	test.run();
