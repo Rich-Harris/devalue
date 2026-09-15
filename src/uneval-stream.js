@@ -424,11 +424,11 @@ class Session {
 			} else if (typeof result === 'object') {
 				const has_type = Object.hasOwn(result, 'type');
 				if (!this.#is_active()) throw this.#terminal_reason();
-				if (!has_type) throw new TypeError(`Invalid unevalStream replacer result: received ${describe_received(result)}. Return a js tagged template, a descriptor with its own type of "async-value" or "async-sequence", or undefined, null, or false to serialize normally. The replacer must be synchronous; Promise results are not supported.`);
+				if (!has_type) throw this.#invalid_replacer_result(result);
 				const type = result.type;
 				if (!this.#is_active()) throw this.#terminal_reason();
 				if (type === 'async-value') {
-					const source = this.#validate_value_descriptor(result);
+					const source = this.#validate_descriptor(result, 'async-value', ['construct', 'resolve', 'reject']);
 					if (!this.#is_active()) throw this.#terminal_reason();
 					this.#add_source(node, result, 'value', false, source);
 					return true;
@@ -436,14 +436,14 @@ class Session {
 				const sequence_type = result.type;
 				if (!this.#is_active()) throw this.#terminal_reason();
 				if (sequence_type === 'async-sequence') {
-					const source = this.#validate_sequence_descriptor(result);
+					const source = this.#validate_descriptor(result, 'async-sequence', ['construct', 'next', 'complete', 'error']);
 					if (!this.#is_active()) throw this.#terminal_reason();
 					this.#add_source(node, result, 'sequence', false, source);
 					return true;
 				}
-				throw new TypeError(`Invalid unevalStream replacer result: received ${describe_received(result)}. Return a js tagged template, a descriptor with its own type of "async-value" or "async-sequence", or undefined, null, or false to serialize normally. The replacer must be synchronous; Promise results are not supported.`);
+				throw this.#invalid_replacer_result(result);
 			} else {
-				throw new TypeError(`Invalid unevalStream replacer result: received ${describe_received(result)}. Return a js tagged template, a descriptor with its own type of "async-value" or "async-sequence", or undefined, null, or false to serialize normally. The replacer must be synchronous; Promise results are not supported.`);
+				throw this.#invalid_replacer_result(result);
 			}
 		}
 
@@ -599,6 +599,14 @@ class Session {
 			const bindings = new Map();
 			/** @type {Emission[]} */
 			const prerequisites = [];
+			// Every root in this operation lowers at the same `retained_at` boundary, so a
+			// single scratch map can prune best-path traversal across them. #assign_references_node
+			// records every visited node's reference before the seen check, so an equal-or-longer
+			// path never hides an improvement while a strictly shorter path still retraverses and
+			// replaces the descendants' records. The map is local to this operation: later events
+			// and region retention use their own fresh scratch at their own boundaries.
+			/** @type {Map<CapturedNode, number>} */
+			const seen = new Map();
 			// Arbitrary descriptor payloads are materialized immediately before these
 			// prerequisites, so their retained identities already exist at this event boundary.
 			for (const entry of entries) {
@@ -615,7 +623,7 @@ class Session {
 					this.#resolve_references(region, retained_at);
 					const index = this.#anchor++;
 					const path = { kind: /** @type {const} */ ('anchor'), index, segments: [] };
-					this.#assign_references(node.value, path, new Map(), retained_at);
+					this.#assign_references(node.value, path, seen, retained_at);
 					expression = join_sources([`${this.#session_name}.a[${index}]=`, region]);
 				}
 				const local = this.#next_name();
@@ -687,51 +695,37 @@ class Session {
 	}
 
 	/**
-	 * Validates the synchronous shape of a one-shot async descriptor without observing its source.
+	 * Validates the synchronous shape of an async descriptor without observing its source.
 	 *
 	 * @param {any} descriptor
+	 * @param {'async-value' | 'async-sequence'} type
+	 * @param {string[]} methods Required descriptor methods in source-then-method access order.
 	 */
-	#validate_value_descriptor(descriptor) {
+	#validate_descriptor(descriptor, type, methods) {
 		const source = descriptor.source;
 		if (!this.#is_active()) throw this.#terminal_reason();
 		if ((typeof source !== 'object' || source === null) && typeof source !== 'function') {
-			throw new TypeError(`Invalid async-value source: received ${describe_received(source)}. The source must be a Promise or a Promise-like object or function with a callable then method.`);
+			const requirement = type === 'async-value'
+				? 'The source must be a Promise or a Promise-like object or function with a callable then method.'
+				: 'The source must be an async iterable with a callable Symbol.asyncIterator method.';
+			throw new TypeError(`Invalid ${type} source: received ${describe_received(source)}. ${requirement}`);
 		}
-		for (const key of ['construct', 'resolve', 'reject']) {
+		for (const key of methods) {
 			const method = descriptor[key];
 			if (!this.#is_active()) throw this.#terminal_reason();
-			if (typeof method !== 'function') throw new TypeError(`Invalid async-value ${key}: received ${describe_received(method)}. The descriptor must provide a ${key}() function.`);
+			if (typeof method !== 'function') throw new TypeError(`Invalid ${type} ${key}: received ${describe_received(method)}. The descriptor must provide a ${key}() function.`);
 		}
 		const cancel = descriptor.cancel;
 		if (!this.#is_active()) throw this.#terminal_reason();
 		if (cancel !== undefined && typeof cancel !== 'function') {
-			throw new TypeError(`Invalid async-value cancel: received ${describe_received(cancel)}. Omit cancel or provide a cleanup function.`);
+			throw new TypeError(`Invalid ${type} cancel: received ${describe_received(cancel)}. Omit cancel or provide a cleanup function.`);
 		}
 		return source;
 	}
 
-	/**
-	 * Validates the synchronous shape of an async sequence descriptor without acquiring an iterator.
-	 *
-	 * @param {any} descriptor
-	 */
-	#validate_sequence_descriptor(descriptor) {
-		const source = descriptor.source;
-		if (!this.#is_active()) throw this.#terminal_reason();
-		if ((typeof source !== 'object' || source === null) && typeof source !== 'function') {
-			throw new TypeError(`Invalid async-sequence source: received ${describe_received(source)}. The source must be an async iterable with a callable Symbol.asyncIterator method.`);
-		}
-		for (const key of ['construct', 'next', 'complete', 'error']) {
-			const method = descriptor[key];
-			if (!this.#is_active()) throw this.#terminal_reason();
-			if (typeof method !== 'function') throw new TypeError(`Invalid async-sequence ${key}: received ${describe_received(method)}. The descriptor must provide a ${key}() function.`);
-		}
-		const cancel = descriptor.cancel;
-		if (!this.#is_active()) throw this.#terminal_reason();
-		if (cancel !== undefined && typeof cancel !== 'function') {
-			throw new TypeError(`Invalid async-sequence cancel: received ${describe_received(cancel)}. Omit cancel or provide a cleanup function.`);
-		}
-		return source;
+	/** @param {unknown} result @returns {TypeError} */
+	#invalid_replacer_result(result) {
+		return new TypeError(`Invalid unevalStream replacer result: received ${describe_received(result)}. Return a js tagged template, a descriptor with its own type of "async-value" or "async-sequence", or undefined, null, or false to serialize normally. The replacer must be synchronous; Promise results are not supported.`);
 	}
 
 	/** Starts every committed source unless the constructor's AbortSignal listener has cancelled the session. */
@@ -868,6 +862,10 @@ class Session {
 						throw new TypeError('async iterator result is not an object');
 					}
 					const done = result.done;
+					// A done getter can synchronously cancel the session, which closes the
+					// iterator and invokes descriptor cancellation before the value is read.
+					// The iterator is then closed, so its value must not be observed.
+					if (source.terminal || !this.#is_active()) return;
 					const value = result.value;
 					this.#event(source, done ? 'complete' : 'next', value);
 				} catch (error) {

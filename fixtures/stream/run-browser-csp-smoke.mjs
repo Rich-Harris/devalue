@@ -118,12 +118,22 @@ function first_line(state) {
 	});
 }
 
+function completed_within(operation, milliseconds) {
+	let timer;
+	return Promise.race([
+		operation,
+		new Promise((resolve) => {
+			timer = setTimeout(() => resolve(false), milliseconds);
+		})
+	]).finally(() => clearTimeout(timer));
+}
+
 async function terminate(state) {
 	if (!state || state.result) return;
 	state.child.kill('SIGTERM');
-	if (await Promise.race([state.completion.then(() => true), delay(1_500).then(() => false)])) return;
+	if (await completed_within(state.completion.then(() => true), 1_500)) return;
 	state.child.kill('SIGKILL');
-	if (!await Promise.race([state.completion.then(() => true), delay(1_500).then(() => false)])) {
+	if (!await completed_within(state.completion.then(() => true), 1_500)) {
 		throw new Error(`${state.label} did not exit after SIGKILL`);
 	}
 }
@@ -293,19 +303,16 @@ try {
 } finally {
 	cdp?.close();
 	const cleanup = await Promise.allSettled([...children].reverse().map(terminate));
-	const profile_cleanup = await Promise.allSettled([rm(profile, { recursive: true, force: true })]);
-	const process_evidence = [];
+	const operations = [rm(profile, { recursive: true, force: true })];
 	if (test_process_file && browser) {
-		if (browser.result && !browser.result.error) {
-			process_evidence.push(await Promise.resolve(writeFile(test_process_file, JSON.stringify({
+		operations.push(browser.result && !browser.result.error
+			? writeFile(test_process_file, JSON.stringify({
 				pid: browser.child.pid,
 				exit: { code: browser.result.code, signal: browser.result.signal }
-			}))).then(() => ({ status: 'fulfilled' }), (reason) => ({ status: 'rejected', reason })));
-		} else {
-			process_evidence.push({ status: 'rejected', reason: new Error('Chrome process exit was not observed') });
-		}
+			}))
+			: Promise.reject(new Error('Chrome process exit was not observed')));
 	}
-	const failures = [...cleanup, ...profile_cleanup, ...process_evidence].filter((result) => result.status === 'rejected');
+	const failures = [...cleanup, ...await Promise.allSettled(operations)].filter((result) => result.status === 'rejected');
 	if (primary_error) {
 		for (const failure of failures) console.error(`browser smoke cleanup failed: ${failure.reason?.stack ?? failure.reason}`);
 	} else if (failures.length > 0) {

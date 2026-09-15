@@ -223,6 +223,58 @@ function retained_scaling_benchmark(count) {
 	};
 }
 
+/** @param {number} count */
+function operation_holes_scaling_benchmark(count) {
+	let described = false;
+	const run = async () => {
+		const nodes = [];
+		let chain;
+		for (let i = 0; i < count; i++) {
+			const node = { index: i, child: chain };
+			nodes.push(node);
+			chain = node;
+		}
+		const pending = deferred();
+		const job = {};
+		const result = await unevalStream(job, (value, js) => value === job && ({
+			type: 'async-value',
+			source: pending.promise,
+			construct: () => js`({children:[]})`,
+			resolve: (reference) => {
+				let operation;
+				for (let i = 0; i < count; i++) {
+					const push = js`${reference.target}.children.push(${nodes[i]})`;
+					operation = i === 0 ? push : js`${operation};${push}`;
+				}
+				return operation;
+			},
+			reject: () => js``
+		}), { id: `operation-holes-scaling-${count}` });
+		const root = Function(`return (${result.head})`)();
+		pending.resolve(undefined);
+		let bytes = result.head.length;
+		for await (const block of result.tail) {
+			bytes += block.length;
+			Function(block)();
+		}
+		for (let i = 0; i < count; i++) {
+			if (root.children[i].child !== (i === 0 ? undefined : root.children[i - 1])) throw new Error('operation holes chain identity failed');
+		}
+		blackhole += bytes + nodes.length;
+		if (!described) {
+			described = true;
+			console.log(`  ${process.version}; ascending overlapping ordinary roots in one descriptor operation; N=${count}; generated=${bytes} bytes; warmup=1; median samples=3`);
+		}
+	};
+	return {
+		label: `unevalStream stream/op holes scaling ${count}`,
+		async fn() {
+			await run();
+			return median_test(3, run);
+		}
+	};
+}
+
 /** @param {Awaited<ReturnType<typeof unevalStream>>} result */
 async function consume(result) {
 	blackhole += result.head.length;
@@ -250,6 +302,7 @@ const benchmarks = [
 	sync_benchmark('unevalStream custom/atomic cycle', atomic_graph(), 150, replacer),
 	...([100, 400, 1000, 4000].map(scalar_scaling_benchmark)),
 	...([100, 200, 400, 800].map(retained_scaling_benchmark)),
+	...([100, 200, 400, 800].map(operation_holes_scaling_benchmark)),
 	{
 		label: 'unevalStream stream/resolved head',
 		async fn() {
