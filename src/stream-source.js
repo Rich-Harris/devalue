@@ -57,12 +57,18 @@ export function expression_source(source) {
 	return typeof source === 'string' ? `(${source})` : instruction_source(brand({ type: 'expression', source }));
 }
 
-/** Protects generated closing syntax after a complete user expression. @param {Emission} source */
+/**
+ * Protects generated closing syntax after a complete user expression.
+ * @param {Emission} source
+ */
 export function complete_expression_source(source) {
 	return typeof source === 'string' ? `(${source}\n)` : instruction_source(brand({ type: 'expression', source, complete: true }));
 }
 
-/** Protects generated separators and closing syntax after a complete user operation. @param {Emission} source */
+/**
+ * Protects generated separators and closing syntax after a complete user operation.
+ * @param {Emission} source
+ */
 export function complete_statement_source(source) {
 	return join_sources([source, '\n']);
 }
@@ -83,7 +89,10 @@ export function promise_source(pending) {
 	return instruction_source(brand({ type: 'promise', pending }));
 }
 
-/** Marks the position where definitions for this final source are emitted. @returns {JavaScriptSource} */
+/**
+ * Marks the position where definitions for this final source are emitted.
+ * @returns {JavaScriptSource}
+ */
 export function definitions_source() {
 	return instruction_source(brand({ type: 'definitions' }));
 }
