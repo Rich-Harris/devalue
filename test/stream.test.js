@@ -232,6 +232,131 @@ test('keeps overlapping opaque-root retention proportional to captured nodes', (
 	}
 });
 
+test('keeps descriptor-root best-path traversal proportional to operation holes', () => {
+	const fixture = fileURLToPath(new URL('../fixtures/stream/operation-holes-scaling.mjs', import.meta.url));
+	const child = spawnSync(process.execPath, [fixture, '100', '200', '400', '800'], {
+		encoding: 'utf8',
+		timeout: 30_000
+	});
+	assert.is(child.error, undefined, child.error?.stack);
+	assert.is(child.signal, null, child.stderr || child.stdout);
+	assert.is(child.status, 0, child.stderr || child.stdout);
+	const measurement = JSON.parse(child.stdout);
+	assert.is(measurement.fixture, 'ascending overlapping ordinary-identity roots in one async descriptor operation');
+	assert.is(measurement.counting, 'Map.get calls from resolution through generated block');
+	assert.equal(measurement.results.map((result) => result.count), [100, 200, 400, 800]);
+	for (const result of measurement.results) {
+		assert.ok(result.map_gets <= 80 * result.count + 1_000, JSON.stringify(measurement));
+		assert.is(result.holes, result.count, JSON.stringify(measurement));
+		assert.ok(result.bytes > 0);
+	}
+});
+
+test('keeps per-event best-path scratch proportional when a later batch re-reaches earlier roots', () => {
+	const fixture = fileURLToPath(new URL('../fixtures/stream/operation-holes-scaling.mjs', import.meta.url));
+	const child = spawnSync(process.execPath, [fixture, '--events', '100', '200', '400', '800'], {
+		encoding: 'utf8',
+		timeout: 30_000
+	});
+	assert.is(child.error, undefined, child.error?.stack);
+	assert.is(child.signal, null, child.stderr || child.stdout);
+	assert.is(child.status, 0, child.stderr || child.stdout);
+	const measurement = JSON.parse(child.stdout);
+	assert.is(measurement.fixture, 'ascending overlapping ordinary-identity roots, then a second-batch wrapper re-reaching the chain');
+	assert.is(measurement.counting, 'Map.get calls per event window from resolution through generated block');
+	assert.equal(measurement.results.map((result) => result.count), [100, 200, 400, 800]);
+	for (const result of measurement.results) {
+		assert.ok(result.event1.map_gets <= 80 * result.count + 1_000, JSON.stringify(measurement));
+		assert.ok(result.event2.map_gets >= result.count, JSON.stringify(measurement));
+		assert.ok(result.event2.map_gets <= 80 * result.count + 1_000, JSON.stringify(measurement));
+	}
+});
+
+test('keeps descending overlapping roots and duplicate ordinary holes lowered once and in order', async () => {
+	const ready = deferred();
+	const job = {};
+	const r1 = { value: 42 };
+	const r2 = { child: r1 };
+	let constructions = 0;
+	const result = await unevalStream({ job }, (value, js) => value === job && ({
+		type: 'async-value',
+		source: ready.promise,
+		construct: () => {
+			constructions++;
+			return js`({value:null,also:null,dup:null,again:null})`;
+		},
+		// The parent root precedes its child root (descending), and r1 plus r2 are
+		// each repeated: duplicates must reuse one eager local, not re-anchor.
+		resolve: ({ target }) => js`${target}.value=${r2};${target}.also=${r1};${target}.dup=${r1};${target}.again=${r2}`,
+		reject: () => js``
+	}), { id: 'descriptor-descending-holes' });
+	const target = client();
+	const root = target.head(result.head);
+	const data = target.context.__d['descriptor-descending-holes'];
+	const initial = data.a.length;
+	ready.resolve(1);
+	const block = (await result.tail.next()).value;
+	target.block(block);
+	assert.is(constructions, 1);
+	assert.is(data.a.length, initial + 1);
+	assert.equal((block.match(/\.a\[\d+\]=/g) ?? []).length, 1);
+	assert.is(root.job.value, root.job.again);
+	assert.is(root.job.also, root.job.dup);
+	assert.is(root.job.value.child, root.job.dup);
+	assert.is(root.job.value.child, root.job.also);
+	assert.is(root.job.value.child.value, 42);
+});
+
+test('reuses ordinary descriptor holes across same and later events with a later shorter retained path', async () => {
+	const gates = [deferred(), deferred(), deferred()];
+	const leaf = { value: 1 };
+	const deep = { veryLongPropertyName: { anotherLongPropertyName: leaf } };
+	const result = await unevalStream(
+		{ deep, first: gates[0].promise, second: gates[1].promise, third: gates[2].promise },
+		(value, js) => {
+			const index = [gates[0].promise, gates[1].promise, gates[2].promise].indexOf(value);
+			if (index === -1) return;
+			const operations = [
+				({ target }) => js`${target}.a=${leaf}`,
+				({ target }) => js`${target}.b=${leaf};${target}.c=${leaf}`,
+				({ target }) => js`${target}.value=${leaf}`
+			];
+			return {
+				type: 'async-value',
+				source: value,
+				construct: () => js`({value:null})`,
+				resolve: operations[index],
+				reject: () => js``
+			};
+		},
+		{ id: 'ordinary-descriptor-reuse' }
+	);
+	const target = client();
+	const root = target.head(result.head);
+	const data = target.context.__d['ordinary-descriptor-reuse'];
+	const initial = data.a.length;
+	gates[0].resolve(1);
+	gates[1].resolve(2);
+	const first_block = (await result.tail.next()).value;
+	target.block(first_block);
+	assert.is(data.s.length, 1);
+	assert.ok((first_block.match(/\.s\[0\]/g) ?? []).length >= 2, first_block);
+	assert.equal((first_block.match(/\.veryLongPropertyName\.anotherLongPropertyName/g) ?? []).length, 1);
+	gates[2].resolve(3);
+	const second_block = (await result.tail.next()).value;
+	target.block(second_block);
+	assert.match(second_block, /\.s\[0\]/);
+	assert.not.match(second_block, /veryLongPropertyName|anotherLongPropertyName/);
+	const revived = root.deep.veryLongPropertyName.anotherLongPropertyName;
+	assert.is(root.first.a, revived);
+	assert.is(root.second.b, revived);
+	assert.is(root.second.c, revived);
+	assert.is(root.third.value, revived);
+	assert.is(revived.value, 1);
+	assert.is(data.a.length, initial);
+	await result.tail.return();
+});
+
 test('collects nested synchronous source holes with linear append work', () => {
 	const fixture = fileURLToPath(new URL('../fixtures/stream/source-values-scaling.mjs', import.meta.url));
 	const child = spawnSync(process.execPath, [fixture, '100', '200', '400', '800'], {

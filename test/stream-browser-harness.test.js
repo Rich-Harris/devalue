@@ -15,6 +15,20 @@ async function temporary_directory() {
 	return mkdtemp(join(tmpdir(), 'devalue-browser-harness-test-'));
 }
 
+async function with_timeout(label, operation, milliseconds) {
+	let timer;
+	try {
+		return await Promise.race([
+			operation,
+			new Promise((_, reject) => {
+				timer = setTimeout(() => reject(new Error(label)), milliseconds);
+			})
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 function run(cwd, environment) {
 	return spawnSync(process.execPath, [runner], {
 		cwd,
@@ -57,15 +71,19 @@ async function process_evidence(path, signal) {
 test('reports a missing browser from any cwd and removes only its created profile', async () => {
 	const parent = await temporary_directory();
 	const cwd = join(parent, 'unrelated-cwd');
+	const process_file = join(parent, 'child.process.json');
 	await mkdir(cwd);
 	try {
 		const result = run(cwd, {
 			TMPDIR: parent,
-			CHROME_PATH: join(parent, 'browser-does-not-exist')
+			CHROME_PATH: join(parent, 'browser-does-not-exist'),
+			DEVALUE_BROWSER_TEST_PROCESS_FILE: process_file
 		});
 		assert.is(result.signal, null, result.error?.message);
 		assert.is(result.status, 1, result.stderr || result.stdout);
 		assert.match(result.stderr, /Chrome failed to start: .*ENOENT/);
+		assert.match(result.stderr, /browser smoke cleanup failed: Error: Chrome process exit was not observed/);
+		await absent(process_file);
 		await no_profiles(parent);
 	} finally {
 		await rm(parent, { recursive: true, force: true });
@@ -254,6 +272,37 @@ for (const [label, setup_delay] of [['immediate', 0], ['configured', inherited_s
 	});
 }
 
+test('reports a process evidence write failure as a cleanup diagnostic under an existing primary failure', async () => {
+	const parent = await temporary_directory();
+	const blocker = join(parent, 'not-a-directory');
+	const process_file = join(blocker, 'child.process.json');
+	try {
+		await writeFile(blocker, 'caller-owned');
+		const executable = await fake_browser(parent);
+		const result = run(process.cwd(), {
+			TMPDIR: parent,
+			CHROME_PATH: executable,
+			DEVALUE_BROWSER_TEST_CHILD_MODE: 'never-ready',
+			DEVALUE_BROWSER_TEST_SETUP_FILE: join(parent, 'child.setup'),
+			DEVALUE_BROWSER_TEST_SETUP_TIMEOUT_MS: '1500',
+			DEVALUE_BROWSER_TEST_READY_FILE: join(parent, 'child.ready'),
+			DEVALUE_BROWSER_TEST_READINESS_TIMEOUT_MS: '300',
+			DEVALUE_BROWSER_TEST_PID_FILE: join(parent, 'child.pid'),
+			DEVALUE_BROWSER_TEST_SIGTERM_FILE: join(parent, 'child.sigterm'),
+			DEVALUE_BROWSER_TEST_PROCESS_FILE: process_file
+		});
+		assert.is(result.signal, null, result.error?.message);
+		assert.is(result.status, 1, result.stderr || result.stdout);
+		assert.match(result.stderr, /Chrome test readiness timed out after 300ms/);
+		assert.not.match(result.stderr, /Chrome process exit was not observed/);
+		assert.match(result.stderr, /browser smoke cleanup failed: Error: E(NOTDIR|NOENT|ACCES)/);
+		assert.is(await readFile(blocker, 'utf8'), 'caller-owned');
+		await no_profiles(parent);
+	} finally {
+		await rm(parent, { recursive: true, force: true });
+	}
+});
+
 test('reports an early browser exit during readiness and removes its profile', async () => {
 	const parent = await temporary_directory();
 	try {
@@ -296,30 +345,21 @@ test('shuts down a server with an abandonment response parked before release', a
 	const server = spawn(process.execPath, [server_fixture, '0'], { stdio: ['ignore', 'pipe', 'pipe'] });
 	let request;
 	try {
-		const origin = await Promise.race([
-			new Promise((resolve, reject) => {
-				let text = '';
-				server.stdout.on('data', (chunk) => {
-					text += chunk;
-					const newline = text.indexOf('\n');
-					if (newline !== -1) resolve(text.slice(0, newline).trim());
-				});
-				server.once('error', reject);
-				server.once('exit', (code, signal) => reject(new Error(`server exited before listening: ${code ?? signal}`)));
-			}),
-			new Promise((_, reject) => setTimeout(() => reject(new Error('server startup timed out')), 2_000))
-		]);
+		const origin = await with_timeout('server startup timed out', new Promise((resolve, reject) => {
+			let text = '';
+			server.stdout.on('data', (chunk) => {
+				text += chunk;
+				const newline = text.indexOf('\n');
+				if (newline !== -1) resolve(text.slice(0, newline).trim());
+			});
+			server.once('error', reject);
+			server.once('exit', (code, signal) => reject(new Error(`server exited before listening: ${code ?? signal}`)));
+		}), 2_000);
 		request = fetch(`${origin}/abandon`);
-		const response = await Promise.race([
-			request,
-			new Promise((_, reject) => setTimeout(() => reject(new Error('abandonment head timed out')), 2_000))
-		]);
+		const response = await with_timeout('abandonment head timed out', request, 2_000);
 		assert.is(response.status, 200);
 		server.kill('SIGTERM');
-		const result = await Promise.race([
-			new Promise((resolve) => server.once('exit', (code, signal) => resolve({ code, signal }))),
-			new Promise((_, reject) => setTimeout(() => reject(new Error('server shutdown timed out')), 4_000))
-		]);
+		const result = await with_timeout('server shutdown timed out', new Promise((resolve) => server.once('exit', (code, signal) => resolve({ code, signal }))), 4_000);
 		assert.equal(result, { code: 0, signal: null });
 	} finally {
 		if (server.exitCode === null && server.signalCode === null) server.kill('SIGKILL');

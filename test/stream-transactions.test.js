@@ -291,4 +291,54 @@ test('keeps head-retained opaque descendants usable after an operation rollback'
 	assert.equal(await result.tail.next(), { done: true, value: undefined });
 });
 
+test('keeps overlapping ordinary operation holes healthy after a failed operation rollback', async () => {
+	class Job {
+		constructor(ready) {
+			this.ready = ready;
+		}
+	}
+	const failed_gate = deferred();
+	const healthy_gate = deferred();
+	const failed = new Job(failed_gate);
+	const healthy = new Job(healthy_gate);
+	const r1 = { value: 42 };
+	const r2 = { child: r1 };
+	const reports = [];
+	const result = await unevalStream({ failed, healthy }, (value, js) => {
+		if (!(value instanceof Job)) return;
+		const template = ({ target }) => js`${target}.value=${r2};${target}.also=${r1}`;
+		return {
+			type: 'async-value',
+			source: value.ready.promise,
+			construct: (capture) => js`({value:null,also:null,control:${capture(js`[]`)}})`,
+			// The failed operation provisions the same overlapping ordinary holes as the
+			// healthy fallback; its rollback must leave no anchors, slots, or promises.
+			resolve: ({ target }) => value === failed ? js`${target}.value=${r2};${target}.also=${r1};${{ invalid: () => {} }}` : template({ target }),
+			reject: template,
+			cancel() {}
+		};
+	}, { id: 'ordinary-operation-rollback', onerror: (error) => reports.push(error) });
+	const target = client();
+	const root = target.head(result.head);
+	const data = target.context.__d['ordinary-operation-rollback'];
+	const initial = data.a.length;
+	failed_gate.resolve(1);
+	healthy_gate.resolve(2);
+	const block = (await result.tail.next()).value;
+	target.block(block);
+	assert.is(reports.length, 1);
+	assert.match(reports[0].message, /Cannot stringify a function/);
+	assert.is(data.a.length, initial + 1);
+	assert.equal((block.match(/delete b\.p\[\d+\]/g) ?? []).length, 2);
+	assert.is(data.s.length, 0);
+	assert.is(data.c.length, 0);
+	assert.match(block, new RegExp(`\\.a\\[${initial}\\]`));
+	assert.not.match(block, new RegExp(`\\.a\\[${initial + 1}\\]`));
+	assert.is(root.failed.value, root.healthy.value);
+	assert.is(root.failed.value.child, root.failed.also);
+	assert.is(root.failed.value.child, root.healthy.also);
+	assert.is(root.failed.value.child.value, 42);
+	assert.equal(await result.tail.next(), { done: true, value: undefined });
+});
+
 test.run();

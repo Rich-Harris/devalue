@@ -39,6 +39,16 @@ function settled(promise) {
 	);
 }
 
+function with_watchdog(label, operation) {
+	let timer;
+	return Promise.race([
+		operation,
+		new Promise((_, reject) => {
+			timer = setTimeout(() => reject(new Error(label)), 1000);
+		})
+	]).finally(() => clearTimeout(timer));
+}
+
 function listeners(signal) {
 	return getEventListeners(signal, 'abort').length;
 }
@@ -146,8 +156,7 @@ test('does not wait for an abandoned pull when return is absent or completes', a
 		const result = await unevalStream(source);
 		const waiting = result.tail.next();
 		try {
-			const watchdog = new Promise((_, reject) => setTimeout(() => reject(new Error('cleanup deadlocked')), 1000));
-			assert.equal(await Promise.race([result.tail.return(), watchdog]), { done: true, value: undefined });
+			assert.equal(await with_watchdog('cleanup deadlocked', result.tail.return()), { done: true, value: undefined });
 			assert.equal(await waiting, { done: true, value: undefined });
 			assert.is(returns, has_return ? 1 : 0);
 		} finally {
@@ -630,8 +639,11 @@ test('ignores next call properties and invokes the cached callable while active'
 	});
 	iterator.next = next;
 	const source = { [Symbol.asyncIterator]() { return iterator; } };
-	const result = await unevalStream(source, undefined, { signal: controller.signal });
-	for await (const _block of result.tail) {}
+	const outcome = await with_watchdog('cached callable session deadlocked', settled((async () => {
+		const result = await unevalStream(source, undefined, { signal: controller.signal });
+		for await (const _block of result.tail) {}
+	})()));
+	assert.is(outcome.ok, true);
 	assert.is(controller.signal.aborted, false);
 	assert.is(call_reads, 0);
 	assert.is(pulls, 2);
@@ -733,6 +745,99 @@ test('preserves a falsy abort raised inside a running next body', async () => {
 	assert.is(pulls, 1);
 	assert.is(returns, 1);
 	assert.is(cancels, 1);
+});
+
+/** Builds a sequence source whose pull-result getters count reads and may abort the session with reason 0. */
+function pull_case(results, controller) {
+	const stats = { done_reads: 0, value_reads: 0, returns: 0, cancels: 0, pulls: 0 };
+	const iterator = {
+		next() {
+			const spec = results[stats.pulls++];
+			return {
+				get done() {
+					stats.done_reads++;
+					if (spec.done === 'abort') controller.abort(0);
+					return spec.done === 'abort' ? true : spec.done;
+				},
+				get value() {
+					stats.value_reads++;
+					if (spec.value === 'abort') controller.abort(0);
+					return spec.value;
+				}
+			};
+		},
+		return() { stats.returns++; return { done: true }; }
+	};
+	return { stats, source: { [Symbol.asyncIterator]() { return iterator; } } };
+}
+
+const abort_cases = [
+	{ initial: true, abort: 'done', results: [{ done: 'abort' }], value_reads: 0, pulls: 1 },
+	{ initial: false, abort: 'done', results: [{ done: false, value: 1 }, { done: 'abort' }], value_reads: 1, pulls: 2 },
+	{ initial: true, abort: 'value', results: [{ done: false, value: 'abort' }], value_reads: 1, pulls: 1 },
+	{ initial: false, abort: 'value', results: [{ done: false, value: 1 }, { done: false, value: 'abort' }], value_reads: 2, pulls: 2 }
+];
+
+for (const current of abort_cases) {
+	for (const native of [true, false]) {
+		test(`${current.abort} getter abort on the ${current.initial ? 'initial' : 'resumed'} pull (${native ? 'native' : 'custom'})`, async () => {
+			const controller = new AbortController();
+			const fixture = pull_case(current.results, controller);
+			const job = {};
+			const stream = native
+				? unevalStream(fixture.source, undefined, { signal: controller.signal })
+				: unevalStream(job, (value, js) => value === job && ({
+					type: 'async-sequence', source: fixture.source,
+					construct: () => js`({events:[]})`,
+					next: () => js``, complete: () => js``, error: () => js``,
+					cancel() { fixture.stats.cancels++; }
+				}), { signal: controller.signal });
+			if (current.initial) {
+				const outcome = await settled(stream);
+				assert.is(outcome.ok, false);
+				assert.is(outcome.reason, 0);
+			} else {
+				const result = await stream;
+				const outcome = await settled(result.tail.next());
+				assert.is(outcome.ok, false);
+				assert.is(outcome.reason, 0);
+			}
+			// a value-getter abort is already running when it aborts, so its own read counts
+			assert.is(fixture.stats.value_reads, current.value_reads);
+			assert.is(fixture.stats.pulls, current.pulls);
+			assert.is(fixture.stats.returns, 1);
+			assert.is(fixture.stats.cancels, native ? 0 : 1);
+		});
+	}
+}
+
+test('nonaborting done getters read the value once and preserve yield and return values', async () => {
+	for (const native of [true, false]) {
+		const fixture = pull_case([
+			{ done: false, value: 'yield-value' },
+			{ done: true, value: 'return-value' }
+		]);
+		const job = {};
+		const result = native
+			? await unevalStream(fixture.source, undefined)
+			: await unevalStream(job, (value, js) => value === job && ({
+				type: 'async-sequence', source: fixture.source,
+				construct: () => js`({events:[]})`,
+				next: (_reference, item) => js`${_reference.target}.events.push(${item})`,
+				complete: (_reference, item) => js`(${item})`,
+				error: () => js``
+			}));
+		assert.is(fixture.stats.done_reads, 2);
+		assert.is(fixture.stats.value_reads, 2);
+		assert.is(fixture.stats.pulls, 2);
+		if (native) assert.ok(result.head.includes('(0,"yield-value")'));
+		else assert.ok(result.head.includes('.events.push("yield-value")'));
+		const block = await result.tail.next();
+		assert.is(block.done, false);
+		if (native) assert.ok(block.value.includes('(1,"return-value")'));
+		else assert.ok(block.value.includes('"return-value"'));
+		assert.equal(await result.tail.next(), { done: true, value: undefined });
+	}
 });
 
 for (const phase of ['resolve', 'next', 'complete']) {
@@ -1006,8 +1111,7 @@ for (const phase of ['head', 'tail']) {
 		if (phase === 'tail') {
 			next_gate.resolve({ done: false, value: () => {} });
 			healthy.resolve(1);
-			const watchdog = new Promise((_, reject) => setTimeout(() => reject(new Error('delivery blocked on return')), 1000));
-			assert.is((await Promise.race([result.tail.next(), watchdog])).done, false);
+			assert.is((await with_watchdog('delivery blocked on return', result.tail.next())).done, false);
 		}
 		// The unserializable outcome is reported first; return failure is observed later.
 		assert.is(reports.length, 1);
